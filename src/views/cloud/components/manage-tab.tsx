@@ -495,12 +495,8 @@ export const ManageTab: React.FC = () => {
                     updatedAt: Date.now(),
                     createdAt: Date.now(),
                 };
-                manager.saveSource(sourceInfo);
-
-                // 如果该插件下没有激活的源，自动激活
-                if (!manager.getActiveSourceId(entry.plugin)) {
-                    manager.setActive(entry.id, true);
-                }
+                const shouldActivate = !manager.hasAnySources(entry.plugin);
+                manager.saveSource(sourceInfo, { activate: shouldActivate });
             }
 
             // 触发列表状态刷新

@@ -334,12 +334,8 @@ export const BackupSyncTab: React.FC = () => {
                         updatedAt: Date.now(),
                         createdAt: existingSource?.createdAt || Date.now(),
                     };
-                    i18n.sourceManager.saveSource(sourceInfo);
-
-                    // 如果该插件下没有激活的源，自动激活
-                    if (!i18n.sourceManager.getActiveSourceId(entry.plugin)) {
-                        i18n.sourceManager.setActive(entry.id, true);
-                    }
+                    const shouldActivate = !existingSource && !i18n.sourceManager.hasAnySources(entry.plugin);
+                    i18n.sourceManager.saveSource(sourceInfo, { activate: shouldActivate });
 
                     restored++;
                     addLog(t('Cloud.Notices.RestoreSuccessItem', { title: entry.title || entry.plugin }));

@@ -14,6 +14,24 @@ export class AutoManager {
     private registryCache: RegistryCacheManager;
     private historyManager: HistoryManager;
     private manifestCache: { repoAddress: string; entry: ManifestEntry }[] = [];
+    private manifestCacheByPlugin = new Map<string, { repoAddress: string; entry: ManifestEntry }[]>();
+
+    private indexManifests(manifests: { repoAddress: string; entry: ManifestEntry }[]) {
+        const index = new Map<string, { repoAddress: string; entry: ManifestEntry }[]>();
+        for (const manifest of manifests) {
+            const matches = index.get(manifest.entry.plugin);
+            if (matches) matches.push(manifest);
+            else index.set(manifest.entry.plugin, [manifest]);
+        }
+        return index;
+    }
+
+    private getCachedManifestMatches(pluginId: string) {
+        if (this.manifestCacheByPlugin.size === 0 && this.manifestCache.length > 0) {
+            this.manifestCacheByPlugin = this.indexManifests(this.manifestCache);
+        }
+        return this.manifestCacheByPlugin.get(pluginId) || [];
+    }
 
     constructor(i18n: I18N) {
         this.i18n = i18n;
@@ -31,16 +49,16 @@ export class AutoManager {
     /**
      * 同步设置到 Store
      */
-    private async syncStore() {
+    private async syncStore(history?: any[]) {
         const store = useAutoStore.getState();
-        const history = await this.historyManager.loadHistory();
+        const finalHistory = history ?? await this.historyManager.loadHistory();
         const plugins = this.i18n.stateManager.getAllPluginStates();
         const themes = this.i18n.stateManager.getAllThemeStates();
         const appliedCount = [...Object.values(plugins), ...Object.values(themes)].filter((s: IState) => s.isApplied).length;
 
         store.hydrate(this.i18n.settings, {
             appliedCount,
-            history
+            history: finalHistory
         });
     }
 
@@ -168,6 +186,7 @@ export class AutoManager {
             }
 
             const allManifests = this.manifestCache;
+            this.manifestCacheByPlugin = this.indexManifests(allManifests);
 
             let successCount = 0;
             let skipCount = 0;
@@ -189,7 +208,7 @@ export class AutoManager {
 
                     store.updateTaskStatus(installed.id, 'processing');
 
-                    const matches = allManifests.filter(m => m.entry.plugin === installed.id);
+                    const matches = this.getCachedManifestMatches(installed.id);
                     if (matches.length === 0) {
                         skipCount++;
                         store.updateTaskStatus(installed.id, 'skipped', t('Manager.Auto.Status.SkipReasons.NoMatch'));
@@ -272,9 +291,11 @@ export class AutoManager {
             await this.i18n.saveSettings();
 
             const triggerMode = options.isDiscovery ? 'discovery' : (options.isIncremental ? 'startup' : 'manual');
-            const auditRecord = await this.historyManager.addRecord(triggerMode, store.tasks);
+            const currentHistory = store.history;
+            const auditRecord = await this.historyManager.addRecord(triggerMode, store.tasks, currentHistory);
+            const nextHistory = [auditRecord, ...currentHistory].slice(0, 50);
             store.addHistory(auditRecord);
-            this.syncStore();
+            this.syncStore(nextHistory);
         } catch (error: any) {
             console.error('[AutoManager] Smart Auto failed:', error);
             store.setStatus('error');
@@ -302,33 +323,42 @@ export class AutoManager {
                 if (theme) installedVersion = theme.version;
             }
 
-            const [registry, stats] = await Promise.all([
-                this.registryCache.getRegistry(),
-                this.registryCache.getStats(),
-            ]);
-
             const trustedSet = new Set(this.i18n.settings.autoTrustedRepos || []);
-            const relevantRepos = registry.filter((item: RegistryItem) => trustedSet.has(item.repoAddress));
-
-            if (relevantRepos.length === 0) {
+            if (trustedSet.size === 0) {
                 store.updateTaskStatus(id, 'error', t('Manager.Errors.TrustedRepoNotInRegistry'));
                 return;
             }
 
-            const allManifests: { repoAddress: string; entry: ManifestEntry }[] = [];
-            for (const item of relevantRepos) {
-                const [rOwner, rRepo] = item.repoAddress.split('/');
-                try {
-                    const manifestRes = await this.i18n.api.github.getFileContentWithFallback(rOwner, rRepo, 'metadata.json');
-                    if (manifestRes.state && Array.isArray(manifestRes.data)) {
-                        manifestRes.data.forEach((entry: ManifestEntry) => {
-                            allManifests.push({ repoAddress: item.repoAddress, entry });
-                        });
-                    }
-                } catch (e) { }
+            const stats = await this.registryCache.getStats();
+            let matches = this.getCachedManifestMatches(id).filter(m => trustedSet.has(m.repoAddress));
+
+            if (matches.length === 0) {
+                const registry = await this.registryCache.getRegistry();
+                const relevantRepos = registry.filter((item: RegistryItem) => trustedSet.has(item.repoAddress));
+
+                if (relevantRepos.length === 0) {
+                    store.updateTaskStatus(id, 'error', t('Manager.Errors.TrustedRepoNotInRegistry'));
+                    return;
+                }
+
+                const allManifests: { repoAddress: string; entry: ManifestEntry }[] = [];
+                for (const item of relevantRepos) {
+                    const [rOwner, rRepo] = item.repoAddress.split('/');
+                    try {
+                        const manifestRes = await this.i18n.api.github.getFileContentWithFallback(rOwner, rRepo, 'metadata.json');
+                        if (manifestRes.state && Array.isArray(manifestRes.data)) {
+                            manifestRes.data.forEach((entry: ManifestEntry) => {
+                                allManifests.push({ repoAddress: item.repoAddress, entry });
+                            });
+                        }
+                    } catch (e) { }
+                }
+
+                this.manifestCache = allManifests;
+                this.manifestCacheByPlugin = this.indexManifests(allManifests);
+                matches = this.getCachedManifestMatches(id);
             }
 
-            const matches = allManifests.filter(m => m.entry.plugin === id);
             if (matches.length === 0) {
                 store.updateTaskStatus(id, 'skipped', t('Manager.Auto.Status.SkipReasons.NoMatch'));
                 return;
@@ -425,25 +455,25 @@ export class AutoManager {
         }
 
         const stats = await this.registryCache.getStats();
+        const allInstalled = [
+            ...Object.values(this.i18n.app.plugins.manifests).map(m => ({ ...m, type: 'plugin' })),
+            ...(await this.getInstalledThemes()).map(t => ({ ...t, type: 'theme' }))
+        ];
+        const installedById = new Map(allInstalled.map(item => [item.id, item]));
+        const tasksById = new Map(store.tasks.map(task => [task.id, task]));
 
         for (const id of ids) {
-            const task = store.tasks.find(t => t.id === id);
+            const task = tasksById.get(id);
             if (!task) continue;
 
-            const matches = this.manifestCache.filter(m => m.entry.plugin === id);
+            const matches = this.getCachedManifestMatches(id);
             if (matches.length === 0) {
                 fail++;
                 store.updateTaskStatus(id, 'error', t('Manager.Auto.Errors.NoCachedManifest' as any));
                 continue;
             }
 
-            // Re-calculate the best match based on current strategy
-            // (We could store the specific match in the task, but re-calculating is safer)
-            const allInstalled = [
-                ...Object.values(this.i18n.app.plugins.manifests).map(m => ({ ...m, type: 'plugin' })),
-                ...(await this.getInstalledThemes()).map(t => ({ ...t, type: 'theme' }))
-            ];
-            const installed = allInstalled.find(item => item.id === id);
+            const installed = installedById.get(id);
             if (!installed) continue;
 
             const { match: bestMatch, scoreInfo } = this.selectBestTranslation(
@@ -504,70 +534,70 @@ export class AutoManager {
         isTheme: boolean
     ): { match: { repoAddress: string; entry: ManifestEntry } | null, scoreInfo: any } {
         const strategy = this.i18n.settings.autoMatchStrategy || 'comprehensive';
-        let langMatches = matches.filter(m => m.entry.language === targetLanguage);
-        if (langMatches.length === 0) langMatches = matches;
+        let hasLanguageMatch = false;
+        for (const match of matches) {
+            if (match.entry.language === targetLanguage) {
+                hasLanguageMatch = true;
+                break;
+            }
+        }
 
-        const scored = langMatches.map(m => {
-            const repoStats = stats.repos[m.repoAddress] || {};
+        let bestMatch: { repoAddress: string; entry: ManifestEntry } | null = null;
+        let bestScore = -1;
+        let bestBreakdown = { version: 0, popularity: 0, freshness: 0, total: 0 };
+        const now = Date.now();
+
+        for (const match of matches) {
+            if (hasLanguageMatch && match.entry.language !== targetLanguage) continue;
+
+            const repoStats = stats.repos[match.repoAddress] || {};
             const stars = repoStats.stars || 0;
             const activity = repoStats.activityScore || 0;
-            const pluginCount = repoStats.pluginCount || 0;
 
-            // 1. Version Match (0-50)
-            const vMatchRaw = isTheme ? 50 : this.isVersionCompatible(m.entry.supported_versions || '', targetVersion);
-            const versionScore = (vMatchRaw / 100) * 50; // Scale 100/50/0 -> 50/25/0
+            const vMatchRaw = isTheme ? 50 : this.isVersionCompatible(match.entry.supported_versions || '', targetVersion);
+            const versionScore = (vMatchRaw / 100) * 50;
 
-            // 2. Popularity (0-30)
-            // Scaling: Stars (cap 500) -> 20, Activity (0.0-1.0) -> 10
             const starScore = Math.min((stars / 500) * 20, 20);
             const activityScore = Math.min(activity * 10, 10);
             const popularityScore = starScore + activityScore;
 
-            // 3. Freshness (0-20)
-            const updatedAt = new Date(m.entry.updated_at || 0).getTime();
-            const daysSinceUpdate = (Date.now() - updatedAt) / (1000 * 60 * 60 * 24);
+            const updatedAt = new Date(match.entry.updated_at || 0).getTime();
+            const daysSinceUpdate = (now - updatedAt) / (1000 * 60 * 60 * 24);
             let freshnessScore = 0;
             if (daysSinceUpdate <= 30) freshnessScore = 20;
             else if (daysSinceUpdate <= 90) freshnessScore = 15;
             else if (daysSinceUpdate <= 180) freshnessScore = 10;
             else if (daysSinceUpdate <= 365) freshnessScore = 5;
 
-            // Strategy Weights
             let total = 0;
             switch (strategy) {
-                case 'version_first': 
-                    total = (versionScore * 1.5) + (popularityScore * 0.5) + (freshnessScore * 0.5); 
+                case 'version_first':
+                    total = (versionScore * 1.5) + (popularityScore * 0.5) + (freshnessScore * 0.5);
                     break;
-                case 'popularity': 
-                    total = (versionScore * 0.5) + (popularityScore * 1.5) + (freshnessScore * 0.5); 
+                case 'popularity':
+                    total = (versionScore * 0.5) + (popularityScore * 1.5) + (freshnessScore * 0.5);
                     break;
-                case 'latest_update': 
-                    total = (versionScore * 0.5) + (popularityScore * 0.5) + (freshnessScore * 1.5); 
+                case 'latest_update':
+                    total = (versionScore * 0.5) + (popularityScore * 0.5) + (freshnessScore * 1.5);
                     break;
-                default: 
+                default:
                     total = versionScore + popularityScore + freshnessScore;
             }
 
-            // Final cap at 100
             total = Math.min(Math.round(total), 100);
-
-            return {
-                ...m,
-                score: total,
-                breakdown: {
+            if (total > bestScore) {
+                bestScore = total;
+                bestMatch = match;
+                bestBreakdown = {
                     version: Math.round(versionScore),
                     popularity: Math.round(popularityScore),
                     freshness: Math.round(freshnessScore),
-                    total: total
-                }
-            };
-        });
+                    total
+                };
+            }
+        }
 
-        scored.sort((a, b) => b.score - a.score);
-        return {
-            match: scored[0] || null,
-            scoreInfo: scored[0]?.breakdown || { version: 0, popularity: 0, freshness: 0, total: 0 }
-        };
+        return { match: bestMatch, scoreInfo: bestBreakdown };
     }
 
     private async applyTranslation(match: { repoAddress: string; entry: ManifestEntry }, type: 'plugin' | 'theme'): Promise<boolean> {
@@ -598,8 +628,7 @@ export class AutoManager {
                 createdAt: existing?.createdAt || Date.now(),
             };
 
-            manager.saveSource(sourceInfo);
-            manager.setActive(match.entry.id, true);
+            manager.saveSource(sourceInfo, { activate: true });
 
             return type === 'theme'
                 ? await this.i18n.injectorManager.applyToTheme(match.entry.plugin)

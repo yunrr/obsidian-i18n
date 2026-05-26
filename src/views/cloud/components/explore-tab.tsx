@@ -497,10 +497,10 @@ export const ExploreTab: React.FC = () => {
                     createdAt: Date.now(),
                 };
 
-                manager.saveSource(sourceInfo);
+                const shouldActivate = !manager.getActiveSourceId(entry.plugin);
+                manager.saveSource(sourceInfo, { activate: shouldActivate });
 
-                if (!manager.getActiveSourceId(entry.plugin)) {
-                    manager.setActive(sourceId, true);
+                if (shouldActivate) {
                     i18n.notice.successPrefix(t_i18n('Cloud.Notices.DownloadSuccess'), t_i18n('Cloud.Tips.AddedAndActive', '', { title: sourceInfo.title }));
                 } else {
                     i18n.notice.successPrefix(t_i18n('Cloud.Notices.DownloadSuccess'), t_i18n('Cloud.Tips.AddedSource', '', { title: sourceInfo.title }));

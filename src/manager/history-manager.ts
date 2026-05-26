@@ -37,14 +37,25 @@ export class HistoryManager {
         }
     }
 
-    async addRecord(trigger: AutoHistoryItem['trigger'], tasks: AutoTaskItem[]): Promise<AutoHistoryItem> {
-        const history = await this.loadHistory();
-        
-        const success = tasks.filter(t => t.status === 'success').length;
-        const error = tasks.filter(t => t.status === 'error').length;
-        const skipped = tasks.filter(t => t.status === 'skipped').length;
-        const upToDate = tasks.filter(t => t.status === 'up_to_date').length;
-        const discovered = tasks.filter(t => t.status === 'discovered_new' || t.status === 'discovered_update').length;
+    async addRecord(trigger: AutoHistoryItem['trigger'], tasks: AutoTaskItem[], existingHistory?: AutoHistoryItem[]): Promise<AutoHistoryItem> {
+        const history = existingHistory ? [...existingHistory] : await this.loadHistory();
+
+        let success = 0;
+        let error = 0;
+        let skipped = 0;
+        let upToDate = 0;
+        let discovered = 0;
+        const details: AutoTaskItem[] = [];
+
+        for (const task of tasks) {
+            if (task.status === 'success') success++;
+            else if (task.status === 'error') error++;
+            else if (task.status === 'skipped') skipped++;
+            else if (task.status === 'up_to_date') upToDate++;
+            else if (task.status === 'discovered_new' || task.status === 'discovered_update') discovered++;
+
+            if (task.status !== 'pending' && task.status !== 'skipped') details.push(task);
+        }
 
         const newItem: AutoHistoryItem = {
             id: Date.now().toString(),
@@ -58,7 +69,7 @@ export class HistoryManager {
                 discovered,
                 upToDate
             },
-            details: JSON.stringify(tasks.filter(t => t.status !== 'pending' && t.status !== 'skipped'))
+            details: JSON.stringify(details)
         };
 
         history.unshift(newItem);

@@ -156,26 +156,58 @@ export class SourceManager {
 
     // ========== 增删改 ==========
 
-    /**
-     * 添加/更新翻译源
-     */
-    saveSource(source: TranslationSource): void {
+    private upsertSourceInMemory(source: TranslationSource): void {
         const now = Date.now();
+        const existing = this.meta.sources[source.id];
 
-        if (this.meta.sources[source.id]) {
-            // 更新现有
+        if (existing) {
             this.meta.sources[source.id] = {
-                ...this.meta.sources[source.id],
+                ...existing,
                 ...source,
                 updatedAt: now
             };
-        } else {
-            // 添加新的
-            source.createdAt = source.createdAt || now;
-            source.updatedAt = now;
-            this.meta.sources[source.id] = source;
+            return;
         }
 
+        this.meta.sources[source.id] = {
+            ...source,
+            createdAt: source.createdAt || now,
+            updatedAt: now
+        };
+    }
+
+    private setActiveInMemory(sourceId: string, active: boolean): boolean {
+        const source = this.meta.sources[sourceId];
+        if (!source) return false;
+
+        let changed = false;
+
+        if (active) {
+            Object.values(this.meta.sources)
+                .filter(s => s.plugin === source.plugin)
+                .forEach(s => {
+                    const shouldBeActive = s.id === sourceId;
+                    if (s.isActive !== shouldBeActive) {
+                        s.isActive = shouldBeActive;
+                        changed = true;
+                    }
+                });
+            return changed;
+        }
+
+        if (!source.isActive) return false;
+        source.isActive = false;
+        return true;
+    }
+
+    /**
+     * 添加/更新翻译源
+     */
+    saveSource(source: TranslationSource, options?: { activate?: boolean }): void {
+        this.upsertSourceInMemory(source);
+        if (options?.activate) {
+            this.setActiveInMemory(source.id, true);
+        }
         this.saveMeta();
     }
 
@@ -183,19 +215,8 @@ export class SourceManager {
      * 批量添加/更新翻译源 (减少磁盘写入)
      */
     batchSaveSources(sources: TranslationSource[]): void {
-        const now = Date.now();
         for (const source of sources) {
-            if (this.meta.sources[source.id]) {
-                this.meta.sources[source.id] = {
-                    ...this.meta.sources[source.id],
-                    ...source,
-                    updatedAt: now
-                };
-            } else {
-                source.createdAt = source.createdAt || now;
-                source.updatedAt = now;
-                this.meta.sources[source.id] = source;
-            }
+            this.upsertSourceInMemory(source);
         }
         this.saveMeta();
     }
@@ -218,7 +239,6 @@ export class SourceManager {
             const remaining = this.getSourcesForPlugin(pluginId);
             if (remaining.length > 0) {
                 remaining[0].isActive = true;
-                this.saveMeta();
             }
         }
 
@@ -235,17 +255,7 @@ export class SourceManager {
      * 设置激活状态（自动取消同插件的其他激活）
      */
     setActive(sourceId: string, active: boolean): void {
-        const source = this.meta.sources[sourceId];
-        if (!source) return;
-
-        if (active) {
-            // 取消同插件的其他激活
-            Object.values(this.meta.sources)
-                .filter(s => s.plugin === source.plugin)
-                .forEach(s => s.isActive = false);
-        }
-
-        source.isActive = active;
+        if (!this.setActiveInMemory(sourceId, active)) return;
         this.saveMeta();
     }
 
