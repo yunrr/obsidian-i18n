@@ -1,4 +1,5 @@
 import esbuild from "esbuild";
+import fs from "fs";
 import process from "process";
 import builtins from "builtin-modules";
 
@@ -70,7 +71,7 @@ const context = await esbuild.context({
      * 2. true: 生成独立的 main.js.map 文件（推荐，兼顾调试与体积）。
      * 3. false: 不生成任何地图信息，体积最小但无法源码级调试。
      */
-    sourcemap: true,
+    sourcemap: !prod,
 
     // 自动移除未被引用的代码（死代码删除），有助于减小最终产物的体积
     treeShaking: true,
@@ -91,6 +92,7 @@ const context = await esbuild.context({
 if (prod) {
     // 生产模式：直接运行一次构建流程并退出
     await context.rebuild();
+    if (fs.existsSync("main.js.map")) fs.unlinkSync("main.js.map");
     process.exit(0);
 } else {
     // 开发模式：开启监视模式，每当你修改并保存源码时，esbuild 会秒级自动重新构建

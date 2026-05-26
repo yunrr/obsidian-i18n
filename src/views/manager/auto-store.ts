@@ -91,6 +91,18 @@ export interface AutoState {
     clearAll: () => void;
 }
 
+function addStatusToSummary(summary: AutoState['summary'], status: AutoTaskStatus, delta: number) {
+    if (status === 'up_to_date') summary.upToDate += delta;
+    else if (status === 'success' || status === 'discovered_new' || status === 'discovered_update') summary.success += delta;
+    else if (status === 'error') summary.error += delta;
+}
+
+function summarizeTasks(tasks: AutoTaskItem[], applied: number): AutoState['summary'] {
+    const summary = { upToDate: 0, success: 0, error: 0, applied };
+    for (const task of tasks) addStatusToSummary(summary, task.status, 1);
+    return summary;
+}
+
 export const useAutoStore = create<AutoState>((set, get) => ({
     status: 'idle',
     progress: { current: 0, total: 0 },
@@ -112,45 +124,40 @@ export const useAutoStore = create<AutoState>((set, get) => ({
 
     setProgress: (current, total) => set({ progress: { current, total } }),
 
-    initTasks: (tasks) => set((state) => {
-        const summary = {
-            upToDate: tasks.filter(t => t.status === 'up_to_date').length,
-            success: tasks.filter(t => t.status === 'success' || t.status === 'discovered_new' || t.status === 'discovered_update').length,
-            error: tasks.filter(t => t.status === 'error').length,
-            applied: state.summary.applied
-        };
-        return { tasks, summary, progress: { current: 0, total: tasks.length } };
-    }),
+    initTasks: (tasks) => set((state) => ({
+        tasks,
+        summary: summarizeTasks(tasks, state.summary.applied),
+        progress: { current: 0, total: tasks.length }
+    })),
 
     updateTaskStatus: (id, status, message, source, version, score) => set((state) => {
-        const newTasks = state.tasks.map(t => t.id === id ? {
-            ...t,
-            status,
-            message: message || t.message,
-            sourceRepo: source || t.sourceRepo,
-            targetVersion: version || t.targetVersion,
-            scoreBreakdown: score || t.scoreBreakdown
-        } : t);
+        const index = state.tasks.findIndex(t => t.id === id);
+        if (index === -1) return {};
 
-        const summary = {
-            upToDate: newTasks.filter(t => t.status === 'up_to_date').length,
-            success: newTasks.filter(t => t.status === 'success' || t.status === 'discovered_new' || t.status === 'discovered_update').length,
-            error: newTasks.filter(t => t.status === 'error').length,
-            applied: state.summary.applied
+        const previous = state.tasks[index];
+        const updated = {
+            ...previous,
+            status,
+            message: message || previous.message,
+            sourceRepo: source || previous.sourceRepo,
+            targetVersion: version || previous.targetVersion,
+            scoreBreakdown: score || previous.scoreBreakdown
         };
+
+        const newTasks = state.tasks.slice();
+        newTasks[index] = updated;
+
+        const summary = { ...state.summary };
+        addStatusToSummary(summary, previous.status, -1);
+        addStatusToSummary(summary, status, 1);
 
         return { tasks: newTasks, summary };
     }),
 
     addTasks: (newTasks) => set((state) => {
-        const combinedTasks = [...state.tasks, ...newTasks];
-        const summary = {
-            upToDate: combinedTasks.filter(t => t.status === 'up_to_date').length,
-            success: combinedTasks.filter(t => t.status === 'success' || t.status === 'discovered_new' || t.status === 'discovered_update').length,
-            error: combinedTasks.filter(t => t.status === 'error').length,
-            applied: state.summary.applied
-        };
-        return { tasks: combinedTasks, summary };
+        const summary = { ...state.summary };
+        for (const task of newTasks) addStatusToSummary(summary, task.status, 1);
+        return { tasks: [...state.tasks, ...newTasks], summary };
     }),
 
     setSummary: (summary) => set((state) => ({
