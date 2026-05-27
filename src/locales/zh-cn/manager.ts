@@ -98,6 +98,8 @@ export default {
             Unapplied: "未应用",
             Translated: "已翻译",
             Untranslated: "未翻译",
+            PartialFailed: "部分失败",
+            Error: "错误",
             ToExtract: "待提取"
         },
         Labels: {
@@ -142,7 +144,7 @@ export default {
             ReloadPlugin: "准备重启插件: {{id}}",
             ReloadSuccess: "插件重载成功",
             ExtractSuccess: "提取成功",
-            BatchExtractComplete: "批量提取完成：成功 {{success}}，失败 {{fail}}",
+            BatchExtractComplete: "批量提取完成：成功 {{success}}，失败 {{fail}}，跳过 {{skip}}",
             BatchTranslateComplete: "批量翻译完成：成功 {{success}}，失败 {{fail}}，跳过 {{skip}}"
         }
     },
@@ -163,6 +165,7 @@ export default {
             Unapplied: "未应用",
             Translated: "已翻译",
             Untranslated: "未翻译",
+            PartialFailed: "部分失败",
             ToExtract: "待提取"
         },
         Status: {
@@ -191,7 +194,7 @@ export default {
             ThemeExtractPrefix: "提取译文",
             ThemeApplyPrefix: "主题应用",
             ThemeRestorePrefix: "主题还原",
-            BatchExtractComplete: "批量提取完成：成功 {{success}}，失败 {{fail}}",
+            BatchExtractComplete: "批量提取完成：成功 {{success}}，失败 {{fail}}，跳过 {{skip}}",
             BatchTranslateComplete: "批量翻译完成：成功 {{success}}，失败 {{fail}}，跳过 {{skip}}"
         }
     },

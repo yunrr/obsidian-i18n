@@ -6,7 +6,7 @@ import { useTranslation } from 'react-i18next';
 import { Settings, FolderOpen, Pen, FileOutput, XCircle, Loader2, MoreHorizontal, CloudDownload, Cloud } from 'lucide-react';
 import I18N from 'src/main';
 import { PluginTranslationV1 } from 'src/types';
-import { i18nOpen, AstTranslator, RegexTranslator, isValidPluginTranslationV1Format } from '../../../utils';
+import { i18nOpen, AstTranslator, RegexTranslator, isValidPluginTranslationV1Format, getPluginTranslationSources, shouldSkipExtractionForChineseContent } from '../../../utils';
 import { loadTranslationFile } from '../../../manager/io-manager';
 import { useGlobalStoreInstance } from '~/utils';
 import { EDITOR_VIEW_TYPE } from '../../../views';
@@ -47,6 +47,8 @@ export interface PluginItemData {
     sources: any[];
     activeSourceId: string | null;
     translationFormatMark: boolean;
+    hasFailedBatches: boolean;
+    hasFormatError: boolean;
     mainDoc: string;
     manifestDoc: string;
     isApplied: boolean;
@@ -158,6 +160,10 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
             await new Promise(resolve => setTimeout(resolve, 0));
             const { generatePlugin } = await import('../../../utils');
             const translationJson = generatePlugin(plugin.version, manifestJSON, mainStr, settings.language, i18n.settings);
+            if (shouldSkipExtractionForChineseContent(manifestJSON.name || plugin.name, getPluginTranslationSources(translationJson))) {
+                i18n.notice.result(false, '检测到插件已包含中文内容，已跳过提取');
+                return;
+            }
 
             if (sourceManager) {
                 await sourceManager.extractAndSaveSource(plugin.id, translationJson, { title: plugin.name });
