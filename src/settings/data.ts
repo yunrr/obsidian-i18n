@@ -48,8 +48,10 @@ export interface I18nSettings {
     llmResponseFormat: string;      // LLM 返回格式 (text, json_object)
     llmLanguage: string;            // LLM 翻译的目标语言
     llmStyle: string;               // LLM 翻译的风格类型
-    llmBatchSize: number;           // LLM 批量翻译并行的文本条数
+    llmBatchSize: number;           // LLM 批量翻译每批文本条数
     llmConcurrencyLimit: number;    // LLM 并发请求限制数
+    batchExtractConcurrency: number; // 管理器批量提取资源并发数
+    batchTranslateConcurrency: number; // 管理器批量翻译资源并发数
     llmTimeout: number;             // LLM 请求超时时间 (毫秒)
 
     llmRegexPrompt?: string;        // LLM Regex 自定义提示词模板
@@ -248,7 +250,7 @@ export const DEFAULT_SETTINGS: I18nSettings = {
     checkUpdates: true,       // 默认开启检查更新
     searchText: '',           // 默认无搜索文本
     sort: '0',                 // 默认按正序排列
-    author: '',                // 默认作者署名为空
+    author: 'yun',             // 默认作者署名
     mode: 0,                   // 默认模式: 0
 
     // ==============================
@@ -263,8 +265,10 @@ export const DEFAULT_SETTINGS: I18nSettings = {
     llmResponseFormat: 'text',      // 默认使用 text 的通用容错返回格式
     llmLanguage: '简体中文',        // LLM 的默认生成语言
     llmStyle: '无',                 // LLM 的默认生成风格
-    llmBatchSize: 10,               // 默认最大批量并发为 10 条
-    llmConcurrencyLimit: 3,         // 默认并发限制为 3
+    llmBatchSize: 10,               // 默认每批 10 条
+    llmConcurrencyLimit: 3,         // 默认 LLM 请求并发限制为 3
+    batchExtractConcurrency: 3,     // 默认批量提取资源并发为 3
+    batchTranslateConcurrency: 2,   // 默认批量翻译资源并发为 2
     llmTimeout: 60000,              // 默认超时为 60 秒
 
 

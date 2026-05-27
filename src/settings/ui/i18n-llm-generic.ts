@@ -18,6 +18,7 @@ export default class I18nLLMGeneric extends BaseSetting {
 
         this.profileUI();
         this.configUI();
+        this.batchConcurrencyUI();
 
         // 允许所有模型显式或者兜底式自选返回格式
         this.openaiSpecialUI();
@@ -251,6 +252,57 @@ export default class I18nLLMGeneric extends BaseSetting {
             });
         });
 
+    }
+
+    private batchConcurrencyUI(): void {
+        new Setting(this.containerEl).setName(t('Settings.Ai.BatchConcurrencyHeader')).setHeading();
+
+        const parseLimit = (value: string, fallback: number) => {
+            const parsed = Number.parseInt(value, 10);
+            return Number.isFinite(parsed) ? Math.max(1, Math.min(20, parsed)) : fallback;
+        };
+
+        new Setting(this.containerEl)
+            .setName(t('Settings.Ai.BatchExtractConcurrencyTitle'))
+            .setDesc(t('Settings.Ai.BatchExtractConcurrencyDesc'))
+            .addText(text => {
+                text.setValue(String(this.settings.batchExtractConcurrency || 3))
+                    .onChange(async (value) => {
+                        this.settings.batchExtractConcurrency = parseLimit(value, 3);
+                        await this.i18n.saveSettings();
+                    });
+                text.inputEl.type = 'number';
+                text.inputEl.min = '1';
+                text.inputEl.max = '20';
+            });
+
+        new Setting(this.containerEl)
+            .setName(t('Settings.Ai.BatchTranslateConcurrencyTitle'))
+            .setDesc(t('Settings.Ai.BatchTranslateConcurrencyDesc'))
+            .addText(text => {
+                text.setValue(String(this.settings.batchTranslateConcurrency || 2))
+                    .onChange(async (value) => {
+                        this.settings.batchTranslateConcurrency = parseLimit(value, 2);
+                        await this.i18n.saveSettings();
+                    });
+                text.inputEl.type = 'number';
+                text.inputEl.min = '1';
+                text.inputEl.max = '20';
+            });
+
+        new Setting(this.containerEl)
+            .setName(t('Settings.Ai.LlmConcurrencyTitle'))
+            .setDesc(t('Settings.Ai.LlmConcurrencyDesc'))
+            .addText(text => {
+                text.setValue(String(this.settings.llmConcurrencyLimit || 3))
+                    .onChange(async (value) => {
+                        this.settings.llmConcurrencyLimit = parseLimit(value, 3);
+                        await this.i18n.saveSettings();
+                    });
+                text.inputEl.type = 'number';
+                text.inputEl.min = '1';
+                text.inputEl.max = '20';
+            });
     }
 
     private openaiSpecialUI(): void {

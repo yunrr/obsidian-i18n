@@ -38,6 +38,14 @@ export type OnRegexBatchComplete = (
     totalBatches: number
 ) => void | Promise<void>;
 
+/** 批次失败回调 (Regex) */
+export type OnRegexBatchError = (
+    batchItems: RegexItem[],
+    error: Error,
+    batchIndex: number,
+    totalBatches: number
+) => void | Promise<void>;
+
 /** 批次完成回调 (AST) */
 export type OnAstBatchComplete = (
     batchResult: AstItem[],
@@ -45,9 +53,25 @@ export type OnAstBatchComplete = (
     totalBatches: number
 ) => void | Promise<void>;
 
+/** 批次失败回调 (AST) */
+export type OnAstBatchError = (
+    batchItems: AstItem[],
+    error: Error,
+    batchIndex: number,
+    totalBatches: number
+) => void | Promise<void>;
+
 /** 批次完成回调 (Theme) */
 export type OnThemeBatchComplete = (
     batchResult: ThemeTranslationItem[],
+    batchIndex: number,
+    totalBatches: number
+) => void | Promise<void>;
+
+/** 批次失败回调 (Theme) */
+export type OnThemeBatchError = (
+    batchItems: ThemeTranslationItem[],
+    error: Error,
     batchIndex: number,
     totalBatches: number
 ) => void | Promise<void>;
@@ -60,21 +84,24 @@ export interface ITranslationProvider {
     regexTranslate(
         items: RegexItem[],
         onBatchComplete: OnRegexBatchComplete,
-        signal?: AbortSignal
+        signal?: AbortSignal,
+        onBatchError?: OnRegexBatchError
     ): Promise<RegexItem[]>;
 
     /** AST 模式批量翻译 */
     astTranslate(
         items: AstItem[],
         onBatchComplete: OnAstBatchComplete,
-        signal?: AbortSignal
+        signal?: AbortSignal,
+        onBatchError?: OnAstBatchError
     ): Promise<AstItem[]>;
 
     /** Theme 模式批量翻译 */
     themeTranslate(
         items: ThemeTranslationItem[],
         onBatchComplete: OnThemeBatchComplete,
-        signal?: AbortSignal
+        signal?: AbortSignal,
+        onBatchError?: OnThemeBatchError
     ): Promise<ThemeTranslationItem[]>;
 
     /** Token 数量与成本估算 */

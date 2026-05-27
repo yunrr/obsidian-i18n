@@ -198,6 +198,13 @@ export default {
         ModelDesc: "用于翻译的模型名称。",
         ModelSelectPlaceholder: "选择内置模型",
         ModelInputPlaceholder: "或手动输入",
+        BatchConcurrencyHeader: "批量任务并发",
+        BatchExtractConcurrencyTitle: "批量提取并发数",
+        BatchExtractConcurrencyDesc: "插件和主题批量提取时同时处理的资源数量，建议 2-6。",
+        BatchTranslateConcurrencyTitle: "批量翻译资源并发数",
+        BatchTranslateConcurrencyDesc: "批量翻译时同时处理的插件或主题数量。实际请求数还会受下方请求并发数限制。",
+        LlmConcurrencyTitle: "请求并发数",
+        LlmConcurrencyDesc: "单个批量翻译任务内部同时发送给 LLM 的请求数量，过高可能触发 429。",
         // ── 连通测试 ──
         TestHeader: "连通测试",
         TestTitle: "测试连接",

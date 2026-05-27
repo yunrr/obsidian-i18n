@@ -19,7 +19,13 @@ export default {
             Restore: "还原",
             Edit: "编辑译文",
             Delete: "删除译文",
-            OpenFolder: "浏览目录"
+            OpenFolder: "浏览目录",
+            BatchExtract: "批量提取",
+            BatchTranslate: "批量翻译",
+            StopTask: "停止任务",
+            ResumeExtract: "继续提取",
+            ResumeTranslate: "继续翻译",
+            RetryFailures: "重试失败批次"
         },
         Placeholders: {
             SearchPlaceholder: "输入搜索关键词..."
@@ -28,9 +34,13 @@ export default {
             All: "全部"
         },
         Labels: {
-            Author: "作者"
+            Author: "作者",
+            ScopeHint: "当前筛选范围：{{count}} 项"
         },
         Status: {
+            BatchExtracting: "正在批量提取",
+            BatchTranslating: "正在批量翻译",
+            Stopping: "正在停止",
             Labels: {
                 pending: '等待中',
                 processing: '处理中',
@@ -67,7 +77,8 @@ export default {
         Notices: {
             ApplySuccess: "翻译应用成功",
             CopySuccess: "Registry JSON 已复制到剪贴板",
-            SyncSuccess: "中心库注册表同步成功！"
+            SyncSuccess: "中心库注册表同步成功！",
+            RetryFailuresComplete: "失败批次重试完成：成功 {{success}}，失败 {{fail}}"
         }
     },
     Plugins: {
@@ -129,7 +140,9 @@ export default {
             ApplyPluginSuccess: "{{id}} 翻译应用成功",
             ReloadPlugin: "准备重启插件: {{id}}",
             ReloadSuccess: "插件重载成功",
-            ExtractSuccess: "提取成功"
+            ExtractSuccess: "提取成功",
+            BatchExtractComplete: "批量提取完成：成功 {{success}}，失败 {{fail}}",
+            BatchTranslateComplete: "批量翻译完成：成功 {{success}}，失败 {{fail}}，跳过 {{skip}}"
         }
     },
     Themes: {
@@ -176,6 +189,8 @@ export default {
             ThemeExtractPrefix: "提取译文",
             ThemeApplyPrefix: "主题应用",
             ThemeRestorePrefix: "主题还原",
+            BatchExtractComplete: "批量提取完成：成功 {{success}}，失败 {{fail}}",
+            BatchTranslateComplete: "批量翻译完成：成功 {{success}}，失败 {{fail}}，跳过 {{skip}}"
         }
     },
     Sources: {

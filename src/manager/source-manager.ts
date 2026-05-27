@@ -4,7 +4,7 @@
  */
 import * as fs from 'fs-extra';
 import * as path from 'path';
-import { TranslationSourceMeta, TranslationSource, EMPTY_META } from '../types';
+import { TranslationSourceMeta, TranslationSource, EMPTY_META, EMPTY_BATCH_TASK_RECORD, BatchTaskRecordMeta, BatchTaskCheckpoint, BatchTaskFailureRecord } from '../types';
 import { calculateChecksum } from '../utils/translator/translation';
 import { nanoid } from 'nanoid';
 import { useGlobalStoreInstance } from '~/utils';
@@ -16,6 +16,7 @@ export class SourceManager {
     public sourcesDir: string;         // translation-sources目录
     private metaPath: string;           // meta.json路径
     private checkpointPath: string;     // backup-checkpoint.json路径
+    private batchTaskRecordPath: string;
     private meta: TranslationSourceMeta;
 
     constructor(i18nPluginDir: string) {
@@ -23,6 +24,7 @@ export class SourceManager {
         this.sourcesDir = path.join(i18nPluginDir, 'translations');
         this.metaPath = path.join(i18nPluginDir, 'metadata.json');
         this.checkpointPath = path.join(i18nPluginDir, 'backup-checkpoint.json');
+        this.batchTaskRecordPath = path.join(i18nPluginDir, 'batch-task-records.json');
         this.meta = this.loadMeta();
     }
 
@@ -84,6 +86,43 @@ export class SourceManager {
             console.error('[SourceManager] Failed to save meta:', error);
             throw error;
         }
+    }
+
+    private loadBatchTaskRecord(): BatchTaskRecordMeta {
+        try {
+            if (fs.existsSync(this.batchTaskRecordPath)) {
+                const raw = fs.readJsonSync(this.batchTaskRecordPath);
+                return {
+                    schemaVersion: raw?.schemaVersion || 1,
+                    checkpoints: raw?.checkpoints || {},
+                    failures: Array.isArray(raw?.failures) ? raw.failures : [],
+                    updatedAt: raw?.updatedAt || 0,
+                };
+            }
+        } catch (error) {
+            console.error('[SourceManager] Failed to load batch task record:', error);
+        }
+        return JSON.parse(JSON.stringify(EMPTY_BATCH_TASK_RECORD));
+    }
+
+    private saveBatchTaskRecord(record: BatchTaskRecordMeta): void {
+        try {
+            fs.ensureDirSync(this.basePath);
+            fs.writeJsonSync(this.batchTaskRecordPath, {
+                ...record,
+                updatedAt: Date.now(),
+            }, { spaces: 2 });
+            useGlobalStoreInstance.getState().triggerSourceUpdate();
+        } catch (error) {
+            console.error('[SourceManager] Failed to save batch task record:', error);
+        }
+    }
+
+    private updateBatchTaskRecord(updater: (record: BatchTaskRecordMeta) => void): BatchTaskRecordMeta {
+        const record = this.loadBatchTaskRecord();
+        updater(record);
+        this.saveBatchTaskRecord(record);
+        return record;
     }
 
     // ========== 基础查询 ==========
@@ -381,6 +420,41 @@ export class SourceManager {
         return sourceId;
     }
 
+    public batchExtractAndSaveSources(entries: Array<{ pluginId: string; content: any; options: TranslationExtractionOptions }>): string[] {
+        const sourceIds: string[] = [];
+
+        for (const entry of entries) {
+            const sourceId = this.generateRandomId();
+            const translationSource: TranslationSource = {
+                id: sourceId,
+                plugin: entry.pluginId,
+                title: entry.options.title || t('func.extract_local'),
+                type: entry.options.type || 'plugin',
+                origin: 'local',
+                isActive: true,
+                checksum: calculateChecksum(entry.content),
+                updatedAt: Date.now(),
+                createdAt: Date.now()
+            };
+
+            Object.values(this.meta.sources)
+                .filter(source => source.plugin === entry.pluginId)
+                .forEach(source => {
+                    source.isActive = false;
+                });
+
+            this.saveSourceFile(sourceId, entry.content);
+            this.upsertSourceInMemory(translationSource);
+            sourceIds.push(sourceId);
+        }
+
+        if (sourceIds.length > 0) {
+            this.saveMeta();
+        }
+
+        return sourceIds;
+    }
+
     // ========== 检查点 (Checkpoint) 管理 ==========
 
     /**
@@ -422,6 +496,61 @@ export class SourceManager {
         } catch (error) {
             console.error('[SourceManager] Failed to clear checkpoint:', error);
         }
+    }
+
+    saveBatchTaskCheckpoint(key: string, checkpoint: BatchTaskCheckpoint): void {
+        this.updateBatchTaskRecord(record => {
+            record.checkpoints[key] = checkpoint;
+        });
+    }
+
+    loadBatchTaskCheckpoint(key: string): BatchTaskCheckpoint | null {
+        const record = this.loadBatchTaskRecord();
+        return record.checkpoints[key] || null;
+    }
+
+    clearBatchTaskCheckpoint(key: string): void {
+        this.updateBatchTaskRecord(record => {
+            delete record.checkpoints[key];
+        });
+    }
+
+    getBatchTaskFailures(scope?: BatchTaskFailureRecord['scope']): BatchTaskFailureRecord[] {
+        const record = this.loadBatchTaskRecord();
+        const failures = scope ? record.failures.filter(item => item.scope === scope) : record.failures;
+        return failures.sort((a, b) => b.failedAt - a.failedAt);
+    }
+
+    saveBatchTaskFailure(failure: BatchTaskFailureRecord): void {
+        this.updateBatchTaskRecord(record => {
+            const duplicateIndex = record.failures.findIndex(item => item.id === failure.id);
+            if (duplicateIndex >= 0) {
+                record.failures[duplicateIndex] = failure;
+            } else {
+                record.failures.unshift(failure);
+            }
+            if (record.failures.length > 500) {
+                record.failures = record.failures.slice(0, 500);
+            }
+        });
+    }
+
+    removeBatchTaskFailures(ids: string[]): void {
+        if (ids.length === 0) return;
+        const idSet = new Set(ids);
+        this.updateBatchTaskRecord(record => {
+            record.failures = record.failures.filter(item => !idSet.has(item.id));
+        });
+    }
+
+    clearBatchTaskFailures(scope?: BatchTaskFailureRecord['scope']): void {
+        this.updateBatchTaskRecord(record => {
+            if (!scope) {
+                record.failures = [];
+                return;
+            }
+            record.failures = record.failures.filter(item => item.scope !== scope);
+        });
     }
 }
 
