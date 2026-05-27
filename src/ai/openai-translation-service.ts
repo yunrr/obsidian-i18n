@@ -14,6 +14,72 @@ interface ChatMessage {
     content: string;
 }
 
+function normalizeStreamingResponseText(text: string): string {
+    const trimmed = text.trim();
+    if (!trimmed.startsWith('data:')) return text;
+
+    const chunks: string[] = [];
+    let lastEvent: any = null;
+
+    for (const line of text.split(/\r?\n/)) {
+        const trimmedLine = line.trim();
+        if (!trimmedLine.startsWith('data:')) continue;
+
+        const payload = trimmedLine.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+
+        try {
+            const event = JSON.parse(payload);
+            lastEvent = event;
+            const choice = event?.choices?.[0];
+            const deltaContent = choice?.delta?.content;
+            const messageContent = choice?.message?.content;
+            if (typeof deltaContent === 'string') chunks.push(deltaContent);
+            if (typeof messageContent === 'string') chunks.push(messageContent);
+        } catch {
+            // Ignore malformed SSE fragments and keep parsing subsequent chunks.
+        }
+    }
+
+    const content = chunks.join('');
+    if (!content) return text;
+
+    return JSON.stringify({
+        id: lastEvent?.id || 'request-url-stream',
+        object: 'chat.completion',
+        created: lastEvent?.created || Math.floor(Date.now() / 1000),
+        model: lastEvent?.model || '',
+        choices: [{
+            index: 0,
+            message: { role: 'assistant', content },
+            finish_reason: lastEvent?.choices?.[0]?.finish_reason || 'stop',
+        }],
+        usage: lastEvent?.usage,
+    });
+}
+
+function normalizeRequestUrlBody(response: any): string {
+    let text = '';
+
+    if (typeof response.text === 'string' && response.text.length > 0) {
+        text = response.text;
+    } else if (response.json !== undefined && response.json !== null) {
+        text = typeof response.json === 'string' ? response.json : JSON.stringify(response.json);
+    } else if (response.arrayBuffer instanceof ArrayBuffer && response.arrayBuffer.byteLength > 0) {
+        text = new TextDecoder().decode(response.arrayBuffer);
+    }
+
+    return normalizeStreamingResponseText(text);
+}
+
+function buildFetchResponse(response: any): Response {
+    return new Response(normalizeRequestUrlBody(response), {
+        status: response.status,
+        statusText: String(response.status),
+        headers: new Headers(response.headers as any),
+    });
+}
+
 export class OpenAITranslationService extends BaseProvider {
 
     constructor() {
@@ -66,15 +132,7 @@ export class OpenAITranslationService extends BaseProvider {
                         throw: false
                     }).then(response => {
                         signal?.removeEventListener('abort', onAbort);
-                        resolve({
-                            ok: response.status >= 200 && response.status < 300,
-                            status: response.status,
-                            statusText: response.status.toString(),
-                            headers: new Headers(response.headers as any),
-                            json: () => Promise.resolve(response.json),
-                            text: () => Promise.resolve(response.text),
-                            arrayBuffer: () => Promise.resolve(response.arrayBuffer),
-                        } as Response);
+                        resolve(buildFetchResponse(response));
                     }).catch(err => {
                         signal?.removeEventListener('abort', onAbort);
                         reject(err);
@@ -160,6 +218,7 @@ export class OpenAITranslationService extends BaseProvider {
                     messages: messages as any,
                     model: this.getModelName(),
                     temperature: 0.3,
+                    stream: false,
                 };
 
                 // 根据设定的格式注入对应 response_format
@@ -267,6 +326,7 @@ export class OpenAITranslationService extends BaseProvider {
                 messages: messages as any,
                 model: this.getModelName(),
                 temperature: 0.2,
+                stream: false,
             }, { signal: timeoutController.signal });
 
             const result = completion.choices[0].message.content;

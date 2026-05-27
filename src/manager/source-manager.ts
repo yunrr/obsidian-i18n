@@ -522,12 +522,19 @@ export class SourceManager {
     }
 
     saveBatchTaskFailure(failure: BatchTaskFailureRecord): void {
+        this.saveBatchTaskFailures([failure]);
+    }
+
+    saveBatchTaskFailures(failures: BatchTaskFailureRecord[]): void {
+        if (failures.length === 0) return;
         this.updateBatchTaskRecord(record => {
-            const duplicateIndex = record.failures.findIndex(item => item.id === failure.id);
-            if (duplicateIndex >= 0) {
-                record.failures[duplicateIndex] = failure;
-            } else {
-                record.failures.unshift(failure);
+            for (const failure of failures) {
+                const duplicateIndex = record.failures.findIndex(item => item.id === failure.id);
+                if (duplicateIndex >= 0) {
+                    record.failures[duplicateIndex] = failure;
+                } else {
+                    record.failures.unshift(failure);
+                }
             }
             if (record.failures.length > 500) {
                 record.failures = record.failures.slice(0, 500);
