@@ -250,7 +250,7 @@ export const DEFAULT_SETTINGS: I18nSettings = {
     checkUpdates: true,       // 默认开启检查更新
     searchText: '',           // 默认无搜索文本
     sort: '0',                 // 默认按正序排列
-    author: 'yun',             // 默认作者署名
+    author: '',                // 默认作者署名
     mode: 0,                   // 默认模式: 0
 
     // ==============================

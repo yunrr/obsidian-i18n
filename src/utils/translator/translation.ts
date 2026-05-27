@@ -47,7 +47,7 @@ export function generatePlugin(pluginVersion: string, manifestJSON: PluginManife
             description: `${manifestJSON.name} Localization & Tweaks`,
             language: language,
             supportedVersions: pluginVersion,
-            author: settings.author || 'yun',
+            author: settings.author || '',
         },
         dict: {
             'main.js': {
@@ -118,7 +118,7 @@ export function generateTheme(themeManifest: OBThemeManifest, themeStr: string, 
             supportedVersions: themeManifest.version,
             title: themeManifest.name,
             description: `${themeManifest.name} Localization & Tweaks`,
-            author: settings.author || 'yun',
+            author: settings.author || '',
         },
         dict: []
     };
