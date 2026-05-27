@@ -8,7 +8,7 @@ import { Search, LayoutGrid, List, FileOutput, Languages, Loader2, RotateCcw, Sq
 
 import I18N from 'src/main';
 import { OBThemeManifest, ThemeTranslationV1, BatchTaskFailureRecord } from 'src/types';
-import { calculateChecksum, generateTheme, getThemeTranslationSources, shouldSkipExtractionForChineseContent } from '~/utils';
+import { calculateChecksum, generateTheme, getThemeTranslationSources, hasExtractedTranslationContent, shouldSkipExtractionForChineseContent } from '~/utils';
 import { useGlobalStoreInstance } from '~/utils';
 import { loadTranslationFile } from '../../manager/io-manager';
 import { createTranslationProvider } from '~/ai/provider-factory';
@@ -414,11 +414,11 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
         checksum: calculateChecksum(translationJson),
     }), []);
 
-    const saveThemeExtractCheckpoint = useCallback((resources: ThemeBatchResource[], startIndex: number, completedResources: number, totalResources: number) => {
+    const saveThemeExtractCheckpoint = useCallback((resources: ThemeBatchResource[], completedIndexes: Set<number>, completedResources: number, totalResources: number) => {
         i18n.sourceManager.saveBatchTaskCheckpoint(THEME_EXTRACT_CHECKPOINT_KEY, {
             scope: 'theme',
             mode: 'extract',
-            resources: resources.slice(startIndex).map(resource => ({
+            resources: resources.filter((_, index) => !completedIndexes.has(index)).map(resource => ({
                 resourceId: resource.resourceId,
                 label: resource.label,
                 sourceId: resource.sourceId ?? null,
@@ -505,7 +505,6 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
         let successCount = 0;
         let failedCount = 0;
         let skippedCount = 0;
-        let nextCheckpointIndex = 0;
         const completedIndexes = new Set<number>();
         const pendingEntries: Array<{ pluginId: string; content: ThemeTranslationV1; options: { title: string; type: 'theme' } }> = [];
         const themeMap = new Map(themes.map(theme => [theme.name, theme]));
@@ -517,12 +516,16 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
 
         const markResourceDone = (index: number) => {
             completedIndexes.add(index);
-            while (completedIndexes.has(nextCheckpointIndex)) nextCheckpointIndex++;
         };
 
         const saveStopCheckpoint = () => {
             flushPendingEntries();
-            saveThemeExtractCheckpoint(resources, nextCheckpointIndex, processedResources, resources.length);
+            saveThemeExtractCheckpoint(resources, completedIndexes, processedResources, resources.length);
+        };
+
+        const saveProgressCheckpoint = () => {
+            flushPendingEntries();
+            saveThemeExtractCheckpoint(resources, completedIndexes, processedResources, resources.length);
         };
 
         try {
@@ -533,6 +536,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                 const data = allThemeStates[resource.resourceId];
                 updateBatchTask({ currentLabel: resource.label });
 
+                let shouldSaveCheckpoint = false;
                 try {
                     if (!theme || !data || !await fs.pathExists(data.themeCssPath)) {
                         throw new Error(t('Manager.Themes.Errors.ThemeCssNotFound'));
@@ -551,11 +555,13 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
 
                     await yieldToMainThread();
                     const translationJson = generateTheme(manifest, cssStr, i18n.settings);
-                    if (translationJson.dict.length === 0) {
-                        throw new Error(t('Manager.Themes.Errors.NoSettingsBlock'));
-                    }
-                    if (shouldSkipExtractionForChineseContent(manifest.name || theme.name, getThemeTranslationSources(translationJson))) {
+                    const extractedSources = getThemeTranslationSources(translationJson);
+                    if (!hasExtractedTranslationContent(extractedSources)) {
                         skippedCount++;
+                        shouldSaveCheckpoint = true;
+                    } else if (shouldSkipExtractionForChineseContent(manifest.name || theme.name, extractedSources)) {
+                        skippedCount++;
+                        shouldSaveCheckpoint = true;
                     } else {
                         pendingEntries.push({
                             pluginId: theme.name,
@@ -575,6 +581,9 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
 
                 processedResources++;
                 markResourceDone(index);
+                if (shouldSaveCheckpoint) {
+                    saveProgressCheckpoint();
+                }
                 updateBatchTask({ processedResources, successCount, failedCount, skippedCount });
             });
 

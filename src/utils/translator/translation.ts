@@ -43,6 +43,10 @@ export function shouldSkipExtractionForChineseContent(name: string | undefined |
     return hasChineseText(name) || countChineseTranslationSources(sources) >= minChineseSourceCount;
 }
 
+export function hasExtractedTranslationContent(sources: Array<string | undefined | null>): boolean {
+    return sources.some(source => !!source && source.trim() !== '');
+}
+
 export function getPluginTranslationSources(translationJson: PluginTranslationV1): string[] {
     return Object.values(translationJson.dict || {}).flatMap(dict => [
         ...(dict.ast || []).map(item => item.source),

@@ -5,7 +5,7 @@ import { useTranslation } from 'react-i18next';
 import { FolderOpen, FileOutput, XCircle, Loader2, MoreHorizontal, Pen, CloudDownload, Cloud } from 'lucide-react';
 import I18N from 'src/main';
 import { OBThemeManifest, ThemeTranslationV1 } from 'src/types';
-import { i18nOpen, getThemeTranslationSources, shouldSkipExtractionForChineseContent } from '../../../utils';
+import { i18nOpen, getThemeTranslationSources, hasExtractedTranslationContent, shouldSkipExtractionForChineseContent } from '../../../utils';
 import { loadTranslationFile } from '../../../manager/io-manager';
 import { useGlobalStoreInstance } from '~/utils';
 import { THEME_EDITOR_VIEW_TYPE } from '../../theme_editor/editor';
@@ -155,12 +155,13 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
 
             const { generateTheme } = await import('../../../utils');
             const themeTranslation = generateTheme(manifest, cssStr, i18n.settings);
+            const extractedSources = getThemeTranslationSources(themeTranslation);
 
-            if (themeTranslation.dict.length === 0) {
-                i18n.notice.error(t('Manager.Themes.Errors.NoSettingsBlock'));
+            if (!hasExtractedTranslationContent(extractedSources)) {
+                i18n.notice.result(false, '未提取到可翻译内容，已跳过提取');
                 return;
             }
-            if (shouldSkipExtractionForChineseContent(manifest.name || theme.name, getThemeTranslationSources(themeTranslation))) {
+            if (shouldSkipExtractionForChineseContent(manifest.name || theme.name, extractedSources)) {
                 i18n.notice.result(false, '检测到主题已包含中文内容，已跳过提取');
                 return;
             }
