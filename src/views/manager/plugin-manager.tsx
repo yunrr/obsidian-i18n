@@ -8,7 +8,7 @@ import { Search, LayoutGrid, List, FileOutput, Languages, Loader2, RotateCcw, Sq
 
 import I18N from 'src/main';
 import { PluginTranslationV1, BatchTaskFailureRecord } from 'src/types';
-import { formatTimestamp, isValidPluginTranslationV1Format, calculateChecksum, generatePlugin, getPluginTranslationSources, hasExtractedTranslationContent, shouldSkipExtractionForChineseContent } from '../../utils';
+import { formatTimestamp, isValidPluginTranslationV1Format, calculateChecksum, generatePlugin, getPluginTranslationSources, hasChineseText, hasExtractedTranslationContent } from '../../utils';
 import { loadTranslationFile } from '../../manager/io-manager';
 import { useGlobalStoreInstance } from '~/utils';
 import { createTranslationProvider } from '~/ai/provider-factory';
@@ -388,6 +388,13 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         return error instanceof Error && (error.name === 'AbortError' || error.message === '翻译任务已取消');
     }, []);
 
+    const clearLocalSourcesForPlugin = useCallback((pluginId: string) => {
+        i18n.sourceManager
+            .getSourcesForPlugin(pluginId)
+            .filter(source => source.origin === 'local' && source.type === 'plugin')
+            .forEach(source => i18n.sourceManager.removeSource(source.id));
+    }, [i18n]);
+
     const buildPluginSourceUpdate = useCallback((source: any, translationJson: PluginTranslationV1) => ({
         ...source,
         title: translationJson.metadata?.title || source.title,
@@ -589,20 +596,24 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                         fs.readJson(data.manifestDoc)
                     ]);
 
-                    const translationJson = generatePlugin(plugin.version, manifestJSON, mainStr, settings.language, i18n.settings);
-                    const extractedSources = getPluginTranslationSources(translationJson);
-                    if (!hasExtractedTranslationContent(extractedSources)) {
-                        skippedCount++;
-                        shouldSaveCheckpoint = true;
-                    } else if (shouldSkipExtractionForChineseContent(`${manifestJSON.name || plugin.name}\n${manifestJSON.description || ''}`, extractedSources)) {
+                    if (hasChineseText(`${manifestJSON.name || plugin.name}\n${manifestJSON.description || ''}\n${mainStr}`)) {
+                        flushPendingEntries();
+                        clearLocalSourcesForPlugin(plugin.id);
                         skippedCount++;
                         shouldSaveCheckpoint = true;
                     } else {
-                        pendingEntries.push({ pluginId: plugin.id, content: translationJson, options: { title: plugin.name } });
-                        successCount++;
+                        const translationJson = generatePlugin(plugin.version, manifestJSON, mainStr, settings.language, i18n.settings);
+                        const extractedSources = getPluginTranslationSources(translationJson);
+                        if (!hasExtractedTranslationContent(extractedSources)) {
+                            skippedCount++;
+                            shouldSaveCheckpoint = true;
+                        } else {
+                            pendingEntries.push({ pluginId: plugin.id, content: translationJson, options: { title: plugin.name } });
+                            successCount++;
 
-                        if (pendingEntries.length >= Math.max(5, extractConcurrency * 2)) {
-                            flushPendingEntries();
+                            if (pendingEntries.length >= Math.max(5, extractConcurrency * 2)) {
+                                flushPendingEntries();
+                            }
                         }
                     }
                 } catch (error) {
@@ -645,7 +656,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                 skippedCount,
             }));
         }
-    }, [allPluginStates, batchTask.isRunning, extractablePlugins, handleRefresh, i18n, plugins, pluginExtractCheckpoint, savePluginExtractCheckpoint, settings.language, t, updateBatchTask]);
+    }, [allPluginStates, batchTask.isRunning, clearLocalSourcesForPlugin, extractablePlugins, handleRefresh, i18n, plugins, pluginExtractCheckpoint, savePluginExtractCheckpoint, settings.language, t, updateBatchTask]);
 
     const handleBatchExtract = useCallback(() => startPluginBatchExtract(false), [startPluginBatchExtract]);
     const handleResumeExtract = useCallback(() => startPluginBatchExtract(true), [startPluginBatchExtract]);

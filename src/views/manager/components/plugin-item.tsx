@@ -6,7 +6,7 @@ import { useTranslation } from 'react-i18next';
 import { Settings, FolderOpen, Pen, FileOutput, XCircle, Loader2, MoreHorizontal, CloudDownload, Cloud } from 'lucide-react';
 import I18N from 'src/main';
 import { PluginTranslationV1 } from 'src/types';
-import { i18nOpen, AstTranslator, RegexTranslator, isValidPluginTranslationV1Format, getPluginTranslationSources, hasExtractedTranslationContent, shouldSkipExtractionForChineseContent } from '../../../utils';
+import { i18nOpen, AstTranslator, RegexTranslator, isValidPluginTranslationV1Format, getPluginTranslationSources, hasChineseText, hasExtractedTranslationContent } from '../../../utils';
 import { loadTranslationFile } from '../../../manager/io-manager';
 import { useGlobalStoreInstance } from '~/utils';
 import { EDITOR_VIEW_TYPE } from '../../../views';
@@ -156,6 +156,16 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
             const mainStr = mainBuffer.toString();
             const manifestJSON = await fs.readJson(manifestDoc);
 
+            if (hasChineseText(`${manifestJSON.name || plugin.name}\n${manifestJSON.description || ''}\n${mainStr}`)) {
+                sourceManager
+                    ?.getSourcesForPlugin(plugin.id)
+                    .filter(source => source.origin === 'local' && source.type === 'plugin')
+                    .forEach(source => sourceManager.removeSource(source.id));
+                i18n.notice.result(false, '检测到插件已包含中文内容，已跳过提取');
+                refreshParent();
+                return;
+            }
+
             // 延时一下避免 UI 冻结感
             await new Promise(resolve => setTimeout(resolve, 0));
             const { generatePlugin } = await import('../../../utils');
@@ -163,10 +173,6 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
             const extractedSources = getPluginTranslationSources(translationJson);
             if (!hasExtractedTranslationContent(extractedSources)) {
                 i18n.notice.result(false, '未提取到可翻译内容，已跳过提取');
-                return;
-            }
-            if (shouldSkipExtractionForChineseContent(`${manifestJSON.name || plugin.name}\n${manifestJSON.description || ''}`, extractedSources)) {
-                i18n.notice.result(false, '检测到插件已包含中文内容，已跳过提取');
                 return;
             }
 
