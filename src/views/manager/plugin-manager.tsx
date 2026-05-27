@@ -8,7 +8,7 @@ import { Search, LayoutGrid, List, FileOutput, Languages, Loader2, RotateCcw, Sq
 
 import I18N from 'src/main';
 import { PluginTranslationV1, BatchTaskFailureRecord } from 'src/types';
-import { formatTimestamp, isValidPluginTranslationV1Format, calculateChecksum, generatePlugin, getPluginTranslationSources, shouldSkipExtractionForChineseContent } from '../../utils';
+import { formatTimestamp, isValidPluginTranslationV1Format, calculateChecksum, generatePlugin, getPluginTranslationSources, hasExtractedTranslationContent, shouldSkipExtractionForChineseContent } from '../../utils';
 import { loadTranslationFile } from '../../manager/io-manager';
 import { useGlobalStoreInstance } from '~/utils';
 import { createTranslationProvider } from '~/ai/provider-factory';
@@ -396,11 +396,11 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         checksum: calculateChecksum(translationJson),
     }), []);
 
-    const savePluginExtractCheckpoint = useCallback((resources: PluginBatchResource[], startIndex: number, completedResources: number, totalResources: number) => {
+    const savePluginExtractCheckpoint = useCallback((resources: PluginBatchResource[], completedIndexes: Set<number>, completedResources: number, totalResources: number) => {
         i18n.sourceManager.saveBatchTaskCheckpoint(PLUGIN_EXTRACT_CHECKPOINT_KEY, {
             scope: 'plugin',
             mode: 'extract',
-            resources: resources.slice(startIndex).map(resource => ({
+            resources: resources.filter((_, index) => !completedIndexes.has(index)).map(resource => ({
                 resourceId: resource.resourceId,
                 label: resource.label,
                 sourceId: resource.sourceId ?? null,
@@ -547,7 +547,6 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         });
 
         let processedResources = 0;
-        let nextCheckpointIndex = 0;
         let successCount = 0;
         let failedCount = 0;
         let skippedCount = 0;
@@ -561,12 +560,16 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
 
         const markResourceDone = (index: number) => {
             completedIndexes.add(index);
-            while (completedIndexes.has(nextCheckpointIndex)) nextCheckpointIndex++;
         };
 
         const saveStopCheckpoint = () => {
             flushPendingEntries();
-            savePluginExtractCheckpoint(resources, nextCheckpointIndex, processedResources, resources.length);
+            savePluginExtractCheckpoint(resources, completedIndexes, processedResources, resources.length);
+        };
+
+        const saveProgressCheckpoint = () => {
+            flushPendingEntries();
+            savePluginExtractCheckpoint(resources, completedIndexes, processedResources, resources.length);
         };
 
         try {
@@ -575,6 +578,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                 const data = allPluginStates[resource.resourceId];
                 updateBatchTask({ currentLabel: resource.label });
 
+                let shouldSaveCheckpoint = false;
                 try {
                     if (!plugin || !data || !await fs.pathExists(data.mainDoc)) {
                         throw new Error(t('Manager.Plugins.Errors.MainNotFound'));
@@ -586,8 +590,13 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                     ]);
 
                     const translationJson = generatePlugin(plugin.version, manifestJSON, mainStr, settings.language, i18n.settings);
-                    if (shouldSkipExtractionForChineseContent(manifestJSON.name || plugin.name, getPluginTranslationSources(translationJson))) {
+                    const extractedSources = getPluginTranslationSources(translationJson);
+                    if (!hasExtractedTranslationContent(extractedSources)) {
                         skippedCount++;
+                        shouldSaveCheckpoint = true;
+                    } else if (shouldSkipExtractionForChineseContent(`${manifestJSON.name || plugin.name}\n${manifestJSON.description || ''}`, extractedSources)) {
+                        skippedCount++;
+                        shouldSaveCheckpoint = true;
                     } else {
                         pendingEntries.push({ pluginId: plugin.id, content: translationJson, options: { title: plugin.name } });
                         successCount++;
@@ -603,6 +612,9 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
 
                 processedResources++;
                 markResourceDone(index);
+                if (shouldSaveCheckpoint) {
+                    saveProgressCheckpoint();
+                }
                 updateBatchTask({
                     processedResources,
                     successCount,
