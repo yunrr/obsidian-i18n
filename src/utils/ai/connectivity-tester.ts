@@ -579,7 +579,14 @@ export class ConnectivityTester {
                         contentPreview = extractOpenAIContent(parseRequestUrlJson(transRes));
                     } catch { }
 
-                    report.translation.tip = `模型返回了无法被解析的内容。当前选择格式: "${this.responseFormat}"。\n模型实际输出预览: "${contentPreview.substring(0, 200)}..."\n建议: 若模型输出了大量非 JSON 文字，请确认其是否支持 JSON 模式，或改用 Text 格式。`;
+                    const outputPreview = contentPreview.trim()
+                        ? `"${contentPreview.substring(0, 200)}..."`
+                        : '未能从响应中提取模型内容，可能是本地网关返回格式不是标准 OpenAI Chat Completion。';
+                    const suggestion = this.responseFormat === 'text'
+                        ? '当前已是 Text 模式，说明模型输出内容不是插件需要的 JSON 数组，或本地网关返回结构不符合 OpenAI Chat Completion 格式。请确认模型实际输出包含 [{ "i": 1, "t": "译文" }] 这样的数组。'
+                        : `当前使用 ${this.responseFormat} 模式，若模型或网关不支持该响应格式，可改用 Text；但 Text 模式下模型仍必须按提示词输出 JSON 数组。`;
+
+                    report.translation.tip = `模型返回了无法被解析的内容。当前选择格式: "${this.responseFormat}"。\n模型实际输出预览: ${outputPreview}\n建议: ${suggestion}`;
                     report.translation.rawResponse = rawBody;
                     report.overallStatus = 'failed';
                     this.addLog('Translation', '模型生成的内容无法解析，请检查服务商返回的数据或响应格式是否正确。', 'error', rawBody);

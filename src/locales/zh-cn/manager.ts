@@ -114,6 +114,7 @@ export default {
             Unapplied: "未应用",
             Translated: "已翻译",
             Untranslated: "未翻译",
+            PartialFailed: "部分失败",
             ToExtract: "待提取",
             NoTrans: "未翻译",
             Reloading: "重载中..."
@@ -172,6 +173,7 @@ export default {
             Unapplied: "未应用",
             Translated: "已翻译",
             Untranslated: "未翻译",
+            PartialFailed: "部分失败",
             ToExtract: "待提取",
             NoTrans: "未翻译",
             Reloading: "重载中..."

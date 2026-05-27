@@ -206,14 +206,6 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         return grouped;
     }, [cloudManifest]);
 
-    const checkIsTranslated = useCallback((json: PluginTranslationV1) => {
-        if (!json.dict) return false;
-        return Object.values(json.dict).some(fileData =>
-            fileData.ast.some(item => item.target && item.target !== item.source) ||
-            fileData.regex.some(item => item.target && item.target !== item.source)
-        );
-    }, []);
-
     const countPendingTranslationItems = useCallback((json: PluginTranslationV1) => {
         if (!json?.dict) return 0;
 
@@ -224,6 +216,19 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         }
         return count;
     }, []);
+
+    const pluginFailureRecords = useMemo(() => {
+        return i18n.sourceManager.getBatchTaskFailures('plugin');
+    }, [i18n, sourceTick]);
+
+    const failedSourceIds = useMemo(() => {
+        return new Set(pluginFailureRecords.map(record => record.sourceId));
+    }, [pluginFailureRecords]);
+
+    const checkIsTranslated = useCallback((json: PluginTranslationV1, sourceId: string | null) => {
+        if (!json.dict || !sourceId || failedSourceIds.has(sourceId)) return false;
+        return countPendingTranslationItems(json) === 0;
+    }, [countPendingTranslationItems, failedSourceIds]);
 
     const allPluginStates = useMemo(() => {
         const stats: Record<string, PluginItemData> = {};
@@ -250,8 +255,8 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                     localJson = loadTranslationFile(langDoc);
                     translationFormatMark = isValidPluginTranslationV1Format(localJson);
                     if (translationFormatMark && localJson) {
-                        isTranslated = checkIsTranslated(localJson);
                         pendingTranslationCount = countPendingTranslationItems(localJson);
+                        isTranslated = checkIsTranslated(localJson, activeSourceId);
                     }
                 } catch (e) {
                     translationFormatMark = false;
@@ -271,10 +276,14 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                 mtime = isLangDoc ? fs.statSync(langDoc).mtimeMs : Date.now();
 
                 const isApplied = !!(state && state.isApplied);
+                const hasFailedBatches = !!activeSourceId && failedSourceIds.has(activeSourceId);
 
-                if (isApplied) {
+                if (isApplied && isTranslated) {
                     statusColor = 'bg-green-500 dark:bg-green-600';
                     statusText = t('Manager.Plugins.Status.Applied');
+                } else if (hasFailedBatches) {
+                    statusColor = 'bg-orange-500 dark:bg-orange-600';
+                    statusText = t('Manager.Plugins.Status.PartialFailed', '部分失败');
                 } else if (isTranslated) {
                     statusColor = 'bg-blue-500 dark:bg-blue-600';
                     statusText = t('Manager.Plugins.Status.Unapplied');
@@ -310,7 +319,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             };
         }
         return stats;
-    }, [plugins, i18n, refreshKey, sourceIndex, t, checkIsTranslated, countPendingTranslationItems, cloudEntriesByPlugin]);
+    }, [plugins, i18n, refreshKey, sourceIndex, t, checkIsTranslated, countPendingTranslationItems, cloudEntriesByPlugin, failedSourceIds]);
 
     const displayPlugins = useMemo(() => {
         let result = [...plugins];
@@ -365,10 +374,6 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
 
     const pluginTranslateCheckpoint = useMemo(() => {
         return i18n.sourceManager.loadBatchTaskCheckpoint(PLUGIN_TRANSLATE_CHECKPOINT_KEY);
-    }, [i18n, sourceTick]);
-
-    const pluginFailureRecords = useMemo(() => {
-        return i18n.sourceManager.getBatchTaskFailures('plugin');
     }, [i18n, sourceTick]);
 
     const isAbortError = useCallback((error: unknown) => {
@@ -806,7 +811,6 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                         if (!source || !translationJson || pendingCount === 0) {
                             skippedCount++;
                         } else {
-                            clearPluginFailuresForSource(source.id);
                             await yieldToMainThread();
                             const persistCurrentSource = () => {
                                 i18n.sourceManager.saveSourceFile(source.id, translationJson);
@@ -849,6 +853,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                             });
                             flushCurrentSourcePersist();
                             persistCurrentSource();
+                            clearPluginFailuresForSource(source.id);
                             updateBatchTask({ processedItems });
                             successCount++;
                         }
@@ -918,6 +923,14 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
     const handleRetryPluginFailures = useCallback(async () => {
         if (batchTask.isRunning || pluginFailureRecords.length === 0) return;
 
+        const retryConcurrency = getPositiveInt(i18n.settings.batchTranslateConcurrency, 2);
+        const failureGroups = Array.from(pluginFailureRecords.reduce((map, failure) => {
+            const group = map.get(failure.sourceId) || [];
+            group.push(failure);
+            map.set(failure.sourceId, group);
+            return map;
+        }, new Map<string, BatchTaskFailureRecord[]>()).values());
+
         stopRequestedRef.current = false;
         translateAbortControllerRef.current = new AbortController();
         setBatchTask({
@@ -938,83 +951,209 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         let successCount = 0;
         let failedCount = 0;
         let skippedCount = 0;
-        const retriedIds: string[] = [];
 
-        try {
+        const updateRetryProgress = () => {
+            updateBatchTask({ processedResources, processedItems, successCount, failedCount, skippedCount });
+        };
+
+        const markProcessedRecords = (count: number) => {
+            processedResources += count;
+            updateRetryProgress();
+        };
+
+        const processFailureGroup = async (failures: BatchTaskFailureRecord[]) => {
+            if (failures.length === 0 || stopRequestedRef.current || translateAbortControllerRef.current?.signal.aborted) return;
+
+            const firstFailure = failures[0];
+            updateBatchTask({ currentLabel: firstFailure.resourceLabel });
+
+            let source: any | null = null;
+            let translationJson: PluginTranslationV1 | null = null;
+            try {
+                source = i18n.sourceManager.getSource(firstFailure.sourceId);
+                translationJson = i18n.sourceManager.readSourceFile(firstFailure.sourceId) as PluginTranslationV1 | null;
+            } catch (error) {
+                console.error(`[i18n] Failed to load plugin retry source ${firstFailure.sourceId}:`, error);
+            }
+
+            if (!source || !translationJson) {
+                skippedCount += failures.length;
+                markProcessedRecords(failures.length);
+                return;
+            }
+
             const provider = createTranslationProvider();
-            for (const failure of pluginFailureRecords) {
-                if (stopRequestedRef.current || translateAbortControllerRef.current?.signal.aborted) {
-                    new Notice(t('Common.Notices.TaskStopped'));
-                    return;
-                }
+            let sourceDirty = false;
+            let lastPersistAt = 0;
+            const attemptedRecordIds = new Set<string>();
+            const failedRecordIds = new Set<string>();
+            const recordTotalItems = new Map<string, number>();
+            const recordSucceededItems = new Map<string, number>();
 
-                updateBatchTask({ currentLabel: failure.resourceLabel });
-                try {
-                    const source = i18n.sourceManager.getSource(failure.sourceId);
-                    const translationJson = i18n.sourceManager.readSourceFile(failure.sourceId) as PluginTranslationV1 | null;
-                    if (!source || !translationJson) {
-                        skippedCount++;
-                    } else if (failure.batchType === 'ast') {
-                        const items = failure.items.map((item, index) => ({
-                            id: index,
+            const persistSource = () => {
+                if (!sourceDirty) return;
+                i18n.sourceManager.saveSourceFile(source.id, translationJson);
+                i18n.sourceManager.saveSource(buildPluginSourceUpdate(source, translationJson));
+                sourceDirty = false;
+                lastPersistAt = Date.now();
+            };
+
+            const schedulePersistSource = () => {
+                if (!sourceDirty) return;
+                if (Date.now() - lastPersistAt < BATCH_PERSIST_INTERVAL) return;
+                persistSource();
+            };
+
+            const addRecordItems = (failureId: string, count: number) => {
+                if (count <= 0) return;
+                attemptedRecordIds.add(failureId);
+                recordTotalItems.set(failureId, (recordTotalItems.get(failureId) || 0) + count);
+            };
+
+            const markRecordItemSucceeded = (failureId: string) => {
+                recordSucceededItems.set(failureId, (recordSucceededItems.get(failureId) || 0) + 1);
+            };
+
+            const getCompletedRecordIds = () => Array.from(attemptedRecordIds).filter(id => {
+                if (failedRecordIds.has(id)) return false;
+                return (recordSucceededItems.get(id) || 0) >= (recordTotalItems.get(id) || 0);
+            });
+
+            const astItems: AstItem[] = [];
+            const regexItems: RegexItem[] = [];
+            const astMappings = new Map<number, { failureId: string; file: string; index: number }>();
+            const regexMappings = new Map<number, { failureId: string; file: string; index: number }>();
+            let nextAstId = 0;
+            let nextRegexId = 0;
+
+            for (const failure of failures) {
+                if (failure.batchType === 'ast') {
+                    let itemCount = 0;
+                    for (const item of failure.items) {
+                        if (!item.file || item.dictIndex < 0) {
+                            failedRecordIds.add(failure.id);
+                            continue;
+                        }
+                        const id = nextAstId++;
+                        astItems.push({
+                            id,
                             type: item.type || '',
                             name: item.name || '',
                             source: item.source,
                             target: item.target,
-                        }));
-                        await provider.astTranslate(items, async (batchResult) => {
-                            for (const result of batchResult) {
-                                const failedItem = failure.items[result.id];
-                                if (!failedItem?.file) continue;
-                                const dictItem = translationJson.dict[failedItem.file]?.ast[failedItem.dictIndex];
-                                if (dictItem) dictItem.target = result.target;
-                            }
-                            processedItems += batchResult.length;
-                            updateBatchTask({ processedItems });
-                        }, translateAbortControllerRef.current?.signal);
-                        i18n.sourceManager.saveSourceFile(source.id, translationJson);
-                        i18n.sourceManager.saveSource(buildPluginSourceUpdate(source, translationJson));
-                        retriedIds.push(failure.id);
-                        successCount++;
-                    } else if (failure.batchType === 'regex') {
-                        const items = failure.items.map((item, index) => ({
-                            id: index,
-                            source: item.source,
-                            target: item.target,
-                        }));
-                        await provider.regexTranslate(items, async (batchResult) => {
-                            for (const result of batchResult) {
-                                const failedItem = failure.items[result.id];
-                                if (!failedItem?.file) continue;
-                                const dictItem = translationJson.dict[failedItem.file]?.regex[failedItem.dictIndex];
-                                if (dictItem) dictItem.target = result.target;
-                            }
-                            processedItems += batchResult.length;
-                            updateBatchTask({ processedItems });
-                        }, translateAbortControllerRef.current?.signal);
-                        i18n.sourceManager.saveSourceFile(source.id, translationJson);
-                        i18n.sourceManager.saveSource(buildPluginSourceUpdate(source, translationJson));
-                        retriedIds.push(failure.id);
-                        successCount++;
-                    } else {
-                        skippedCount++;
+                        });
+                        astMappings.set(id, { failureId: failure.id, file: item.file, index: item.dictIndex });
+                        itemCount++;
                     }
-                } catch (error) {
-                    if (isAbortError(error)) {
-                        new Notice(t('Common.Notices.TaskStopped'));
-                        return;
+                    addRecordItems(failure.id, itemCount);
+                    if (itemCount === 0) skippedCount++;
+                } else if (failure.batchType === 'regex') {
+                    let itemCount = 0;
+                    for (const item of failure.items) {
+                        if (!item.file || item.dictIndex < 0) {
+                            failedRecordIds.add(failure.id);
+                            continue;
+                        }
+                        const id = nextRegexId++;
+                        regexItems.push({ id, source: item.source, target: item.target });
+                        regexMappings.set(id, { failureId: failure.id, file: item.file, index: item.dictIndex });
+                        itemCount++;
                     }
-                    failedCount++;
-                    console.error(`[i18n] Failed to retry plugin batch ${failure.id}:`, error);
+                    addRecordItems(failure.id, itemCount);
+                    if (itemCount === 0) skippedCount++;
+                } else {
+                    skippedCount++;
                 }
-
-                processedResources++;
-                updateBatchTask({ processedResources, processedItems, successCount, failedCount, skippedCount });
-                await yieldToMainThread();
             }
 
-            i18n.sourceManager.removeBatchTaskFailures(retriedIds);
+            const retryTasks: Promise<void>[] = [];
+
+            if (astItems.length > 0) {
+                retryTasks.push(provider.astTranslate(astItems, async (batchResult) => {
+                    for (const result of batchResult) {
+                        const mapping = astMappings.get(result.id);
+                        if (!mapping) continue;
+                        const dictItem = translationJson.dict[mapping.file]?.ast[mapping.index];
+                        if (!dictItem) {
+                            failedRecordIds.add(mapping.failureId);
+                            continue;
+                        }
+                        dictItem.target = result.target;
+                        sourceDirty = true;
+                        markRecordItemSucceeded(mapping.failureId);
+                    }
+                    processedItems += batchResult.length;
+                    schedulePersistSource();
+                    updateBatchTask({ processedItems });
+                }, translateAbortControllerRef.current?.signal, async (batchItems) => {
+                    for (const item of batchItems) {
+                        const mapping = astMappings.get(item.id);
+                        if (mapping) failedRecordIds.add(mapping.failureId);
+                    }
+                }).then(() => undefined));
+            }
+
+            if (regexItems.length > 0) {
+                retryTasks.push(provider.regexTranslate(regexItems, async (batchResult) => {
+                    for (const result of batchResult) {
+                        const mapping = regexMappings.get(result.id);
+                        if (!mapping) continue;
+                        const dictItem = translationJson.dict[mapping.file]?.regex[mapping.index];
+                        if (!dictItem) {
+                            failedRecordIds.add(mapping.failureId);
+                            continue;
+                        }
+                        dictItem.target = result.target;
+                        sourceDirty = true;
+                        markRecordItemSucceeded(mapping.failureId);
+                    }
+                    processedItems += batchResult.length;
+                    schedulePersistSource();
+                    updateBatchTask({ processedItems });
+                }, translateAbortControllerRef.current?.signal, async (batchItems) => {
+                    for (const item of batchItems) {
+                        const mapping = regexMappings.get(item.id);
+                        if (mapping) failedRecordIds.add(mapping.failureId);
+                    }
+                }).then(() => undefined));
+            }
+
+            try {
+                await Promise.all(retryTasks);
+            } catch (error) {
+                if (isAbortError(error)) {
+                    stopRequestedRef.current = true;
+                } else {
+                    for (const id of attemptedRecordIds) failedRecordIds.add(id);
+                    console.error(`[i18n] Failed to retry plugin source ${firstFailure.sourceId}:`, error);
+                }
+            } finally {
+                persistSource();
+                const completedRecordIds = getCompletedRecordIds();
+                if (completedRecordIds.length > 0) {
+                    i18n.sourceManager.removeBatchTaskFailures(completedRecordIds);
+                    successCount += completedRecordIds.length;
+                }
+
+                const failedRecords = Array.from(attemptedRecordIds).filter(id => failedRecordIds.has(id));
+                if (!stopRequestedRef.current && !translateAbortControllerRef.current?.signal.aborted) {
+                    failedCount += failedRecords.length;
+                    markProcessedRecords(failures.length);
+                } else {
+                    markProcessedRecords(completedRecordIds.length);
+                }
+            }
+        };
+
+        try {
+            await runConcurrentTasks(failureGroups, retryConcurrency, () => stopRequestedRef.current || !!translateAbortControllerRef.current?.signal.aborted, processFailureGroup);
+
             handleRefresh();
+            if (stopRequestedRef.current || translateAbortControllerRef.current?.signal.aborted) {
+                new Notice(t('Common.Notices.TaskStopped'));
+                return;
+            }
+
             new Notice(t('Manager.Common.Notices.RetryFailuresComplete', { success: successCount, fail: failedCount, skip: skippedCount, defaultValue: `失败批次重试完成：成功 ${successCount}，失败 ${failedCount}，跳过 ${skippedCount}` }));
         } finally {
             stopRequestedRef.current = false;
