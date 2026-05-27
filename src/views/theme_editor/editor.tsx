@@ -124,7 +124,7 @@ const ReactThemeEditor: React.FC = () => {
                 supportedVersions: oldManifest.pluginVersion || '0.0.0',
                 title: themeName || '',
                 description: '',
-                author: 'yun'
+                author: ''
             });
         }
 
@@ -186,7 +186,7 @@ const ReactThemeEditor: React.FC = () => {
                     supportedVersions: '0.0.0',
                     title: themeName || '',
                     description: '',
-                    author: 'yun'
+                    author: ''
                 },
                 dict: cleanDict,
             };
