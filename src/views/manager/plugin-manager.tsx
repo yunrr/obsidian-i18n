@@ -388,13 +388,6 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         return error instanceof Error && (error.name === 'AbortError' || error.message === '翻译任务已取消');
     }, []);
 
-    const clearLocalSourcesForPlugin = useCallback((pluginId: string) => {
-        i18n.sourceManager
-            .getSourcesForPlugin(pluginId)
-            .filter(source => source.origin === 'local' && source.type === 'plugin')
-            .forEach(source => i18n.sourceManager.removeSource(source.id));
-    }, [i18n]);
-
     const buildPluginSourceUpdate = useCallback((source: any, translationJson: PluginTranslationV1) => ({
         ...source,
         title: translationJson.metadata?.title || source.title,
@@ -597,8 +590,6 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                     ]);
 
                     if (hasChineseText(`${manifestJSON.name || plugin.name}\n${manifestJSON.description || ''}\n${mainStr}`)) {
-                        flushPendingEntries();
-                        clearLocalSourcesForPlugin(plugin.id);
                         skippedCount++;
                         shouldSaveCheckpoint = true;
                     } else {
@@ -656,7 +647,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                 skippedCount,
             }));
         }
-    }, [allPluginStates, batchTask.isRunning, clearLocalSourcesForPlugin, extractablePlugins, handleRefresh, i18n, plugins, pluginExtractCheckpoint, savePluginExtractCheckpoint, settings.language, t, updateBatchTask]);
+    }, [allPluginStates, batchTask.isRunning, extractablePlugins, handleRefresh, i18n, plugins, pluginExtractCheckpoint, savePluginExtractCheckpoint, settings.language, t, updateBatchTask]);
 
     const handleBatchExtract = useCallback(() => startPluginBatchExtract(false), [startPluginBatchExtract]);
     const handleResumeExtract = useCallback(() => startPluginBatchExtract(true), [startPluginBatchExtract]);

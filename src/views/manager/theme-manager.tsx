@@ -406,13 +406,6 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
         return error instanceof Error && (error.name === 'AbortError' || error.message === '翻译任务已取消');
     }, []);
 
-    const clearLocalSourcesForTheme = useCallback((themeName: string) => {
-        i18n.sourceManager
-            .getSourcesForPlugin(themeName)
-            .filter(source => source.origin === 'local' && source.type === 'theme')
-            .forEach(source => i18n.sourceManager.removeSource(source.id));
-    }, [i18n]);
-
     const buildThemeSourceUpdate = useCallback((source: any, translationJson: ThemeTranslationV1) => ({
         ...source,
         title: translationJson.metadata?.title || source.title,
@@ -562,8 +555,6 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
 
                     await yieldToMainThread();
                     if (hasChineseText(`${manifest.name || theme.name}\n${cssStr}`)) {
-                        flushPendingEntries();
-                        clearLocalSourcesForTheme(theme.name);
                         skippedCount++;
                         shouldSaveCheckpoint = true;
                     } else {
@@ -620,7 +611,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                 skippedCount,
             }));
         }
-    }, [allThemeStates, batchTask.isRunning, clearLocalSourcesForTheme, extractableThemes, handleRefresh, i18n, saveThemeExtractCheckpoint, t, themeExtractCheckpoint, themes, updateBatchTask]);
+    }, [allThemeStates, batchTask.isRunning, extractableThemes, handleRefresh, i18n, saveThemeExtractCheckpoint, t, themeExtractCheckpoint, themes, updateBatchTask]);
 
     const handleBatchExtract = useCallback(() => startThemeBatchExtract(false), [startThemeBatchExtract]);
     const handleResumeExtract = useCallback(() => startThemeBatchExtract(true), [startThemeBatchExtract]);
