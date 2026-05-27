@@ -157,12 +157,7 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
             const manifestJSON = await fs.readJson(manifestDoc);
 
             if (hasChineseText(`${manifestJSON.name || plugin.name}\n${manifestJSON.description || ''}\n${mainStr}`)) {
-                sourceManager
-                    ?.getSourcesForPlugin(plugin.id)
-                    .filter(source => source.origin === 'local' && source.type === 'plugin')
-                    .forEach(source => sourceManager.removeSource(source.id));
                 i18n.notice.result(false, '检测到插件已包含中文内容，已跳过提取');
-                refreshParent();
                 return;
             }
 
