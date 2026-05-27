@@ -28,18 +28,53 @@ import { AstTranslator } from './core-ast-translator';
 import { RegexTranslator } from './core-regex-translator';
 import { useGlobalStoreInstance } from '~/utils';
 
-const CHINESE_TEXT_RE = /[㐀-䶿一-鿿豈-﫿]/;
-const CHINESE_UNICODE_ESCAPE_RE = /\\u(?:34[0-9a-fA-F]{2}|3[5-9a-fA-F][0-9a-fA-F]{2}|4[0-9a-fA-F]{3}|5[0-9a-fA-F]{3}|6[0-9a-fA-F]{3}|7[0-9a-fA-F]{3}|8[0-9a-fA-F]{3}|9[0-9a-fA-F]{3}|f[9aA][0-9a-fA-F]{2})/;
+const CHINESE_TEXT_RE = /[㐀-䶿一-鿿豈-﫿\u{20000}-\u{2FA1F}]/u;
+
+function isChineseCodePoint(codePoint: number): boolean {
+    return (codePoint >= 0x3400 && codePoint <= 0x4DBF)
+        || (codePoint >= 0x4E00 && codePoint <= 0x9FFF)
+        || (codePoint >= 0xF900 && codePoint <= 0xFAFF)
+        || (codePoint >= 0x20000 && codePoint <= 0x2FA1F);
+}
+
+function isHexText(text: string): boolean {
+    for (let index = 0; index < text.length; index++) {
+        const code = text.charCodeAt(index);
+        if (!((code >= 48 && code <= 57) || (code >= 65 && code <= 70) || (code >= 97 && code <= 102))) return false;
+    }
+    return text.length > 0;
+}
+
+function hasChineseUnicodeEscape(text: string): boolean {
+    let index = text.indexOf('\\u');
+    while (index !== -1) {
+        const next = text[index + 2];
+        if (next === '{') {
+            const closeIndex = text.indexOf('}', index + 3);
+            if (closeIndex !== -1) {
+                const hex = text.slice(index + 3, closeIndex);
+                if (hex.length >= 4 && hex.length <= 6 && isHexText(hex) && isChineseCodePoint(Number.parseInt(hex, 16))) return true;
+                index = text.indexOf('\\u', closeIndex + 1);
+                continue;
+            }
+        } else {
+            const hex = text.slice(index + 2, index + 6);
+            if (hex.length === 4 && isHexText(hex) && isChineseCodePoint(Number.parseInt(hex, 16))) return true;
+        }
+        index = text.indexOf('\\u', index + 2);
+    }
+    return false;
+}
 
 export function hasChineseText(text?: string | null): boolean {
-    return !!text && (CHINESE_TEXT_RE.test(text) || CHINESE_UNICODE_ESCAPE_RE.test(text));
+    return !!text && (CHINESE_TEXT_RE.test(text) || hasChineseUnicodeEscape(text));
 }
 
 export function countChineseTranslationSources(sources: Array<string | undefined | null>): number {
     return sources.reduce((count, source) => count + (hasChineseText(source) ? 1 : 0), 0);
 }
 
-export function shouldSkipExtractionForChineseContent(name: string | undefined | null, sources: Array<string | undefined | null>, minChineseSourceCount = 2): boolean {
+export function shouldSkipExtractionForChineseContent(name: string | undefined | null, sources: Array<string | undefined | null>, minChineseSourceCount = 1): boolean {
     return hasChineseText(name) || countChineseTranslationSources(sources) >= minChineseSourceCount;
 }
 

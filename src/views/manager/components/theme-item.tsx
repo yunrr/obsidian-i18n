@@ -5,7 +5,7 @@ import { useTranslation } from 'react-i18next';
 import { FolderOpen, FileOutput, XCircle, Loader2, MoreHorizontal, Pen, CloudDownload, Cloud } from 'lucide-react';
 import I18N from 'src/main';
 import { OBThemeManifest, ThemeTranslationV1 } from 'src/types';
-import { i18nOpen, getThemeTranslationSources, hasExtractedTranslationContent, shouldSkipExtractionForChineseContent } from '../../../utils';
+import { i18nOpen, getThemeTranslationSources, hasChineseText, hasExtractedTranslationContent } from '../../../utils';
 import { loadTranslationFile } from '../../../manager/io-manager';
 import { useGlobalStoreInstance } from '~/utils';
 import { THEME_EDITOR_VIEW_TYPE } from '../../theme_editor/editor';
@@ -153,16 +153,22 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
                 try { manifest = fs.readJsonSync(manifestPath); } catch (e) { /* use default */ }
             }
 
+            if (hasChineseText(`${manifest.name || theme.name}\n${cssStr}`)) {
+                sourceManager
+                    ?.getSourcesForPlugin(theme.name)
+                    .filter(source => source.origin === 'local' && source.type === 'theme')
+                    .forEach(source => sourceManager.removeSource(source.id));
+                i18n.notice.result(false, '检测到主题已包含中文内容，已跳过提取');
+                refreshParent();
+                return;
+            }
+
             const { generateTheme } = await import('../../../utils');
             const themeTranslation = generateTheme(manifest, cssStr, i18n.settings);
             const extractedSources = getThemeTranslationSources(themeTranslation);
 
             if (!hasExtractedTranslationContent(extractedSources)) {
                 i18n.notice.result(false, '未提取到可翻译内容，已跳过提取');
-                return;
-            }
-            if (shouldSkipExtractionForChineseContent(manifest.name || theme.name, extractedSources)) {
-                i18n.notice.result(false, '检测到主题已包含中文内容，已跳过提取');
                 return;
             }
 
