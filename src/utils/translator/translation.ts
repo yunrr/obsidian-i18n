@@ -28,6 +28,32 @@ import { AstTranslator } from './core-ast-translator';
 import { RegexTranslator } from './core-regex-translator';
 import { useGlobalStoreInstance } from '~/utils';
 
+const CHINESE_TEXT_RE = /[㐀-䶿一-鿿豈-﫿]/;
+const CHINESE_UNICODE_ESCAPE_RE = /\\u(?:34[0-9a-fA-F]{2}|3[5-9a-fA-F][0-9a-fA-F]{2}|4[0-9a-fA-F]{3}|5[0-9a-fA-F]{3}|6[0-9a-fA-F]{3}|7[0-9a-fA-F]{3}|8[0-9a-fA-F]{3}|9[0-9a-fA-F]{3}|f[9aA][0-9a-fA-F]{2})/;
+
+export function hasChineseText(text?: string | null): boolean {
+    return !!text && (CHINESE_TEXT_RE.test(text) || CHINESE_UNICODE_ESCAPE_RE.test(text));
+}
+
+export function countChineseTranslationSources(sources: Array<string | undefined | null>): number {
+    return sources.reduce((count, source) => count + (hasChineseText(source) ? 1 : 0), 0);
+}
+
+export function shouldSkipExtractionForChineseContent(name: string | undefined | null, sources: Array<string | undefined | null>, minChineseSourceCount = 2): boolean {
+    return hasChineseText(name) || countChineseTranslationSources(sources) >= minChineseSourceCount;
+}
+
+export function getPluginTranslationSources(translationJson: PluginTranslationV1): string[] {
+    return Object.values(translationJson.dict || {}).flatMap(dict => [
+        ...(dict.ast || []).map(item => item.source),
+        ...(dict.regex || []).map(item => item.source),
+    ]);
+}
+
+export function getThemeTranslationSources(translationJson: ThemeTranslationV1): string[] {
+    return (translationJson.dict || []).map(item => item.source);
+}
+
 /**
  * 生成插件的翻译 JSON 对象。
  * @param pluginVersion - 插件的版本号。

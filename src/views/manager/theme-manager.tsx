@@ -8,7 +8,7 @@ import { Search, LayoutGrid, List, FileOutput, Languages, Loader2, RotateCcw, Sq
 
 import I18N from 'src/main';
 import { OBThemeManifest, ThemeTranslationV1, BatchTaskFailureRecord } from 'src/types';
-import { calculateChecksum, generateTheme } from '~/utils';
+import { calculateChecksum, generateTheme, getThemeTranslationSources, shouldSkipExtractionForChineseContent } from '~/utils';
 import { useGlobalStoreInstance } from '~/utils';
 import { loadTranslationFile } from '../../manager/io-manager';
 import { createTranslationProvider } from '~/ai/provider-factory';
@@ -113,7 +113,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
     const [viewMode, setViewModeState] = useState<'list' | 'grid'>(i18n.settings.themeViewMode || 'list');
     const [themes, setThemes] = useState<ThemeInfo[]>([]);
     const [refreshKey, setRefreshKey] = useState(0);
-    const [statusFilter, setStatusFilter] = useState<'all' | 'applied' | 'unapplied' | 'translated' | 'untranslated' | 'toExtract'>('all');
+    const [statusFilter, setStatusFilter] = useState<'all' | 'applied' | 'unapplied' | 'translated' | 'untranslated' | 'partialFailed' | 'toExtract'>('all');
     const [cloudManifest, setCloudManifest] = useState<any[]>([]);
     const [batchTask, setBatchTask] = useState<BatchTaskState>(EMPTY_BATCH_TASK_STATE);
     const translateAbortControllerRef = useRef<AbortController | null>(null);
@@ -159,6 +159,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
     const filterOptions = useMemo(() => [
         { key: 'all', label: t('Manager.Common.Filters.All') },
         { key: 'toExtract', label: t('Manager.Themes.Filters.ToExtract') },
+        { key: 'partialFailed', label: t('Manager.Themes.Filters.PartialFailed') },
         { key: 'untranslated', label: t('Manager.Themes.Filters.Untranslated') },
         { key: 'translated', label: t('Manager.Themes.Filters.Translated') },
         { key: 'unapplied', label: t('Manager.Themes.Filters.Unapplied') },
@@ -330,6 +331,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                 themeCssPath,
                 sources,
                 activeSourceId,
+                hasFailedBatches,
                 isApplied,
                 isTranslated,
                 pendingTranslationCount,
@@ -362,7 +364,9 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                     case 'translated':
                         return data.isTranslated;
                     case 'untranslated':
-                        return data.hasTranslation && !data.isTranslated;
+                        return data.hasTranslation && !data.isTranslated && !data.hasFailedBatches;
+                    case 'partialFailed':
+                        return data.hasFailedBatches;
                     case 'toExtract':
                         return !data.hasTranslation;
                     default:
@@ -500,6 +504,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
         let processedResources = 0;
         let successCount = 0;
         let failedCount = 0;
+        let skippedCount = 0;
         let nextCheckpointIndex = 0;
         const completedIndexes = new Set<number>();
         const pendingEntries: Array<{ pluginId: string; content: ThemeTranslationV1; options: { title: string; type: 'theme' } }> = [];
@@ -549,15 +554,19 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                     if (translationJson.dict.length === 0) {
                         throw new Error(t('Manager.Themes.Errors.NoSettingsBlock'));
                     }
-                    pendingEntries.push({
-                        pluginId: theme.name,
-                        content: translationJson,
-                        options: { title: theme.name, type: 'theme' }
-                    });
-                    successCount++;
+                    if (shouldSkipExtractionForChineseContent(manifest.name || theme.name, getThemeTranslationSources(translationJson))) {
+                        skippedCount++;
+                    } else {
+                        pendingEntries.push({
+                            pluginId: theme.name,
+                            content: translationJson,
+                            options: { title: theme.name, type: 'theme' }
+                        });
+                        successCount++;
 
-                    if (pendingEntries.length >= Math.max(5, extractConcurrency * 2)) {
-                        flushPendingEntries();
+                        if (pendingEntries.length >= Math.max(5, extractConcurrency * 2)) {
+                            flushPendingEntries();
+                        }
                     }
                 } catch (error) {
                     failedCount++;
@@ -566,7 +575,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
 
                 processedResources++;
                 markResourceDone(index);
-                updateBatchTask({ processedResources, successCount, failedCount });
+                updateBatchTask({ processedResources, successCount, failedCount, skippedCount });
             });
 
             if (stopRequestedRef.current) {
@@ -578,7 +587,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             flushPendingEntries();
             i18n.sourceManager.clearBatchTaskCheckpoint(THEME_EXTRACT_CHECKPOINT_KEY);
             handleRefresh();
-            new Notice(t('Manager.Themes.Notices.BatchExtractComplete', { success: successCount, fail: failedCount, defaultValue: `批量提取完成：成功 ${successCount}，失败 ${failedCount}` }));
+            new Notice(t('Manager.Themes.Notices.BatchExtractComplete', { success: successCount, fail: failedCount, skip: skippedCount, defaultValue: `批量提取完成：成功 ${successCount}，失败 ${failedCount}，跳过 ${skippedCount}` }));
         } finally {
             stopRequestedRef.current = false;
             setBatchTask(prev => ({
@@ -588,6 +597,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                 processedResources,
                 successCount,
                 failedCount,
+                skippedCount,
             }));
         }
     }, [allThemeStates, batchTask.isRunning, extractableThemes, handleRefresh, i18n, saveThemeExtractCheckpoint, t, themeExtractCheckpoint, themes, updateBatchTask]);

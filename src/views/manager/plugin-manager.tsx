@@ -8,7 +8,7 @@ import { Search, LayoutGrid, List, FileOutput, Languages, Loader2, RotateCcw, Sq
 
 import I18N from 'src/main';
 import { PluginTranslationV1, BatchTaskFailureRecord } from 'src/types';
-import { formatTimestamp, isValidPluginTranslationV1Format, calculateChecksum, generatePlugin } from '../../utils';
+import { formatTimestamp, isValidPluginTranslationV1Format, calculateChecksum, generatePlugin, getPluginTranslationSources, shouldSkipExtractionForChineseContent } from '../../utils';
 import { loadTranslationFile } from '../../manager/io-manager';
 import { useGlobalStoreInstance } from '~/utils';
 import { createTranslationProvider } from '~/ai/provider-factory';
@@ -106,7 +106,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
     const [searchTerm, setSearchTerm] = useState(settings.searchText);
     const [sortType, setSortType] = useState(settings.sort);
     const [viewMode, setViewModeState] = useState<'list' | 'grid'>(settings.pluginViewMode || 'list');
-    const [statusFilter, setStatusFilter] = useState<'all' | 'applied' | 'unapplied' | 'translated' | 'untranslated' | 'toExtract'>('all');
+    const [statusFilter, setStatusFilter] = useState<'all' | 'applied' | 'unapplied' | 'translated' | 'untranslated' | 'partialFailed' | 'error' | 'toExtract'>('all');
     const [plugins, setPlugins] = useState<PluginManifest[]>([]);
     const [enabledPlugins, setEnabledPlugins] = useState<Set<string>>(new Set());
     const [refreshKey, setRefreshKey] = useState(0);
@@ -155,6 +155,8 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
     const filterOptions = useMemo(() => [
         { key: 'all', label: t('Manager.Common.Filters.All') },
         { key: 'toExtract', label: t('Manager.Plugins.Filters.ToExtract') },
+        { key: 'error', label: t('Manager.Plugins.Filters.Error') },
+        { key: 'partialFailed', label: t('Manager.Plugins.Filters.PartialFailed') },
         { key: 'untranslated', label: t('Manager.Plugins.Filters.Untranslated') },
         { key: 'translated', label: t('Manager.Plugins.Filters.Translated') },
         { key: 'unapplied', label: t('Manager.Plugins.Filters.Unapplied') },
@@ -245,6 +247,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
 
             const state = i18n.stateManager.getPluginState(plugin.id);
             const sources = sourceIndex.byPlugin[plugin.id] || [];
+            const hasFailedBatches = !!activeSourceId && failedSourceIds.has(activeSourceId);
 
             let localJson: PluginTranslationV1 | undefined;
             let translationFormatMark = true;
@@ -276,7 +279,6 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                 mtime = isLangDoc ? fs.statSync(langDoc).mtimeMs : Date.now();
 
                 const isApplied = !!(state && state.isApplied);
-                const hasFailedBatches = !!activeSourceId && failedSourceIds.has(activeSourceId);
 
                 if (isApplied && isTranslated) {
                     statusColor = 'bg-green-500 dark:bg-green-600';
@@ -292,7 +294,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                     statusText = t('Manager.Plugins.Status.Untranslated');
                 }
                 statusDesc = `${t('Manager.Plugins.Labels.Mtime')}: ${formatTimestamp(mtime)}`;
-            } else if (localJson && !translationFormatMark) {
+            } else if (isLangDoc && !translationFormatMark) {
                 statusColor = 'bg-destructive';
                 statusText = t('Manager.Common.Errors.Error');
                 statusDesc = t('Manager.Common.Errors.ErrorDesc');
@@ -308,6 +310,8 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                 sources,
                 activeSourceId,
                 translationFormatMark,
+                hasFailedBatches,
+                hasFormatError: isLangDoc && !translationFormatMark,
                 mainDoc,
                 manifestDoc,
                 isApplied: !!(state && state.isApplied),
@@ -340,7 +344,11 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                     case 'translated':
                         return data.isTranslated;
                     case 'untranslated':
-                        return data.isLangDoc && !data.isTranslated;
+                        return data.isLangDoc && data.translationFormatMark && !data.isTranslated && !data.hasFailedBatches;
+                    case 'partialFailed':
+                        return data.hasFailedBatches;
+                    case 'error':
+                        return data.hasFormatError;
                     case 'toExtract':
                         return !data.isLangDoc;
                     default:
@@ -542,6 +550,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         let nextCheckpointIndex = 0;
         let successCount = 0;
         let failedCount = 0;
+        let skippedCount = 0;
         const completedIndexes = new Set<number>();
         const pendingEntries: Array<{ pluginId: string; content: PluginTranslationV1; options: { title: string } }> = [];
 
@@ -577,11 +586,15 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                     ]);
 
                     const translationJson = generatePlugin(plugin.version, manifestJSON, mainStr, settings.language, i18n.settings);
-                    pendingEntries.push({ pluginId: plugin.id, content: translationJson, options: { title: plugin.name } });
-                    successCount++;
+                    if (shouldSkipExtractionForChineseContent(manifestJSON.name || plugin.name, getPluginTranslationSources(translationJson))) {
+                        skippedCount++;
+                    } else {
+                        pendingEntries.push({ pluginId: plugin.id, content: translationJson, options: { title: plugin.name } });
+                        successCount++;
 
-                    if (pendingEntries.length >= Math.max(5, extractConcurrency * 2)) {
-                        flushPendingEntries();
+                        if (pendingEntries.length >= Math.max(5, extractConcurrency * 2)) {
+                            flushPendingEntries();
+                        }
                     }
                 } catch (error) {
                     failedCount++;
@@ -594,6 +607,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                     processedResources,
                     successCount,
                     failedCount,
+                    skippedCount,
                 });
             });
 
@@ -606,7 +620,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             flushPendingEntries();
             i18n.sourceManager.clearBatchTaskCheckpoint(PLUGIN_EXTRACT_CHECKPOINT_KEY);
             handleRefresh();
-            new Notice(t('Manager.Plugins.Notices.BatchExtractComplete', { success: successCount, fail: failedCount, defaultValue: `批量提取完成：成功 ${successCount}，失败 ${failedCount}` }));
+            new Notice(t('Manager.Plugins.Notices.BatchExtractComplete', { success: successCount, fail: failedCount, skip: skippedCount, defaultValue: `批量提取完成：成功 ${successCount}，失败 ${failedCount}，跳过 ${skippedCount}` }));
         } finally {
             stopRequestedRef.current = false;
             setBatchTask(prev => ({
@@ -616,6 +630,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                 processedResources,
                 successCount,
                 failedCount,
+                skippedCount,
             }));
         }
     }, [allPluginStates, batchTask.isRunning, extractablePlugins, handleRefresh, i18n, plugins, pluginExtractCheckpoint, savePluginExtractCheckpoint, settings.language, t, updateBatchTask]);

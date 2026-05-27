@@ -50,7 +50,6 @@ export class ObsidianView {
         // 确保工作区布局已加载完成
         await new Promise(resolve => workspace.onLayoutReady(() => resolve(null)));
 
-        this.deactivate();
         let workspaceLeaf: WorkspaceLeaf | null = null;
         const leaves = workspace.getLeavesOfType(this.viewType);
         if (leaves.length > 0) {

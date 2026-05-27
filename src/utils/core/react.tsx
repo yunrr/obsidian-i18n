@@ -261,15 +261,15 @@ export function mountReactView(
     let shadowRoot = contentEl.shadowRoot;
     if (!shadowRoot) {
         shadowRoot = contentEl.attachShadow({ mode: 'open' });
+    }
 
-        // 只在初次创建时注入样式
-        if (i18n.sharedStyleSheet) {
-            shadowRoot.adoptedStyleSheets = [i18n.sharedStyleSheet];
-        } else if (i18n.css) {
-            const style = document.createElement('style');
-            style.textContent = i18n.css;
-            shadowRoot.appendChild(style);
-        }
+    if (i18n.sharedStyleSheet && !shadowRoot.adoptedStyleSheets.includes(i18n.sharedStyleSheet)) {
+        shadowRoot.adoptedStyleSheets = [...shadowRoot.adoptedStyleSheets, i18n.sharedStyleSheet];
+    } else if (!i18n.sharedStyleSheet && i18n.css && !shadowRoot.querySelector('style[data-i18n-view-style="true"]')) {
+        const style = document.createElement('style');
+        style.dataset.i18nViewStyle = 'true';
+        style.textContent = i18n.css;
+        shadowRoot.appendChild(style);
     }
 
     // 准备挂载点（并清理之前的挂载内容，防止重复）
