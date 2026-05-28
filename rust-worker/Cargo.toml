@@ -1,0 +1,20 @@
+[package]
+name = "i18n-companion-worker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+axum = { version = "0.7", features = ["macros"] }
+brotli = "8.0"
+flate2 = "1.0"
+hex = "0.4"
+nanoid = "0.4"
+regex = "1.11"
+reqwest = { version = "0.12", default-features = false, features = ["brotli", "gzip", "deflate", "json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+sha2 = "0.10"
+tokio = { version = "1.43", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors"] }
+url = "2.5"

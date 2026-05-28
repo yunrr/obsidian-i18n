@@ -1383,69 +1383,99 @@ async function handleTask(type: string, payload: any) {
     throw new Error(`未知任务类型: ${type}`);
 }
 
-const server = http.createServer(async (req, res) => {
-    try {
-        if (req.method === 'GET' && req.url === '/health') {
-            send(res, 200, { ok: true });
-            return;
-        }
-
-        if (req.method === 'POST' && req.url === '/proxy') {
-            const body = await readBody(req);
-            const payload = JSON.parse(body || '{}');
-            const response = await proxy(payload);
-            send(res, 200, { ok: true, response });
-            return;
-        }
-
-        if (req.method === 'POST' && req.url === '/task/start') {
-            const body = await readBody(req);
-            const payload = JSON.parse(body || '{}');
-            const task = startAsyncTask(payload.type, payload.payload);
-            send(res, 200, { ok: true, taskId: task.progress.taskId, progress: task.progress });
-            return;
-        }
-
-        if (req.method === 'GET' && req.url?.startsWith('/task/status')) {
-            const target = new URL(req.url, `http://${host}:${port}`);
-            const taskId = target.searchParams.get('id') || '';
-            const task = getTask(taskId);
-            send(res, 200, { ok: true, progress: task.progress });
-            return;
-        }
-
-        if (req.method === 'POST' && req.url === '/task/cancel') {
-            const body = await readBody(req);
-            const payload = JSON.parse(body || '{}');
-            const task = getTask(payload.taskId || '');
-            task.cancelRequested = true;
-            touchProgress(task, { currentLabel: '' });
-            send(res, 200, { ok: true, progress: task.progress });
-            return;
-        }
-
-        if (req.method === 'POST' && req.url === '/task') {
-            const body = await readBody(req);
-            const payload = JSON.parse(body || '{}');
-            const result = await handleTask(payload.type, payload.payload);
-            send(res, 200, { ok: true, result });
-            return;
-        }
-
-        send(res, 404, { ok: false, error: 'not found' });
-    } catch (error) {
-        send(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
-    }
-});
-
-server.listen(port, host, () => {
-    console.log(`ready ${host}:${port}`);
-});
-
-function shutdown() {
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 1000).unref();
+function readStdin(): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        process.stdin.on('data', chunk => chunks.push(Buffer.from(chunk)));
+        process.stdin.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+        process.stdin.on('error', reject);
+    });
 }
 
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+async function runStdioTask() {
+    const logToStderr = (...args: any[]) => process.stderr.write(`${args.map(value => typeof value === 'string' ? value : JSON.stringify(value)).join(' ')}\n`);
+    console.log = logToStderr;
+    console.debug = logToStderr;
+    console.warn = logToStderr;
+    console.error = logToStderr;
+
+    try {
+        const body = await readStdin();
+        const payload = JSON.parse(body || '{}');
+        const result = await handleTask(payload.type, payload.payload);
+        process.stdout.write(JSON.stringify({ ok: true, result }));
+    } catch (error) {
+        process.stdout.write(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));
+    }
+}
+
+if (process.argv[2] === 'stdio-task') {
+    runStdioTask();
+} else {
+    const server = http.createServer(async (req, res) => {
+        try {
+            if (req.method === 'GET' && req.url === '/health') {
+                send(res, 200, { ok: true });
+                return;
+            }
+
+            if (req.method === 'POST' && req.url === '/proxy') {
+                const body = await readBody(req);
+                const payload = JSON.parse(body || '{}');
+                const response = await proxy(payload);
+                send(res, 200, { ok: true, response });
+                return;
+            }
+
+            if (req.method === 'POST' && req.url === '/task/start') {
+                const body = await readBody(req);
+                const payload = JSON.parse(body || '{}');
+                const task = startAsyncTask(payload.type, payload.payload);
+                send(res, 200, { ok: true, taskId: task.progress.taskId, progress: task.progress });
+                return;
+            }
+
+            if (req.method === 'GET' && req.url?.startsWith('/task/status')) {
+                const target = new URL(req.url, `http://${host}:${port}`);
+                const taskId = target.searchParams.get('id') || '';
+                const task = getTask(taskId);
+                send(res, 200, { ok: true, progress: task.progress });
+                return;
+            }
+
+            if (req.method === 'POST' && req.url === '/task/cancel') {
+                const body = await readBody(req);
+                const payload = JSON.parse(body || '{}');
+                const task = getTask(payload.taskId || '');
+                task.cancelRequested = true;
+                touchProgress(task, { currentLabel: '' });
+                send(res, 200, { ok: true, progress: task.progress });
+                return;
+            }
+
+            if (req.method === 'POST' && req.url === '/task') {
+                const body = await readBody(req);
+                const payload = JSON.parse(body || '{}');
+                const result = await handleTask(payload.type, payload.payload);
+                send(res, 200, { ok: true, result });
+                return;
+            }
+
+            send(res, 404, { ok: false, error: 'not found' });
+        } catch (error) {
+            send(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
+        }
+    });
+
+    server.listen(port, host, () => {
+        console.log(`ready ${host}:${port}`);
+    });
+
+    function shutdown() {
+        server.close(() => process.exit(0));
+        setTimeout(() => process.exit(0), 1000).unref();
+    }
+
+    process.on('SIGTERM', shutdown);
+    process.on('SIGINT', shutdown);
+}
