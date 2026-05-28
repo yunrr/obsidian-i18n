@@ -5,8 +5,10 @@
 *.iml
 .idea
 
-# npm
-node_modules
+# rust worker
+/rust-worker/target/
+/i18n-companion-worker
+/i18n-companion-worker.exe
 
 # obsidian
 /main.js
@@ -31,3 +33,4 @@ cache
 
 
 
+node_modules

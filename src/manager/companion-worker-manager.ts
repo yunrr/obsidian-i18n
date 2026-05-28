@@ -1,4 +1,5 @@
 import * as path from 'path';
+import { existsSync } from 'fs';
 import { requestUrl } from 'obsidian';
 import { spawn } from 'child_process';
 import type { ChildProcess } from 'child_process';
@@ -61,9 +62,11 @@ export class CompanionWorkerManager {
     private endpoint = '';
     private startPromise: Promise<boolean> | null = null;
     private readonly scriptPath: string;
+    private readonly rustWorkerPath: string;
 
     constructor(private readonly plugin: I18N, private readonly pluginDir: string) {
         this.scriptPath = path.join(pluginDir, 'i18n-companion-worker.cjs');
+        this.rustWorkerPath = path.join(pluginDir, process.platform === 'win32' ? 'i18n-companion-worker.exe' : 'i18n-companion-worker');
     }
 
     public async start(): Promise<boolean> {
@@ -192,11 +195,26 @@ export class CompanionWorkerManager {
     private async startInner(): Promise<boolean> {
         try {
             const port = this.getPort();
+            if (existsSync(this.rustWorkerPath) && await this.spawnWorker(this.rustWorkerPath, [String(port)], port, { I18N_COMPANION_NODE_PATH: this.plugin.settings.llmCompanionNodePath?.trim() || 'node' }, true)) {
+                return true;
+            }
+
             const nodePath = this.plugin.settings.llmCompanionNodePath?.trim() || 'node';
-            const worker = spawn(nodePath, [this.scriptPath, String(port)], {
+            return this.spawnWorker(nodePath, [this.scriptPath, String(port)], port);
+        } catch (error) {
+            console.warn('[I18N Companion] 启动失败', error);
+            this.stop();
+            return false;
+        }
+    }
+
+    private async spawnWorker(command: string, args: string[], port: number, extraEnv?: Record<string, string>, quiet = false): Promise<boolean> {
+        try {
+            const worker = spawn(command, args, {
                 cwd: this.pluginDir,
                 windowsHide: true,
                 stdio: ['ignore', 'pipe', 'pipe'],
+                env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
             });
 
             this.workerProcess = worker;
@@ -211,7 +229,7 @@ export class CompanionWorkerManager {
                 }
             });
             worker.once('error', error => {
-                console.warn('[I18N Companion] 启动失败', error);
+                if (!quiet) console.warn('[I18N Companion] 启动失败', error);
                 if (this.workerProcess === worker) {
                     this.workerProcess = null;
                     this.endpoint = '';
@@ -226,7 +244,7 @@ export class CompanionWorkerManager {
 
             return true;
         } catch (error) {
-            console.warn('[I18N Companion] 启动失败', error);
+            if (!quiet) console.warn('[I18N Companion] 启动失败', error);
             this.stop();
             return false;
         }
