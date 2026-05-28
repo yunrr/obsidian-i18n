@@ -21,12 +21,10 @@
  */
 
 import { createHash } from 'crypto';
-import { ThemeTranslationV1Metadata } from "@/src/types";
-import { PluginManifest } from 'obsidian';
-import { OBThemeManifest, ThemeTranslationV1, ThemeTranslationSchemaVersion, ThemeTranslationItem, PluginTranslationV1, PluginTranslationSchemaVersion, PluginTranslationV1Ast, PluginTranslationV1Regex } from '../../types';
+import type { PluginManifest } from 'obsidian';
+import { OBThemeManifest, ThemeTranslationV1, ThemeTranslationSchemaVersion, PluginTranslationV1, PluginTranslationSchemaVersion, PluginTranslationV1Ast, PluginTranslationV1Regex } from '../../types';
 import { AstTranslator } from './core-ast-translator';
 import { RegexTranslator } from './core-regex-translator';
-import { useGlobalStoreInstance } from '~/utils';
 
 const CHINESE_TEXT_RE = /[㐀-䶿一-鿿豈-﫿\u{20000}-\u{2FA1F}]/u;
 
@@ -45,29 +43,102 @@ function isHexText(text: string): boolean {
     return text.length > 0;
 }
 
-function hasChineseUnicodeEscape(text: string): boolean {
+function getChineseUnicodeEscapeLength(text: string, index: number): number {
+    if (text[index] !== '\\' || text[index + 1] !== 'u') return 0;
+
+    const next = text[index + 2];
+    if (next === '{') {
+        const closeIndex = text.indexOf('}', index + 3);
+        if (closeIndex === -1) return 0;
+
+        const hex = text.slice(index + 3, closeIndex);
+        if (hex.length >= 4 && hex.length <= 6 && isHexText(hex) && isChineseCodePoint(Number.parseInt(hex, 16))) {
+            return closeIndex - index + 1;
+        }
+        return 0;
+    }
+
+    const hex = text.slice(index + 2, index + 6);
+    if (hex.length === 4 && isHexText(hex) && isChineseCodePoint(Number.parseInt(hex, 16))) {
+        return 6;
+    }
+    return 0;
+}
+
+function countChineseUnicodeEscapes(text: string, limit: number): number {
+    let count = 0;
     let index = text.indexOf('\\u');
     while (index !== -1) {
-        const next = text[index + 2];
-        if (next === '{') {
-            const closeIndex = text.indexOf('}', index + 3);
-            if (closeIndex !== -1) {
-                const hex = text.slice(index + 3, closeIndex);
-                if (hex.length >= 4 && hex.length <= 6 && isHexText(hex) && isChineseCodePoint(Number.parseInt(hex, 16))) return true;
-                index = text.indexOf('\\u', closeIndex + 1);
-                continue;
-            }
+        const escapeLength = getChineseUnicodeEscapeLength(text, index);
+        if (escapeLength > 0) {
+            count++;
+            if (count >= limit) return count;
+            index = text.indexOf('\\u', index + escapeLength);
         } else {
-            const hex = text.slice(index + 2, index + 6);
-            if (hex.length === 4 && isHexText(hex) && isChineseCodePoint(Number.parseInt(hex, 16))) return true;
+            index = text.indexOf('\\u', index + 2);
         }
-        index = text.indexOf('\\u', index + 2);
     }
-    return false;
+    return count;
+}
+
+function hasChineseUnicodeEscape(text: string): boolean {
+    return countChineseUnicodeEscapes(text, 1) > 0;
+}
+
+function hasChineseRunPattern(text: string, minRunLength: number, minRunCount: number, requiredRunLength: number): boolean {
+    let matchedRuns = 0;
+    let hasRequiredRun = false;
+    let runLength = 0;
+
+    const flushRun = () => {
+        if (runLength >= minRunLength) {
+            matchedRuns++;
+        }
+        if (runLength >= requiredRunLength) {
+            hasRequiredRun = true;
+        }
+        runLength = 0;
+    };
+
+    for (let index = 0; index < text.length;) {
+        const escapeLength = getChineseUnicodeEscapeLength(text, index);
+        if (escapeLength > 0) {
+            runLength++;
+            index += escapeLength;
+            continue;
+        }
+
+        const codePoint = text.codePointAt(index) || 0;
+        if (isChineseCodePoint(codePoint)) {
+            runLength++;
+        } else {
+            flushRun();
+            if (matchedRuns >= minRunCount && hasRequiredRun) return true;
+        }
+        index += codePoint > 0xffff ? 2 : 1;
+    }
+    flushRun();
+    return matchedRuns >= minRunCount && hasRequiredRun;
 }
 
 export function hasChineseText(text?: string | null): boolean {
     return !!text && (CHINESE_TEXT_RE.test(text) || hasChineseUnicodeEscape(text));
+}
+
+export function hasChineseTextAtLeast(text: string | undefined | null, minCount: number): boolean {
+    if (!text || minCount <= 0) return false;
+    let count = 0;
+    for (const char of text) {
+        if (isChineseCodePoint(char.codePointAt(0) || 0)) {
+            count++;
+            if (count >= minCount) return true;
+        }
+    }
+    return count + countChineseUnicodeEscapes(text, minCount - count) >= minCount;
+}
+
+export function hasBoundedChineseRuns(text: string | undefined | null, minRunLength = 2, minRunCount = 5, requiredRunLength = 5): boolean {
+    return !!text && hasChineseRunPattern(text, minRunLength, minRunCount, requiredRunLength);
 }
 
 export function countChineseTranslationSources(sources: Array<string | undefined | null>): number {

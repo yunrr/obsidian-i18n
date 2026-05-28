@@ -11,7 +11,7 @@ import { t } from './locales';
 import { icons } from '~/utils';
 import commands from './command';
 
-import { APIManager, ViewManager, NoticeManager, StateManager, BackupManager, SourceManager, InjectorManager, CoreManager, ExtractManager, AutoManager } from './manager';
+import { APIManager, ViewManager, NoticeManager, StateManager, BackupManager, SourceManager, InjectorManager, CoreManager, ExtractManager, AutoManager, CompanionWorkerManager } from './manager';
 import { info } from './utils';
 import { OBThemeManifest, Contributor, NameTranslationJSON } from '~/types';
 
@@ -51,6 +51,7 @@ export default class I18N extends Plugin {
     coreManager: CoreManager; // [管理器] 核心管理器
     extractManager: ExtractManager; // [管理器] 提取助手管理器1
     autoManager: AutoManager; // [管理器] 自动化管理器
+    companionWorkerManager: CompanionWorkerManager; // [管理器] 本地伴生进程管理器
     activeSettingTab: string = 'basis'; // [变量] 当前设置页激活的选项卡
 
     private devRoot: ReactDOM.Root | null = null;
@@ -109,6 +110,7 @@ export default class I18N extends Plugin {
 
     async onunload() {
         this.view.deactivateAllViews(); // 卸载所有视图
+        this.companionWorkerManager?.stop();
         if (this.settings.modeImt) this.coreManager.deactivateIMT();  // 卸载沉浸式翻译
         this.cleanupDevDebug();
     }
@@ -221,6 +223,9 @@ export default class I18N extends Plugin {
 
         // [管理器] 自动化管理器
         this.autoManager = new AutoManager(this);
+
+        // [管理器] 本地伴生进程管理器
+        this.companionWorkerManager = new CompanionWorkerManager(this, i18nPluginDir);
 
         // [管理器] 提取助手管理器 (暂时隐藏)
         // this.extractManager = new ExtractManager(this);

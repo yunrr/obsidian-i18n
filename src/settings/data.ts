@@ -53,6 +53,9 @@ export interface I18nSettings {
     batchExtractConcurrency: number; // 管理器批量提取资源并发数
     batchTranslateConcurrency: number; // 管理器批量翻译资源并发数
     llmTimeout: number;             // LLM 请求超时时间 (毫秒)
+    llmCompanionWorkerEnabled: boolean; // 是否使用本地伴生进程转发 OpenAI 兼容请求
+    llmCompanionWorkerPort: number;  // 本地伴生进程监听端口
+    llmCompanionNodePath: string;    // Node 可执行文件路径，留空使用 node
 
     llmRegexPrompt?: string;        // LLM Regex 自定义提示词模板
     llmAstPrompt?: string;          // LLM AST 自定义提示词模板
@@ -270,6 +273,9 @@ export const DEFAULT_SETTINGS: I18nSettings = {
     batchExtractConcurrency: 3,     // 默认批量提取资源并发为 3
     batchTranslateConcurrency: 2,   // 默认批量翻译资源并发为 2
     llmTimeout: 60000,              // 默认超时为 60 秒
+    llmCompanionWorkerEnabled: true,
+    llmCompanionWorkerPort: 18743,
+    llmCompanionNodePath: '',
 
 
     llmRegexPrompt: DEFAULT_REGEX_PROMPT_TEMPLATE,             // 默认加载内置的 Regex Prompt

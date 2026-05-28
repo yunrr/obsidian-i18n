@@ -4,15 +4,31 @@ import * as fs from 'fs-extra';
 import { useTranslation } from 'react-i18next';
 import { Notice } from 'obsidian';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { Search, LayoutGrid, List, FileOutput, Languages, Loader2, RotateCcw, Square } from 'lucide-react';
+import { Search, LayoutGrid, List, FileOutput, Languages, Loader2, RotateCcw, Square, AlertTriangle } from 'lucide-react';
 
 import I18N from 'src/main';
 import { OBThemeManifest, ThemeTranslationV1, BatchTaskFailureRecord } from 'src/types';
-import { calculateChecksum, generateTheme, getThemeTranslationSources, hasChineseText, hasExtractedTranslationContent } from '~/utils';
 import { useGlobalStoreInstance } from '~/utils';
 import { loadTranslationFile } from '../../manager/io-manager';
-import { createTranslationProvider } from '~/ai/provider-factory';
-import type { ThemeTranslationItem } from '../theme_editor/types';
+import { normalizeOpenAIUrl } from '~/utils/ai/url-helper';
+import { LLM_PROVIDERS } from '~/ai/constants';
+import {
+    DEFAULT_AST_PROMPT_TEMPLATE,
+    DEFAULT_REGEX_PROMPT_TEMPLATE,
+    DEFAULT_THEME_PROMPT_TEMPLATE,
+    generateAstSystemPrompt,
+    generateRegexSystemPrompt,
+    generateThemeSystemPrompt,
+} from '~/ai/prompts';
+import type {
+    CompanionExtractionSettings,
+    CompanionTaskProgress,
+    CompanionThemeBatchExtractPayload,
+    CompanionThemeBatchTranslatePayload,
+    CompanionThemeExtractPayload,
+    CompanionThemeFailureRetryPayload,
+    CompanionTranslationConfig,
+} from '~/manager/companion-worker-manager';
 
 import {
     Button,
@@ -63,8 +79,6 @@ interface ThemeBatchResource {
 
 const THEME_EXTRACT_CHECKPOINT_KEY = 'theme:extract';
 const THEME_TRANSLATE_CHECKPOINT_KEY = 'theme:translate';
-const BATCH_PROGRESS_UPDATE_INTERVAL = 200;
-const BATCH_PERSIST_INTERVAL = 1500;
 
 const EMPTY_BATCH_TASK_STATE: BatchTaskState = {
     mode: null,
@@ -79,29 +93,92 @@ const EMPTY_BATCH_TASK_STATE: BatchTaskState = {
     skippedCount: 0,
 };
 
+const SOURCE_SYNC_THROTTLE_MS = 1500;
+
 const shouldTranslateText = (target?: string, source?: string) => !target || target.trim() === '' || target === source;
-const yieldToMainThread = () => new Promise<void>(resolve => window.setTimeout(resolve, 0));
 const getPositiveInt = (value: unknown, fallback: number) => {
     const parsed = typeof value === 'number' ? value : Number.parseInt(String(value), 10);
     return Number.isFinite(parsed) ? Math.max(1, Math.floor(parsed)) : fallback;
 };
 
-const runConcurrentTasks = async <T,>(
-    items: T[],
-    limit: number,
-    shouldStop: () => boolean,
-    worker: (item: T, index: number) => Promise<void>
-) => {
-    let nextIndex = 0;
-    const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-        while (!shouldStop()) {
-            const index = nextIndex++;
-            if (index >= items.length) return;
-            await worker(items[index], index);
-            await yieldToMainThread();
-        }
-    });
-    await Promise.all(workers);
+const getActiveLLMProfile = (settings: I18N['settings']) => {
+    const config = LLM_PROVIDERS[settings.llmApi];
+    if (!config) return null;
+    const profiles = (settings as any)[`llm${config.labelKey}Profiles`] as any[];
+    const activeId = (settings as any)[`llm${config.labelKey}ActiveProfileId`] as string;
+    return profiles?.find(profile => profile.id === activeId) || profiles?.[0] || null;
+};
+
+const getCompanionTranslationConfig = (settings: I18N['settings']): CompanionTranslationConfig => {
+    const provider = LLM_PROVIDERS[settings.llmApi];
+    const activeProfile = getActiveLLMProfile(settings);
+    if (!provider || provider.engine !== 'openai' || !activeProfile) {
+        throw new Error('本地批量 worker 仅支持 OpenAI 兼容服务');
+    }
+
+    const rawUrl = normalizeOpenAIUrl(activeProfile.url || provider.baseUrl || '');
+    if (!rawUrl) throw new Error('Missing OpenAI compatible API URL');
+
+    return {
+        chatCompletionsUrl: `${rawUrl.replace(/\/+$/, '')}/chat/completions`,
+        apiKey: activeProfile.key,
+        model: activeProfile.model || provider.defaultModel,
+        timeoutMs: settings.llmTimeout || 60000,
+        responseFormat: settings.llmResponseFormat,
+        batchSize: getPositiveInt(settings.llmBatchSize, 1),
+        concurrency: getPositiveInt(settings.llmConcurrencyLimit, 3),
+        prompts: {
+            ast: generateAstSystemPrompt(settings.llmAstPrompt || DEFAULT_AST_PROMPT_TEMPLATE, settings.llmLanguage, settings.llmStyle),
+            regex: generateRegexSystemPrompt(settings.llmRegexPrompt || DEFAULT_REGEX_PROMPT_TEMPLATE, settings.llmLanguage, settings.llmStyle),
+            theme: generateThemeSystemPrompt(settings.llmThemePrompt || DEFAULT_THEME_PROMPT_TEMPLATE, settings.llmLanguage, settings.llmStyle),
+        },
+    };
+};
+
+const getCompanionExtractionSettings = (settings: I18N['settings']): CompanionExtractionSettings => ({
+    author: settings.author,
+    reFlags: settings.reFlags,
+    reLength: settings.reLength,
+    reDatas: settings.reDatas,
+    reRejectRe: settings.reRejectRe,
+    reValidRe: settings.reValidRe,
+    astAssignments: settings.astAssignments,
+    astFunctions: settings.astFunctions,
+    astKeys: settings.astKeys,
+    astRejectRe: settings.astRejectRe,
+    astValidRe: settings.astValidRe,
+});
+
+const formatFailureTime = (failedAt: number) => failedAt ? new Date(failedAt).toLocaleString() : '';
+
+const BatchFailureDetails: React.FC<{ records: BatchTaskFailureRecord[]; title: string }> = ({ records, title }) => {
+    if (records.length === 0) return null;
+
+    return (
+        <div className="border border-destructive/30 bg-destructive/5 rounded-none px-3 py-2 space-y-2">
+            <div className="flex items-center gap-2 text-[12px] font-medium text-destructive">
+                <AlertTriangle className="w-4 h-4" />
+                <span>{title}</span>
+                <span className="text-muted-foreground">{records.length}</span>
+            </div>
+            <div className="max-h-48 overflow-auto space-y-2 pr-1">
+                {records.map(record => (
+                    <div key={record.id} className="border border-muted-foreground/20 bg-background/70 rounded-none p-2 text-[11px] space-y-1">
+                        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                            <span className="font-medium text-foreground">{record.resourceLabel || record.resourceId}</span>
+                            <span className="text-muted-foreground">{record.batchType}</span>
+                            <span className="text-muted-foreground">{record.items.length} 条</span>
+                            <span className="text-muted-foreground">{formatFailureTime(record.failedAt)}</span>
+                        </div>
+                        <div className="text-destructive break-words whitespace-pre-wrap">{record.errorMessage}</div>
+                        {record.items[0]?.source && (
+                            <div className="text-muted-foreground break-words line-clamp-2">{record.items[0].source}</div>
+                        )}
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
 };
 
 export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
@@ -116,8 +193,10 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
     const [statusFilter, setStatusFilter] = useState<'all' | 'applied' | 'unapplied' | 'translated' | 'untranslated' | 'partialFailed' | 'toExtract'>('all');
     const [cloudManifest, setCloudManifest] = useState<any[]>([]);
     const [batchTask, setBatchTask] = useState<BatchTaskState>(EMPTY_BATCH_TASK_STATE);
-    const translateAbortControllerRef = useRef<AbortController | null>(null);
-    const stopRequestedRef = useRef(false);
+    const [showFailureDetails, setShowFailureDetails] = useState(false);
+    const taskIdRef = useRef<string | null>(null);
+    const syncRevisionRef = useRef({ sourceRevision: 0, recordRevision: 0 });
+    const lastSourceSyncAtRef = useRef(0);
 
     const setViewMode = useCallback((mode: 'list' | 'grid') => {
         setViewModeState(mode);
@@ -402,78 +481,62 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
         return i18n.sourceManager.loadBatchTaskCheckpoint(THEME_TRANSLATE_CHECKPOINT_KEY);
     }, [i18n, sourceTick]);
 
-    const isAbortError = useCallback((error: unknown) => {
-        return error instanceof Error && (error.name === 'AbortError' || error.message === '翻译任务已取消');
-    }, []);
-
-    const buildThemeSourceUpdate = useCallback((source: any, translationJson: ThemeTranslationV1) => ({
-        ...source,
-        title: translationJson.metadata?.title || source.title,
-        origin: 'local',
-        cloud: undefined,
-        checksum: calculateChecksum(translationJson),
-    }), []);
-
-    const saveThemeExtractCheckpoint = useCallback((resources: ThemeBatchResource[], completedIndexes: Set<number>, completedResources: number, totalResources: number) => {
-        i18n.sourceManager.saveBatchTaskCheckpoint(THEME_EXTRACT_CHECKPOINT_KEY, {
-            scope: 'theme',
-            mode: 'extract',
-            resources: resources.filter((_, index) => !completedIndexes.has(index)).map(resource => ({
-                resourceId: resource.resourceId,
-                label: resource.label,
-                sourceId: resource.sourceId ?? null,
-            })),
-            totalResources,
-            completedResources,
-            totalItems: 0,
-            processedItems: 0,
-            stoppedAt: Date.now(),
-        });
-    }, [i18n]);
-
-    const saveThemeTranslateCheckpoint = useCallback((resources: ThemeBatchResource[], startIndex: number, completedResources: number, totalResources: number, totalItems: number, processedItems: number) => {
-        i18n.sourceManager.saveBatchTaskCheckpoint(THEME_TRANSLATE_CHECKPOINT_KEY, {
-            scope: 'theme',
-            mode: 'translate',
-            resources: resources.slice(startIndex).map(resource => ({
-                resourceId: resource.resourceId,
-                label: resource.label,
-                sourceId: resource.sourceId ?? null,
-            })),
-            totalResources,
-            completedResources,
-            totalItems,
-            processedItems,
-            stoppedAt: Date.now(),
-        });
-    }, [i18n]);
-
-    const clearThemeFailuresForSource = useCallback((sourceId: string) => {
-        const ids = i18n.sourceManager
-            .getBatchTaskFailures('theme')
-            .filter(item => item.sourceId === sourceId)
-            .map(item => item.id);
-        i18n.sourceManager.removeBatchTaskFailures(ids);
-    }, [i18n]);
-
-    const buildThemeFailureRecord = useCallback((failure: Omit<BatchTaskFailureRecord, 'id' | 'failedAt' | 'scope'>): BatchTaskFailureRecord => ({
-        ...failure,
-        id: `${failure.sourceId}:${failure.batchType}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
-        scope: 'theme',
-        failedAt: Date.now(),
-    }), []);
-
-    const recordThemeFailure = useCallback((failure: Omit<BatchTaskFailureRecord, 'id' | 'failedAt' | 'scope'>) => {
-        i18n.sourceManager.saveBatchTaskFailure(buildThemeFailureRecord(failure));
-    }, [buildThemeFailureRecord, i18n]);
-
     const handleRefresh = useCallback(() => {
         setRefreshKey(k => k + 1);
     }, []);
 
-    const updateBatchTask = useCallback((updates: Partial<BatchTaskState>) => {
-        setBatchTask(prev => ({ ...prev, ...updates }));
-    }, []);
+    const syncSourceStateFromDisk = useCallback(() => {
+        lastSourceSyncAtRef.current = Date.now();
+        i18n.sourceManager.reloadFromDisk();
+        handleRefresh();
+    }, [handleRefresh, i18n]);
+
+    const syncWorkerProgress = useCallback((progress: CompanionTaskProgress) => {
+        setBatchTask({
+            mode: progress.mode,
+            isRunning: progress.status === 'queued' || progress.status === 'running',
+            currentLabel: progress.currentLabel,
+            processedResources: progress.processedResources,
+            totalResources: progress.totalResources,
+            processedItems: progress.processedItems,
+            totalItems: progress.totalItems,
+            successCount: progress.successCount,
+            failedCount: progress.failedCount,
+            skippedCount: progress.skippedCount,
+        });
+
+        const revisions = syncRevisionRef.current;
+        const hasRevisionChange = progress.sourceRevision !== revisions.sourceRevision || progress.recordRevision !== revisions.recordRevision;
+        if (!hasRevisionChange) return;
+
+        revisions.sourceRevision = progress.sourceRevision;
+        revisions.recordRevision = progress.recordRevision;
+        if (Date.now() - lastSourceSyncAtRef.current >= SOURCE_SYNC_THROTTLE_MS) {
+            syncSourceStateFromDisk();
+        }
+    }, [syncSourceStateFromDisk]);
+
+    const runWorkerTask = useCallback(async (type: 'theme-batch-extract' | 'theme-batch-translate' | 'theme-failure-retry', payload: unknown) => {
+        const started = await i18n.companionWorkerManager.startTask(type, payload);
+        taskIdRef.current = started.taskId;
+        syncRevisionRef.current = { sourceRevision: 0, recordRevision: 0 };
+        lastSourceSyncAtRef.current = 0;
+        syncWorkerProgress(started.progress);
+
+        let progress = started.progress;
+        while (progress.status === 'queued' || progress.status === 'running') {
+            await new Promise(resolve => window.setTimeout(resolve, 300));
+            const status = await i18n.companionWorkerManager.getTaskStatus(started.taskId);
+            progress = status.progress;
+            syncWorkerProgress(progress);
+        }
+
+        taskIdRef.current = null;
+        syncSourceStateFromDisk();
+
+        if (progress.status === 'failed') throw new Error(progress.error || '本地伴生任务失败');
+        return progress;
+    }, [i18n, syncSourceStateFromDisk, syncWorkerProgress]);
 
     const startThemeBatchExtract = useCallback(async (resume: boolean) => {
         const resources: ThemeBatchResource[] = resume && themeExtractCheckpoint?.resources.length
@@ -486,7 +549,6 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
 
         if (batchTask.isRunning || resources.length === 0) return;
 
-        stopRequestedRef.current = false;
         setBatchTask({
             mode: 'extract',
             isRunning: true,
@@ -500,167 +562,45 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             skippedCount: 0,
         });
 
-        const extractConcurrency = getPositiveInt(i18n.settings.batchExtractConcurrency, 3);
-        let processedResources = 0;
-        let successCount = 0;
-        let failedCount = 0;
-        let skippedCount = 0;
-        const completedIndexes = new Set<number>();
-        const pendingEntries: Array<{ pluginId: string; content: ThemeTranslationV1; options: { title: string; type: 'theme' } }> = [];
-        const themeMap = new Map(themes.map(theme => [theme.name, theme]));
-
-        const flushPendingEntries = () => {
-            if (pendingEntries.length === 0) return;
-            i18n.sourceManager.batchExtractAndSaveSources(pendingEntries.splice(0, pendingEntries.length));
-        };
-
-        const markResourceDone = (index: number) => {
-            completedIndexes.add(index);
-        };
-
-        const saveStopCheckpoint = () => {
-            flushPendingEntries();
-            saveThemeExtractCheckpoint(resources, completedIndexes, processedResources, resources.length);
-        };
-
-        const saveProgressCheckpoint = () => {
-            flushPendingEntries();
-            saveThemeExtractCheckpoint(resources, completedIndexes, processedResources, resources.length);
-        };
-
         try {
-            await runConcurrentTasks(resources, extractConcurrency, () => stopRequestedRef.current, async (resource, index) => {
-                if (stopRequestedRef.current) return;
-
+            const themeMap = new Map(themes.map(theme => [theme.name, theme]));
+            const workerResources: CompanionThemeExtractPayload[] = resources.map(resource => {
                 const theme = themeMap.get(resource.resourceId);
                 const data = allThemeStates[resource.resourceId];
-                updateBatchTask({ currentLabel: resource.label });
-
-                let shouldSaveCheckpoint = false;
-                try {
-                    if (!theme || !data || !await fs.pathExists(data.themeCssPath)) {
-                        throw new Error(t('Manager.Themes.Errors.ThemeCssNotFound'));
-                    }
-
-                    const cssStr = await fs.readFile(data.themeCssPath, 'utf8');
-                    const manifestPath = path.join(theme.dir, 'manifest.json');
-                    let manifest: OBThemeManifest = { name: theme.name, version: '0.0.0', minAppVersion: '', author: '', authorUrl: '' };
-                    if (await fs.pathExists(manifestPath)) {
-                        try {
-                            manifest = await fs.readJson(manifestPath);
-                        } catch (e) {
-                            // keep fallback manifest
-                        }
-                    }
-
-                    await yieldToMainThread();
-                    if (hasChineseText(`${manifest.name || theme.name}\n${cssStr}`)) {
-                        skippedCount++;
-                        shouldSaveCheckpoint = true;
-                    } else {
-                        const translationJson = generateTheme(manifest, cssStr, i18n.settings);
-                        const extractedSources = getThemeTranslationSources(translationJson);
-                        if (!hasExtractedTranslationContent(extractedSources)) {
-                            skippedCount++;
-                            shouldSaveCheckpoint = true;
-                        } else {
-                            pendingEntries.push({
-                                pluginId: theme.name,
-                                content: translationJson,
-                                options: { title: theme.name, type: 'theme' }
-                            });
-                            successCount++;
-
-                            if (pendingEntries.length >= Math.max(5, extractConcurrency * 2)) {
-                                flushPendingEntries();
-                            }
-                        }
-                    }
-                } catch (error) {
-                    failedCount++;
-                    console.error(`[i18n] Failed to batch extract theme ${resource.resourceId}:`, error);
-                }
-
-                processedResources++;
-                markResourceDone(index);
-                if (shouldSaveCheckpoint) {
-                    saveProgressCheckpoint();
-                }
-                updateBatchTask({ processedResources, successCount, failedCount, skippedCount });
+                if (!theme || !data) throw new Error(t('Manager.Themes.Errors.ThemeCssNotFound'));
+                return {
+                    resourceId: resource.resourceId,
+                    label: resource.label,
+                    themeName: theme.name,
+                    themeDir: theme.dir,
+                    themeCssPath: data.themeCssPath,
+                    settings: getCompanionExtractionSettings(i18n.settings),
+                };
             });
-
-            if (stopRequestedRef.current) {
-                saveStopCheckpoint();
+            const payload: CompanionThemeBatchExtractPayload = {
+                persistence: { basePath: i18n.sourceManager.getBasePath() },
+                resources: workerResources,
+                concurrency: getPositiveInt(i18n.settings.batchExtractConcurrency, 3),
+                checkpointKey: THEME_EXTRACT_CHECKPOINT_KEY,
+                completedResources: themeExtractCheckpoint?.completedResources || 0,
+            };
+            const progress = await runWorkerTask('theme-batch-extract', payload);
+            if (progress.status === 'cancelled') {
                 new Notice(t('Common.Notices.TaskStopped'));
                 return;
             }
-
-            flushPendingEntries();
-            i18n.sourceManager.clearBatchTaskCheckpoint(THEME_EXTRACT_CHECKPOINT_KEY);
-            handleRefresh();
-            new Notice(t('Manager.Themes.Notices.BatchExtractComplete', { success: successCount, fail: failedCount, skip: skippedCount, defaultValue: `批量提取完成：成功 ${successCount}，失败 ${failedCount}，跳过 ${skippedCount}` }));
+            new Notice(t('Manager.Themes.Notices.BatchExtractComplete', { success: progress.successCount, fail: progress.failedCount, skip: progress.skippedCount, defaultValue: `批量提取完成：成功 ${progress.successCount}，失败 ${progress.failedCount}，跳过 ${progress.skippedCount}` }));
+        } catch (error) {
+            console.error('[i18n] Batch theme extraction failed:', error);
+            new Notice(t('Common.Notices.TranslateFail', { message: String(error) }));
         } finally {
-            stopRequestedRef.current = false;
-            setBatchTask(prev => ({
-                ...prev,
-                isRunning: false,
-                currentLabel: '',
-                processedResources,
-                successCount,
-                failedCount,
-                skippedCount,
-            }));
+            taskIdRef.current = null;
+            setBatchTask(prev => ({ ...prev, isRunning: false, currentLabel: '' }));
         }
-    }, [allThemeStates, batchTask.isRunning, extractableThemes, handleRefresh, i18n, saveThemeExtractCheckpoint, t, themeExtractCheckpoint, themes, updateBatchTask]);
+    }, [allThemeStates, batchTask.isRunning, extractableThemes, i18n, runWorkerTask, t, themeExtractCheckpoint, themes]);
 
     const handleBatchExtract = useCallback(() => startThemeBatchExtract(false), [startThemeBatchExtract]);
     const handleResumeExtract = useCallback(() => startThemeBatchExtract(true), [startThemeBatchExtract]);
-
-    const translateThemeSource = useCallback(async (
-        translationJson: ThemeTranslationV1,
-        context: { resourceId: string; resourceLabel: string; sourceId: string },
-        onItemsProcessed: (count: number) => void,
-        onBatchPersist: () => void,
-        signal?: AbortSignal,
-        onBatchFailure: (failure: Omit<BatchTaskFailureRecord, 'id' | 'failedAt' | 'scope'>) => void = recordThemeFailure,
-    ) => {
-        const provider = createTranslationProvider();
-        const items: ThemeTranslationItem[] = translationJson.dict
-            .map((item, index) => ({
-                id: index,
-                type: item.type,
-                source: item.source,
-                target: item.target,
-            }))
-            .filter(item => shouldTranslateText(item.target, item.source));
-
-        if (items.length === 0) {
-            return;
-        }
-
-        await provider.themeTranslate(items, async (batchResult) => {
-            for (const result of batchResult) {
-                if (typeof result.id !== 'number') continue;
-                const dictItem = translationJson.dict[result.id];
-                if (!dictItem) continue;
-                dictItem.target = result.target;
-            }
-            onItemsProcessed(batchResult.length);
-            onBatchPersist();
-        }, signal, async (batchItems, error) => {
-            onBatchFailure({
-                ...context,
-                batchType: 'theme',
-                errorMessage: error.message,
-                items: batchItems.map(item => ({
-                    source: item.source,
-                    target: item.target,
-                    dictIndex: item.id,
-                    type: item.type,
-                })).filter(item => item.dictIndex >= 0),
-            });
-        });
-    }, [recordThemeFailure]);
 
     const startThemeBatchTranslate = useCallback(async (resume: boolean) => {
         const resources: ThemeBatchResource[] = resume && themeTranslateCheckpoint?.resources.length
@@ -681,8 +621,6 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             return sum + (allThemeStates[resource.resourceId]?.pendingTranslationCount || 0);
         }, 0);
 
-        stopRequestedRef.current = false;
-        translateAbortControllerRef.current = new AbortController();
         setBatchTask({
             mode: 'translate',
             isRunning: true,
@@ -696,166 +634,46 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             skippedCount: 0,
         });
 
-        const translateConcurrency = getPositiveInt(i18n.settings.batchTranslateConcurrency, 2);
-        let processedResources = 0;
-        let processedItems = 0;
-        let successCount = 0;
-        let failedCount = 0;
-        let skippedCount = 0;
-        let nextCheckpointIndex = 0;
-        const completedIndexes = new Set<number>();
-        const pendingFailures: BatchTaskFailureRecord[] = [];
-        const flushPendingFailures = () => {
-            if (pendingFailures.length === 0) return;
-            i18n.sourceManager.saveBatchTaskFailures(pendingFailures.splice(0, pendingFailures.length));
-        };
-
-        const markResourceDone = (index: number) => {
-            completedIndexes.add(index);
-            while (completedIndexes.has(nextCheckpointIndex)) nextCheckpointIndex++;
-        };
-
-        const saveStopCheckpoint = () => {
-            flushPendingFailures();
-            saveThemeTranslateCheckpoint(resources, nextCheckpointIndex, processedResources, resources.length, totalItems, processedItems);
-        };
-
         try {
-            await runConcurrentTasks(resources, translateConcurrency, () => stopRequestedRef.current || !!translateAbortControllerRef.current?.signal.aborted, async (resource, index) => {
-                if (stopRequestedRef.current || translateAbortControllerRef.current?.signal.aborted) return;
-
-                const data = allThemeStates[resource.resourceId];
-                updateBatchTask({ currentLabel: resource.label });
-
-                try {
-                    const sourceId = resource.sourceId || data?.activeSourceId;
-                    if (!sourceId || !data?.translationPath) {
-                        skippedCount++;
-                    } else {
-                        const source = i18n.sourceManager.getSource(sourceId);
-                        const translationPath = i18n.sourceManager.getSourceFilePath(sourceId);
-                        const translationJson = loadTranslationFile(translationPath) as ThemeTranslationV1 | null;
-                        const pendingCount = translationJson ? countPendingTranslationItems(translationJson) : 0;
-
-                        if (!source || !translationJson || pendingCount === 0) {
-                            skippedCount++;
-                        } else {
-                            await yieldToMainThread();
-                            const persistCurrentSource = () => {
-                                i18n.sourceManager.saveSourceFile(source.id, translationJson);
-                                i18n.sourceManager.saveSource(buildThemeSourceUpdate(source, translationJson));
-                            };
-                            let lastPersistAt = 0;
-                            let lastProgressUpdateAt = 0;
-                            let hasPendingPersist = false;
-
-                            const scheduleCurrentSourcePersist = () => {
-                                hasPendingPersist = true;
-                                const now = Date.now();
-                                if (now - lastPersistAt < BATCH_PERSIST_INTERVAL) return;
-                                persistCurrentSource();
-                                lastPersistAt = now;
-                                hasPendingPersist = false;
-                            };
-
-                            const flushCurrentSourcePersist = () => {
-                                if (!hasPendingPersist) return;
-                                persistCurrentSource();
-                                lastPersistAt = Date.now();
-                                hasPendingPersist = false;
-                            };
-
-                            const updateProcessedItems = (count: number) => {
-                                processedItems += count;
-                                const now = Date.now();
-                                if (now - lastProgressUpdateAt < BATCH_PROGRESS_UPDATE_INTERVAL) return;
-                                updateBatchTask({ processedItems });
-                                lastProgressUpdateAt = now;
-                            };
-
-                            await translateThemeSource(translationJson, {
-                                resourceId: resource.resourceId,
-                                resourceLabel: resource.label,
-                                sourceId: source.id,
-                            }, updateProcessedItems, scheduleCurrentSourcePersist, translateAbortControllerRef.current?.signal, (failure) => {
-                                pendingFailures.push(buildThemeFailureRecord(failure));
-                            });
-                            flushCurrentSourcePersist();
-                            persistCurrentSource();
-                            clearThemeFailuresForSource(source.id);
-                            updateBatchTask({ processedItems });
-                            successCount++;
-                        }
-                    }
-                    processedResources++;
-                    markResourceDone(index);
-                } catch (error) {
-                    if (isAbortError(error)) {
-                        stopRequestedRef.current = true;
-                        saveStopCheckpoint();
-                        return;
-                    }
-                    failedCount++;
-                    processedResources++;
-                    markResourceDone(index);
-                    console.error(`[i18n] Failed to batch translate theme ${resource.resourceId}:`, error);
-                }
-
-                updateBatchTask({ processedResources, processedItems, successCount, failedCount, skippedCount });
-            });
-
-            if (stopRequestedRef.current || translateAbortControllerRef.current?.signal.aborted) {
-                saveStopCheckpoint();
+            const payload: CompanionThemeBatchTranslatePayload = {
+                persistence: { basePath: i18n.sourceManager.getBasePath() },
+                resources,
+                config: getCompanionTranslationConfig(i18n.settings),
+                checkpointKey: THEME_TRANSLATE_CHECKPOINT_KEY,
+                concurrency: getPositiveInt(i18n.settings.batchTranslateConcurrency, 2),
+                completedResources: themeTranslateCheckpoint?.completedResources || 0,
+                processedItems: themeTranslateCheckpoint?.processedItems || 0,
+                totalItems,
+            };
+            const progress = await runWorkerTask('theme-batch-translate', payload);
+            if (progress.status === 'cancelled') {
                 new Notice(t('Common.Notices.TaskStopped'));
                 return;
             }
-
-            flushPendingFailures();
-            i18n.sourceManager.clearBatchTaskCheckpoint(THEME_TRANSLATE_CHECKPOINT_KEY);
-            handleRefresh();
-            new Notice(t('Manager.Themes.Notices.BatchTranslateComplete', { success: successCount, fail: failedCount, skip: skippedCount, defaultValue: `批量翻译完成：成功 ${successCount}，失败 ${failedCount}，跳过 ${skippedCount}` }));
+            new Notice(t('Manager.Themes.Notices.BatchTranslateComplete', { success: progress.successCount, fail: progress.failedCount, skip: progress.skippedCount, defaultValue: `批量翻译完成：成功 ${progress.successCount}，失败 ${progress.failedCount}，跳过 ${progress.skippedCount}` }));
         } catch (error) {
             console.error('[i18n] Batch theme translation failed:', error);
             new Notice(t('Common.Notices.TranslateFail', { message: String(error) }));
         } finally {
-            flushPendingFailures();
-            stopRequestedRef.current = false;
-            translateAbortControllerRef.current = null;
-            setBatchTask(prev => ({
-                ...prev,
-                isRunning: false,
-                currentLabel: '',
-                processedResources,
-                processedItems,
-                successCount,
-                failedCount,
-                skippedCount,
-            }));
+            taskIdRef.current = null;
+            setBatchTask(prev => ({ ...prev, isRunning: false, currentLabel: '' }));
         }
-    }, [allThemeStates, batchTask.isRunning, buildThemeFailureRecord, buildThemeSourceUpdate, clearThemeFailuresForSource, countPendingTranslationItems, handleRefresh, i18n, isAbortError, saveThemeTranslateCheckpoint, t, themeTranslateCheckpoint, translatableThemes, translateThemeSource, updateBatchTask]);
+    }, [allThemeStates, batchTask.isRunning, i18n, runWorkerTask, t, themeTranslateCheckpoint, translatableThemes]);
 
     const handleBatchTranslate = useCallback(() => startThemeBatchTranslate(false), [startThemeBatchTranslate]);
     const handleResumeTranslate = useCallback(() => startThemeBatchTranslate(true), [startThemeBatchTranslate]);
 
     const handleStopBatchTask = useCallback(() => {
-        stopRequestedRef.current = true;
-        translateAbortControllerRef.current?.abort();
+        const taskId = taskIdRef.current;
+        if (taskId) {
+            i18n.companionWorkerManager.cancelTask(taskId).catch(error => console.warn('[i18n] Failed to cancel companion task:', error));
+        }
         setBatchTask(prev => ({ ...prev, currentLabel: t('Manager.Common.Status.Stopping', '正在停止') }));
-    }, [t]);
+    }, [i18n, t]);
 
     const handleRetryThemeFailures = useCallback(async () => {
         if (batchTask.isRunning || themeFailureRecords.length === 0) return;
 
-        const retryConcurrency = getPositiveInt(i18n.settings.batchTranslateConcurrency, 2);
-        const failureGroups = Array.from(themeFailureRecords.reduce((map, failure) => {
-            const group = map.get(failure.sourceId) || [];
-            group.push(failure);
-            map.set(failure.sourceId, group);
-            return map;
-        }, new Map<string, BatchTaskFailureRecord[]>()).values());
-
-        stopRequestedRef.current = false;
-        translateAbortControllerRef.current = new AbortController();
         setBatchTask({
             mode: 'translate',
             isRunning: true,
@@ -869,186 +687,27 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             skippedCount: 0,
         });
 
-        let processedResources = 0;
-        let processedItems = 0;
-        let successCount = 0;
-        let failedCount = 0;
-        let skippedCount = 0;
-
-        const updateRetryProgress = () => {
-            updateBatchTask({ processedResources, processedItems, successCount, failedCount, skippedCount });
-        };
-
-        const markProcessedRecords = (count: number) => {
-            processedResources += count;
-            updateRetryProgress();
-        };
-
-        const processFailureGroup = async (failures: BatchTaskFailureRecord[]) => {
-            if (failures.length === 0 || stopRequestedRef.current || translateAbortControllerRef.current?.signal.aborted) return;
-
-            const firstFailure = failures[0];
-            updateBatchTask({ currentLabel: firstFailure.resourceLabel });
-
-            let source: any | null = null;
-            let translationJson: ThemeTranslationV1 | null = null;
-            try {
-                source = i18n.sourceManager.getSource(firstFailure.sourceId);
-                translationJson = i18n.sourceManager.readSourceFile(firstFailure.sourceId) as ThemeTranslationV1 | null;
-            } catch (error) {
-                console.error(`[i18n] Failed to load theme retry source ${firstFailure.sourceId}:`, error);
-            }
-
-            if (!source || !translationJson) {
-                skippedCount += failures.length;
-                markProcessedRecords(failures.length);
-                return;
-            }
-
-            const activeSource = source;
-            const activeTranslationJson = translationJson;
-            const provider = createTranslationProvider();
-            let sourceDirty = false;
-            let lastPersistAt = 0;
-            const attemptedRecordIds = new Set<string>();
-            const failedRecordIds = new Set<string>();
-            const recordTotalItems = new Map<string, number>();
-            const recordSucceededItems = new Map<string, number>();
-
-            const persistSource = () => {
-                if (!sourceDirty) return;
-                i18n.sourceManager.saveSourceFile(activeSource.id, activeTranslationJson);
-                i18n.sourceManager.saveSource(buildThemeSourceUpdate(activeSource, activeTranslationJson));
-                sourceDirty = false;
-                lastPersistAt = Date.now();
-            };
-
-            const schedulePersistSource = () => {
-                if (!sourceDirty) return;
-                if (Date.now() - lastPersistAt < BATCH_PERSIST_INTERVAL) return;
-                persistSource();
-            };
-
-            const addRecordItems = (failureId: string, count: number) => {
-                if (count <= 0) return;
-                attemptedRecordIds.add(failureId);
-                recordTotalItems.set(failureId, (recordTotalItems.get(failureId) || 0) + count);
-            };
-
-            const markRecordItemSucceeded = (failureId: string) => {
-                recordSucceededItems.set(failureId, (recordSucceededItems.get(failureId) || 0) + 1);
-            };
-
-            const getCompletedRecordIds = () => Array.from(attemptedRecordIds).filter(id => {
-                if (failedRecordIds.has(id)) return false;
-                return (recordSucceededItems.get(id) || 0) >= (recordTotalItems.get(id) || 0);
-            });
-
-            const items: ThemeTranslationItem[] = [];
-            const mappings = new Map<number, { failureId: string; index: number }>();
-            let nextItemId = 0;
-
-            for (const failure of failures) {
-                if (failure.batchType !== 'theme') {
-                    skippedCount++;
-                    continue;
-                }
-
-                let itemCount = 0;
-                for (const item of failure.items) {
-                    if (item.dictIndex < 0) {
-                        failedRecordIds.add(failure.id);
-                        continue;
-                    }
-                    const id = nextItemId++;
-                    items.push({
-                        id,
-                        type: item.type,
-                        source: item.source,
-                        target: item.target,
-                    });
-                    mappings.set(id, { failureId: failure.id, index: item.dictIndex });
-                    itemCount++;
-                }
-                addRecordItems(failure.id, itemCount);
-                if (itemCount === 0) skippedCount++;
-            }
-
-            try {
-                if (items.length > 0) {
-                    await provider.themeTranslate(items, async (batchResult) => {
-                        for (const result of batchResult) {
-                            const mapping = mappings.get(result.id);
-                            if (!mapping) continue;
-                            const dictItem = activeTranslationJson.dict[mapping.index];
-                            if (!dictItem) {
-                                failedRecordIds.add(mapping.failureId);
-                                continue;
-                            }
-                            dictItem.target = result.target;
-                            sourceDirty = true;
-                            markRecordItemSucceeded(mapping.failureId);
-                        }
-                        processedItems += batchResult.length;
-                        schedulePersistSource();
-                        updateBatchTask({ processedItems });
-                    }, translateAbortControllerRef.current?.signal, async (batchItems) => {
-                        for (const item of batchItems) {
-                            const mapping = mappings.get(item.id);
-                            if (mapping) failedRecordIds.add(mapping.failureId);
-                        }
-                    });
-                }
-            } catch (error) {
-                if (isAbortError(error)) {
-                    stopRequestedRef.current = true;
-                } else {
-                    for (const id of attemptedRecordIds) failedRecordIds.add(id);
-                    console.error(`[i18n] Failed to retry theme source ${firstFailure.sourceId}:`, error);
-                }
-            } finally {
-                persistSource();
-                const completedRecordIds = getCompletedRecordIds();
-                if (completedRecordIds.length > 0) {
-                    i18n.sourceManager.removeBatchTaskFailures(completedRecordIds);
-                    successCount += completedRecordIds.length;
-                }
-
-                const failedRecords = Array.from(attemptedRecordIds).filter(id => failedRecordIds.has(id));
-                if (!stopRequestedRef.current && !translateAbortControllerRef.current?.signal.aborted) {
-                    failedCount += failedRecords.length;
-                    markProcessedRecords(failures.length);
-                } else {
-                    markProcessedRecords(completedRecordIds.length);
-                }
-            }
-        };
-
         try {
-            await runConcurrentTasks(failureGroups, retryConcurrency, () => stopRequestedRef.current || !!translateAbortControllerRef.current?.signal.aborted, processFailureGroup);
-
-            handleRefresh();
-            if (stopRequestedRef.current || translateAbortControllerRef.current?.signal.aborted) {
+            const payload: CompanionThemeFailureRetryPayload = {
+                persistence: { basePath: i18n.sourceManager.getBasePath() },
+                failures: themeFailureRecords,
+                config: getCompanionTranslationConfig(i18n.settings),
+                concurrency: getPositiveInt(i18n.settings.batchTranslateConcurrency, 2),
+            };
+            const progress = await runWorkerTask('theme-failure-retry', payload);
+            if (progress.status === 'cancelled') {
                 new Notice(t('Common.Notices.TaskStopped'));
                 return;
             }
-
-            new Notice(t('Manager.Common.Notices.RetryFailuresComplete', { success: successCount, fail: failedCount, skip: skippedCount, defaultValue: `失败批次重试完成：成功 ${successCount}，失败 ${failedCount}，跳过 ${skippedCount}` }));
+            new Notice(t('Manager.Common.Notices.RetryFailuresComplete', { success: progress.successCount, fail: progress.failedCount, skip: progress.skippedCount, defaultValue: `失败批次重试完成：成功 ${progress.successCount}，失败 ${progress.failedCount}，跳过 ${progress.skippedCount}` }));
+        } catch (error) {
+            console.error('[i18n] Failed to retry theme failures:', error);
+            new Notice(t('Common.Notices.TranslateFail', { message: String(error) }));
         } finally {
-            stopRequestedRef.current = false;
-            translateAbortControllerRef.current = null;
-            setBatchTask(prev => ({
-                ...prev,
-                isRunning: false,
-                currentLabel: '',
-                processedResources,
-                processedItems,
-                successCount,
-                failedCount,
-                skippedCount,
-            }));
+            taskIdRef.current = null;
+            setBatchTask(prev => ({ ...prev, isRunning: false, currentLabel: '' }));
         }
-    }, [batchTask.isRunning, buildThemeSourceUpdate, handleRefresh, i18n, isAbortError, t, themeFailureRecords, updateBatchTask]);
+    }, [batchTask.isRunning, i18n, runWorkerTask, t, themeFailureRecords]);
 
     const parentRef = useRef<HTMLDivElement>(null);
     const [containerWidth, setContainerWidth] = useState(0);
@@ -1191,6 +850,18 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                                 variant="outline"
                                 size="sm"
                                 className="h-9 rounded-none gap-1.5 text-[13px]"
+                                onClick={() => setShowFailureDetails(prev => !prev)}
+                            >
+                                <AlertTriangle className="w-4 h-4" />
+                                {showFailureDetails ? '隐藏失败原因' : '失败原因'}
+                                <span className="text-muted-foreground">{themeFailureRecords.length}</span>
+                            </Button>
+                        )}
+                        {!batchTask.isRunning && themeFailureRecords.length > 0 && (
+                            <Button
+                                variant="outline"
+                                size="sm"
+                                className="h-9 rounded-none gap-1.5 text-[13px]"
                                 onClick={handleRetryThemeFailures}
                             >
                                 <RotateCcw className="w-4 h-4" />
@@ -1244,6 +915,10 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                             {batchTask.skippedCount > 0 && <span>{t('Common.Status.Skipped', '跳过')}: {batchTask.skippedCount}</span>}
                         </div>
                     </div>
+                )}
+
+                {!batchTask.isRunning && showFailureDetails && (
+                    <BatchFailureDetails records={themeFailureRecords} title="主题失败原因" />
                 )}
             </div>
 

@@ -11,3 +11,4 @@ export * from './injector';
 export * from './core';
 export * from './extract-manager';
 export { AutoManager } from './auto-manager';
+export { CompanionWorkerManager } from './companion-worker-manager';

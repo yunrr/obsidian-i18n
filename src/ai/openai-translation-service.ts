@@ -7,6 +7,7 @@ import { ThemeTranslationItem } from "../views/theme_editor/types";
 import { useGlobalStoreInstance } from "~/utils";
 import { BaseProvider } from "./base-provider";
 import { LLM_PROVIDERS } from "./constants";
+import type { CompanionProxyRequest, CompanionProxyResponse } from "../manager/companion-worker-manager";
 
 // 自定义消息类型
 interface ChatMessage {
@@ -20,6 +21,7 @@ function normalizeStreamingResponseText(text: string): string {
 
     const chunks: string[] = [];
     let lastEvent: any = null;
+    let errorEvent: any = null;
 
     for (const line of text.split(/\r?\n/)) {
         const trimmedLine = line.trim();
@@ -31,6 +33,7 @@ function normalizeStreamingResponseText(text: string): string {
         try {
             const event = JSON.parse(payload);
             lastEvent = event;
+            if (event?.error) errorEvent = event;
             const choice = event?.choices?.[0];
             const deltaContent = choice?.delta?.content;
             const messageContent = choice?.message?.content;
@@ -42,6 +45,7 @@ function normalizeStreamingResponseText(text: string): string {
     }
 
     const content = chunks.join('');
+    if (!content && errorEvent) return JSON.stringify(errorEvent);
     if (!content) return text;
 
     return JSON.stringify({
@@ -58,32 +62,139 @@ function normalizeStreamingResponseText(text: string): string {
     });
 }
 
-function normalizeRequestUrlBody(response: any): string {
-    let text = '';
-
-    if (typeof response.text === 'string' && response.text.length > 0) {
-        text = response.text;
-    } else if (response.json !== undefined && response.json !== null) {
-        text = typeof response.json === 'string' ? response.json : JSON.stringify(response.json);
-    } else if (response.arrayBuffer instanceof ArrayBuffer && response.arrayBuffer.byteLength > 0) {
-        text = new TextDecoder().decode(response.arrayBuffer);
-    }
-
-    return normalizeStreamingResponseText(text);
+function getRequestUrlBodyText(response: any): string {
+    if (typeof response.text === 'string' && response.text.length > 0) return response.text;
+    if (response.json !== undefined && response.json !== null) return typeof response.json === 'string' ? response.json : JSON.stringify(response.json);
+    if (response.arrayBuffer instanceof ArrayBuffer && response.arrayBuffer.byteLength > 0) return new TextDecoder().decode(response.arrayBuffer);
+    return '';
 }
 
-function buildFetchResponse(response: any): Response {
-    return new Response(normalizeRequestUrlBody(response), {
+function normalizeRequestUrlBody(response: any): string {
+    return normalizeStreamingResponseText(getRequestUrlBodyText(response));
+}
+
+function buildFetchResponse(response: any, keepStreamingBody = false): Response {
+    return new Response(keepStreamingBody ? getRequestUrlBodyText(response) : normalizeRequestUrlBody(response), {
         status: response.status,
         statusText: String(response.status),
         headers: new Headers(response.headers as any),
     });
 }
 
+function buildCompanionFetchResponse(response: CompanionProxyResponse, keepStreamingBody = false): Response {
+    return new Response(keepStreamingBody ? response.body || '' : normalizeStreamingResponseText(response.body || ''), {
+        status: response.status,
+        statusText: response.statusText || String(response.status),
+        headers: new Headers(response.headers as any),
+    });
+}
+
+function createAbortError(): Error {
+    const abortError = new Error('AbortError');
+    abortError.name = 'AbortError';
+    return abortError;
+}
+
 export class OpenAITranslationService extends BaseProvider {
 
     constructor() {
         super();
+    }
+
+    private isStreamingRequest(options?: RequestInit): boolean {
+        try {
+            const body = typeof options?.body === 'string' ? JSON.parse(options.body) : null;
+            return body?.stream === true;
+        } catch {
+            return false;
+        }
+    }
+
+    private async requestViaObsidian(url: URL | RequestInfo, options?: RequestInit): Promise<Response> {
+        const headers = this.normalizeFetchHeaders(options?.headers);
+        const signal = options?.signal;
+        const keepStreamingBody = this.isStreamingRequest(options);
+        return new Promise((resolve, reject) => {
+            const onAbort = () => reject(createAbortError());
+            if (signal?.aborted) return onAbort();
+            signal?.addEventListener('abort', onAbort);
+
+            requestUrl({
+                url: url.toString(),
+                method: options?.method || 'POST',
+                headers: headers,
+                body: options?.body as string,
+                throw: false
+            }).then(response => {
+                signal?.removeEventListener('abort', onAbort);
+                resolve(buildFetchResponse(response, keepStreamingBody));
+            }).catch(err => {
+                signal?.removeEventListener('abort', onAbort);
+                reject(err);
+            });
+        });
+    }
+
+    private async requestViaCompanion(url: URL | RequestInfo, options?: RequestInit): Promise<Response> {
+        const i18n = useGlobalStoreInstance.getState().i18n;
+        const worker = i18n?.companionWorkerManager;
+        if (!worker || !i18n.settings.llmCompanionWorkerEnabled) {
+            return this.requestViaObsidian(url, options);
+        }
+
+        const keepStreamingBody = this.isStreamingRequest(options);
+        const request: CompanionProxyRequest = {
+            url: url.toString(),
+            method: options?.method || 'POST',
+            headers: this.normalizeFetchHeaders(options?.headers),
+            body: options?.body as string | undefined,
+            timeoutMs: i18n.settings.llmTimeout || 60000,
+        };
+
+        try {
+            const response = await Promise.race([
+                worker.proxyRequest(request),
+                new Promise<never>((_, reject) => {
+                    if (options?.signal?.aborted) {
+                        reject(createAbortError());
+                        return;
+                    }
+                    options?.signal?.addEventListener('abort', () => reject(createAbortError()), { once: true });
+                })
+            ]);
+            return buildCompanionFetchResponse(response, keepStreamingBody);
+        } catch (error) {
+            if ((error as Error).name === 'AbortError') throw error;
+            console.warn('[OpenAI API] 本地伴生进程请求失败，回退 Obsidian requestUrl', error);
+            return this.requestViaObsidian(url, options);
+        }
+    }
+
+    private normalizeFetchHeaders(input?: HeadersInit): Record<string, string> {
+        const headers: Record<string, string> = {};
+        if (!input) return headers;
+
+        if (input instanceof Headers) {
+            input.forEach((value, key) => { headers[key] = value; });
+        } else if (Array.isArray(input)) {
+            input.forEach(([key, value]) => { headers[key] = value; });
+        } else {
+            Object.assign(headers, input as Record<string, string>);
+        }
+        return headers;
+    }
+
+    private async readChatCompletionContent(completion: any): Promise<string> {
+        if (completion?.choices?.[0]?.message?.content !== undefined) {
+            return completion.choices[0].message.content || '';
+        }
+
+        const chunks: string[] = [];
+        for await (const chunk of completion) {
+            const content = chunk?.choices?.[0]?.delta?.content;
+            if (typeof content === 'string') chunks.push(content);
+        }
+        return chunks.join('');
     }
 
     /**
@@ -105,40 +216,7 @@ export class OpenAITranslationService extends BaseProvider {
             baseURL: baseURL,
             apiKey: apiKey,
             dangerouslyAllowBrowser: true,
-            fetch: async (url, options) => {
-                // ... (Headers handling remains same)
-                const headers: Record<string, string> = {};
-                if (options?.headers) {
-                    if (options.headers instanceof Headers) {
-                        options.headers.forEach((value, key) => { headers[key] = value; });
-                    } else if (Array.isArray(options.headers)) {
-                        options.headers.forEach(([key, value]) => { headers[key] = value; });
-                    } else {
-                        Object.assign(headers, options.headers as Record<string, string>);
-                    }
-                }
-
-                const signal = options?.signal;
-                return new Promise((resolve, reject) => {
-                    const onAbort = () => reject(new Error('AbortError'));
-                    if (signal?.aborted) return onAbort();
-                    signal?.addEventListener('abort', onAbort);
-
-                    requestUrl({
-                        url: url.toString(),
-                        method: options?.method || 'POST',
-                        headers: headers,
-                        body: options?.body as string,
-                        throw: false
-                    }).then(response => {
-                        signal?.removeEventListener('abort', onAbort);
-                        resolve(buildFetchResponse(response));
-                    }).catch(err => {
-                        signal?.removeEventListener('abort', onAbort);
-                        reject(err);
-                    });
-                });
-            }
+            fetch: async (url, options) => this.requestViaCompanion(url, options)
         });
     }
 
@@ -218,7 +296,7 @@ export class OpenAITranslationService extends BaseProvider {
                     messages: messages as any,
                     model: this.getModelName(),
                     temperature: 0.3,
-                    stream: false,
+                    stream: true,
                 };
 
                 // 根据设定的格式注入对应 response_format
@@ -253,7 +331,7 @@ export class OpenAITranslationService extends BaseProvider {
                 const openai = this.getOpenAIClient();
                 const completion = await openai.chat.completions.create(requestParams, { signal: timeoutController.signal });
 
-                const assistantContent = completion.choices[0].message.content;
+                const assistantContent = await this.readChatCompletionContent(completion);
                 return this.parseResponseContent(assistantContent || '');
             } catch (error: any) {
                 // 检查是否是因为超时导致的取消

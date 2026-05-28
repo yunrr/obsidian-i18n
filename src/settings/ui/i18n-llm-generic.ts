@@ -18,6 +18,7 @@ export default class I18nLLMGeneric extends BaseSetting {
 
         this.profileUI();
         this.configUI();
+        this.companionWorkerUI();
         this.batchConcurrencyUI();
 
         // 允许所有模型显式或者兜底式自选返回格式
@@ -252,6 +253,53 @@ export default class I18nLLMGeneric extends BaseSetting {
             });
         });
 
+    }
+
+    private companionWorkerUI(): void {
+        if (this.config.engine !== 'openai') return;
+
+        new Setting(this.containerEl).setName(t('Settings.Ai.CompanionHeader')).setHeading();
+
+        new Setting(this.containerEl)
+            .setName(t('Settings.Ai.CompanionEnabledTitle'))
+            .setDesc(t('Settings.Ai.CompanionEnabledDesc'))
+            .addToggle(toggle => {
+                toggle.setValue(this.settings.llmCompanionWorkerEnabled !== false)
+                    .onChange(async (value) => {
+                        this.settings.llmCompanionWorkerEnabled = value;
+                        if (!value) this.i18n.companionWorkerManager?.stop();
+                        await this.i18n.saveSettings();
+                    });
+            });
+
+        new Setting(this.containerEl)
+            .setName(t('Settings.Ai.CompanionPortTitle'))
+            .setDesc(t('Settings.Ai.CompanionPortDesc'))
+            .addText(text => {
+                text.setValue(String(this.settings.llmCompanionWorkerPort || 18743))
+                    .onChange(async (value) => {
+                        const parsed = Number.parseInt(value, 10);
+                        this.settings.llmCompanionWorkerPort = Number.isFinite(parsed) ? Math.max(1, Math.min(65535, parsed)) : 18743;
+                        this.i18n.companionWorkerManager?.stop();
+                        await this.i18n.saveSettings();
+                    });
+                text.inputEl.type = 'number';
+                text.inputEl.min = '1';
+                text.inputEl.max = '65535';
+            });
+
+        new Setting(this.containerEl)
+            .setName(t('Settings.Ai.CompanionNodePathTitle'))
+            .setDesc(t('Settings.Ai.CompanionNodePathDesc'))
+            .addText(text => {
+                text.setValue(this.settings.llmCompanionNodePath || '')
+                    .setPlaceholder('node')
+                    .onChange(async (value) => {
+                        this.settings.llmCompanionNodePath = value.trim();
+                        this.i18n.companionWorkerManager?.stop();
+                        await this.i18n.saveSettings();
+                    });
+            });
     }
 
     private batchConcurrencyUI(): void {
