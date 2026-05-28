@@ -5,7 +5,7 @@ import { useTranslation } from 'react-i18next';
 import { FolderOpen, FileOutput, XCircle, Loader2, MoreHorizontal, Pen, CloudDownload, Cloud } from 'lucide-react';
 import I18N from 'src/main';
 import { OBThemeManifest, ThemeTranslationV1 } from 'src/types';
-import { i18nOpen, getThemeTranslationSources, hasChineseText, hasExtractedTranslationContent } from '../../../utils';
+import { i18nOpen, getThemeTranslationSources, hasBoundedChineseRuns, hasChineseText, hasExtractedTranslationContent } from '../../../utils';
 import { loadTranslationFile } from '../../../manager/io-manager';
 import { useGlobalStoreInstance } from '~/utils';
 import { THEME_EDITOR_VIEW_TYPE } from '../../theme_editor/editor';
@@ -153,7 +153,7 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
                 try { manifest = fs.readJsonSync(manifestPath); } catch (e) { /* use default */ }
             }
 
-            if (hasChineseText(`${manifest.name || theme.name}\n${cssStr}`)) {
+            if (hasChineseText(manifest.name || theme.name) || hasBoundedChineseRuns(cssStr)) {
                 i18n.notice.result(false, '检测到主题已包含中文内容，已跳过提取');
                 return;
             }

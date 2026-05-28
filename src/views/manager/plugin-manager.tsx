@@ -4,15 +4,32 @@ import * as path from 'path';
 import * as fs from 'fs-extra';
 import { useTranslation } from 'react-i18next';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { Search, LayoutGrid, List, FileOutput, Languages, Loader2, RotateCcw, Square } from 'lucide-react';
+import { Search, LayoutGrid, List, FileOutput, Languages, Loader2, RotateCcw, Square, AlertTriangle } from 'lucide-react';
 
 import I18N from 'src/main';
 import { PluginTranslationV1, BatchTaskFailureRecord } from 'src/types';
-import { formatTimestamp, isValidPluginTranslationV1Format, calculateChecksum, generatePlugin, getPluginTranslationSources, hasChineseText, hasExtractedTranslationContent } from '../../utils';
+import { formatTimestamp, isValidPluginTranslationV1Format } from '../../utils';
 import { loadTranslationFile } from '../../manager/io-manager';
 import { useGlobalStoreInstance } from '~/utils';
-import { createTranslationProvider } from '~/ai/provider-factory';
-import type { AstItem, RegexItem } from '../plugin_editor/types';
+import { normalizeOpenAIUrl } from '~/utils/ai/url-helper';
+import { LLM_PROVIDERS } from '~/ai/constants';
+import {
+    DEFAULT_AST_PROMPT_TEMPLATE,
+    DEFAULT_REGEX_PROMPT_TEMPLATE,
+    DEFAULT_THEME_PROMPT_TEMPLATE,
+    generateAstSystemPrompt,
+    generateRegexSystemPrompt,
+    generateThemeSystemPrompt,
+} from '~/ai/prompts';
+import type {
+    CompanionExtractionSettings,
+    CompanionPluginBatchExtractPayload,
+    CompanionPluginBatchTranslatePayload,
+    CompanionPluginExtractPayload,
+    CompanionPluginFailureRetryPayload,
+    CompanionTaskProgress,
+    CompanionTranslationConfig,
+} from '~/manager/companion-worker-manager';
 
 import {
     Button,
@@ -57,8 +74,6 @@ interface PluginBatchResource {
 
 const PLUGIN_EXTRACT_CHECKPOINT_KEY = 'plugin:extract';
 const PLUGIN_TRANSLATE_CHECKPOINT_KEY = 'plugin:translate';
-const BATCH_PROGRESS_UPDATE_INTERVAL = 200;
-const BATCH_PERSIST_INTERVAL = 1500;
 
 const EMPTY_BATCH_TASK_STATE: BatchTaskState = {
     mode: null,
@@ -73,29 +88,92 @@ const EMPTY_BATCH_TASK_STATE: BatchTaskState = {
     skippedCount: 0,
 };
 
+const SOURCE_SYNC_THROTTLE_MS = 1500;
+
 const shouldTranslateText = (target?: string, source?: string) => !target || target.trim() === '' || target === source;
-const yieldToMainThread = () => new Promise<void>(resolve => window.setTimeout(resolve, 0));
 const getPositiveInt = (value: unknown, fallback: number) => {
     const parsed = typeof value === 'number' ? value : Number.parseInt(String(value), 10);
     return Number.isFinite(parsed) ? Math.max(1, Math.floor(parsed)) : fallback;
 };
 
-const runConcurrentTasks = async <T,>(
-    items: T[],
-    limit: number,
-    shouldStop: () => boolean,
-    worker: (item: T, index: number) => Promise<void>
-) => {
-    let nextIndex = 0;
-    const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-        while (!shouldStop()) {
-            const index = nextIndex++;
-            if (index >= items.length) return;
-            await worker(items[index], index);
-            await yieldToMainThread();
-        }
-    });
-    await Promise.all(workers);
+const getActiveLLMProfile = (settings: I18N['settings']) => {
+    const config = LLM_PROVIDERS[settings.llmApi];
+    if (!config) return null;
+    const profiles = (settings as any)[`llm${config.labelKey}Profiles`] as any[];
+    const activeId = (settings as any)[`llm${config.labelKey}ActiveProfileId`] as string;
+    return profiles?.find(profile => profile.id === activeId) || profiles?.[0] || null;
+};
+
+const getCompanionTranslationConfig = (settings: I18N['settings']): CompanionTranslationConfig => {
+    const provider = LLM_PROVIDERS[settings.llmApi];
+    const activeProfile = getActiveLLMProfile(settings);
+    if (!provider || provider.engine !== 'openai' || !activeProfile) {
+        throw new Error('本地批量 worker 仅支持 OpenAI 兼容服务');
+    }
+
+    const rawUrl = normalizeOpenAIUrl(activeProfile.url || provider.baseUrl || '');
+    if (!rawUrl) throw new Error('Missing OpenAI compatible API URL');
+
+    return {
+        chatCompletionsUrl: `${rawUrl.replace(/\/+$/, '')}/chat/completions`,
+        apiKey: activeProfile.key,
+        model: activeProfile.model || provider.defaultModel,
+        timeoutMs: settings.llmTimeout || 60000,
+        responseFormat: settings.llmResponseFormat,
+        batchSize: getPositiveInt(settings.llmBatchSize, 1),
+        concurrency: getPositiveInt(settings.llmConcurrencyLimit, 3),
+        prompts: {
+            ast: generateAstSystemPrompt(settings.llmAstPrompt || DEFAULT_AST_PROMPT_TEMPLATE, settings.llmLanguage, settings.llmStyle),
+            regex: generateRegexSystemPrompt(settings.llmRegexPrompt || DEFAULT_REGEX_PROMPT_TEMPLATE, settings.llmLanguage, settings.llmStyle),
+            theme: generateThemeSystemPrompt(settings.llmThemePrompt || DEFAULT_THEME_PROMPT_TEMPLATE, settings.llmLanguage, settings.llmStyle),
+        },
+    };
+};
+
+const getCompanionExtractionSettings = (settings: I18N['settings']): CompanionExtractionSettings => ({
+    author: settings.author,
+    reFlags: settings.reFlags,
+    reLength: settings.reLength,
+    reDatas: settings.reDatas,
+    reRejectRe: settings.reRejectRe,
+    reValidRe: settings.reValidRe,
+    astAssignments: settings.astAssignments,
+    astFunctions: settings.astFunctions,
+    astKeys: settings.astKeys,
+    astRejectRe: settings.astRejectRe,
+    astValidRe: settings.astValidRe,
+});
+
+const formatFailureTime = (failedAt: number) => failedAt ? new Date(failedAt).toLocaleString() : '';
+
+const BatchFailureDetails: React.FC<{ records: BatchTaskFailureRecord[]; title: string }> = ({ records, title }) => {
+    if (records.length === 0) return null;
+
+    return (
+        <div className="border border-destructive/30 bg-destructive/5 rounded-none px-3 py-2 space-y-2">
+            <div className="flex items-center gap-2 text-[12px] font-medium text-destructive">
+                <AlertTriangle className="w-4 h-4" />
+                <span>{title}</span>
+                <span className="text-muted-foreground">{records.length}</span>
+            </div>
+            <div className="max-h-48 overflow-auto space-y-2 pr-1">
+                {records.map(record => (
+                    <div key={record.id} className="border border-muted-foreground/20 bg-background/70 rounded-none p-2 text-[11px] space-y-1">
+                        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                            <span className="font-medium text-foreground">{record.resourceLabel || record.resourceId}</span>
+                            <span className="text-muted-foreground">{record.batchType}</span>
+                            <span className="text-muted-foreground">{record.items.length} 条</span>
+                            <span className="text-muted-foreground">{formatFailureTime(record.failedAt)}</span>
+                        </div>
+                        <div className="text-destructive break-words whitespace-pre-wrap">{record.errorMessage}</div>
+                        {record.items[0]?.source && (
+                            <div className="text-muted-foreground break-words line-clamp-2">{record.items[0].source}</div>
+                        )}
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
 };
 
 export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => {
@@ -112,8 +190,10 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
     const [refreshKey, setRefreshKey] = useState(0);
     const [cloudManifest, setCloudManifest] = useState<any[]>([]);
     const [batchTask, setBatchTask] = useState<BatchTaskState>(EMPTY_BATCH_TASK_STATE);
-    const translateAbortControllerRef = useRef<AbortController | null>(null);
-    const stopRequestedRef = useRef(false);
+    const [showFailureDetails, setShowFailureDetails] = useState(false);
+    const taskIdRef = useRef<string | null>(null);
+    const syncRevisionRef = useRef({ sourceRevision: 0, recordRevision: 0 });
+    const lastSourceSyncAtRef = useRef(0);
 
     const setViewMode = useCallback((mode: 'list' | 'grid') => {
         setViewModeState(mode);
@@ -384,71 +464,6 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         return i18n.sourceManager.loadBatchTaskCheckpoint(PLUGIN_TRANSLATE_CHECKPOINT_KEY);
     }, [i18n, sourceTick]);
 
-    const isAbortError = useCallback((error: unknown) => {
-        return error instanceof Error && (error.name === 'AbortError' || error.message === '翻译任务已取消');
-    }, []);
-
-    const buildPluginSourceUpdate = useCallback((source: any, translationJson: PluginTranslationV1) => ({
-        ...source,
-        title: translationJson.metadata?.title || source.title,
-        origin: 'local',
-        cloud: undefined,
-        checksum: calculateChecksum(translationJson),
-    }), []);
-
-    const savePluginExtractCheckpoint = useCallback((resources: PluginBatchResource[], completedIndexes: Set<number>, completedResources: number, totalResources: number) => {
-        i18n.sourceManager.saveBatchTaskCheckpoint(PLUGIN_EXTRACT_CHECKPOINT_KEY, {
-            scope: 'plugin',
-            mode: 'extract',
-            resources: resources.filter((_, index) => !completedIndexes.has(index)).map(resource => ({
-                resourceId: resource.resourceId,
-                label: resource.label,
-                sourceId: resource.sourceId ?? null,
-            })),
-            totalResources,
-            completedResources,
-            totalItems: 0,
-            processedItems: 0,
-            stoppedAt: Date.now(),
-        });
-    }, [i18n]);
-
-    const savePluginTranslateCheckpoint = useCallback((resources: PluginBatchResource[], startIndex: number, completedResources: number, totalResources: number, totalItems: number, processedItems: number) => {
-        i18n.sourceManager.saveBatchTaskCheckpoint(PLUGIN_TRANSLATE_CHECKPOINT_KEY, {
-            scope: 'plugin',
-            mode: 'translate',
-            resources: resources.slice(startIndex).map(resource => ({
-                resourceId: resource.resourceId,
-                label: resource.label,
-                sourceId: resource.sourceId ?? null,
-            })),
-            totalResources,
-            completedResources,
-            totalItems,
-            processedItems,
-            stoppedAt: Date.now(),
-        });
-    }, [i18n]);
-
-    const clearPluginFailuresForSource = useCallback((sourceId: string) => {
-        const ids = i18n.sourceManager
-            .getBatchTaskFailures('plugin')
-            .filter(item => item.sourceId === sourceId)
-            .map(item => item.id);
-        i18n.sourceManager.removeBatchTaskFailures(ids);
-    }, [i18n]);
-
-    const buildPluginFailureRecord = useCallback((failure: Omit<BatchTaskFailureRecord, 'id' | 'failedAt' | 'scope'>): BatchTaskFailureRecord => ({
-        ...failure,
-        id: `${failure.sourceId}:${failure.batchType}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
-        scope: 'plugin',
-        failedAt: Date.now(),
-    }), []);
-
-    const recordPluginFailure = useCallback((failure: Omit<BatchTaskFailureRecord, 'id' | 'failedAt' | 'scope'>) => {
-        i18n.sourceManager.saveBatchTaskFailure(buildPluginFailureRecord(failure));
-    }, [buildPluginFailureRecord, i18n]);
-
     const handleSearchChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         const val = e.target.value;
         setSearchTerm(val);
@@ -516,9 +531,58 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         setRefreshKey(k => k + 1);
     }, []);
 
-    const updateBatchTask = useCallback((updates: Partial<BatchTaskState>) => {
-        setBatchTask(prev => ({ ...prev, ...updates }));
-    }, []);
+    const syncSourceStateFromDisk = useCallback(() => {
+        lastSourceSyncAtRef.current = Date.now();
+        i18n.sourceManager.reloadFromDisk();
+        handleRefresh();
+    }, [handleRefresh, i18n]);
+
+    const syncWorkerProgress = useCallback((progress: CompanionTaskProgress) => {
+        setBatchTask({
+            mode: progress.mode,
+            isRunning: progress.status === 'queued' || progress.status === 'running',
+            currentLabel: progress.currentLabel,
+            processedResources: progress.processedResources,
+            totalResources: progress.totalResources,
+            processedItems: progress.processedItems,
+            totalItems: progress.totalItems,
+            successCount: progress.successCount,
+            failedCount: progress.failedCount,
+            skippedCount: progress.skippedCount,
+        });
+
+        const revisions = syncRevisionRef.current;
+        const hasRevisionChange = progress.sourceRevision !== revisions.sourceRevision || progress.recordRevision !== revisions.recordRevision;
+        if (!hasRevisionChange) return;
+
+        revisions.sourceRevision = progress.sourceRevision;
+        revisions.recordRevision = progress.recordRevision;
+        if (Date.now() - lastSourceSyncAtRef.current >= SOURCE_SYNC_THROTTLE_MS) {
+            syncSourceStateFromDisk();
+        }
+    }, [syncSourceStateFromDisk]);
+
+    const runWorkerTask = useCallback(async (type: 'plugin-batch-extract' | 'plugin-batch-translate' | 'plugin-failure-retry', payload: unknown) => {
+        const started = await i18n.companionWorkerManager.startTask(type, payload);
+        taskIdRef.current = started.taskId;
+        syncRevisionRef.current = { sourceRevision: 0, recordRevision: 0 };
+        lastSourceSyncAtRef.current = 0;
+        syncWorkerProgress(started.progress);
+
+        let progress = started.progress;
+        while (progress.status === 'queued' || progress.status === 'running') {
+            await new Promise(resolve => window.setTimeout(resolve, 300));
+            const status = await i18n.companionWorkerManager.getTaskStatus(started.taskId);
+            progress = status.progress;
+            syncWorkerProgress(progress);
+        }
+
+        taskIdRef.current = null;
+        syncSourceStateFromDisk();
+
+        if (progress.status === 'failed') throw new Error(progress.error || '本地伴生任务失败');
+        return progress;
+    }, [i18n, syncSourceStateFromDisk, syncWorkerProgress]);
 
     const startPluginBatchExtract = useCallback(async (resume: boolean) => {
         const resources: PluginBatchResource[] = resume && pluginExtractCheckpoint?.resources.length
@@ -531,8 +595,6 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
 
         if (batchTask.isRunning || resources.length === 0) return;
 
-        const extractConcurrency = getPositiveInt(i18n.settings.batchExtractConcurrency, 3);
-        stopRequestedRef.current = false;
         setBatchTask({
             mode: 'extract',
             isRunning: true,
@@ -546,221 +608,46 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             skippedCount: 0,
         });
 
-        let processedResources = 0;
-        let successCount = 0;
-        let failedCount = 0;
-        let skippedCount = 0;
-        const completedIndexes = new Set<number>();
-        const pendingEntries: Array<{ pluginId: string; content: PluginTranslationV1; options: { title: string } }> = [];
-
-        const flushPendingEntries = () => {
-            if (pendingEntries.length === 0) return;
-            i18n.sourceManager.batchExtractAndSaveSources(pendingEntries.splice(0, pendingEntries.length));
-        };
-
-        const markResourceDone = (index: number) => {
-            completedIndexes.add(index);
-        };
-
-        const saveStopCheckpoint = () => {
-            flushPendingEntries();
-            savePluginExtractCheckpoint(resources, completedIndexes, processedResources, resources.length);
-        };
-
-        const saveProgressCheckpoint = () => {
-            flushPendingEntries();
-            savePluginExtractCheckpoint(resources, completedIndexes, processedResources, resources.length);
-        };
-
         try {
-            await runConcurrentTasks(resources, extractConcurrency, () => stopRequestedRef.current, async (resource, index) => {
+            const workerResources: CompanionPluginExtractPayload[] = resources.map(resource => {
                 const plugin = plugins.find(item => item.id === resource.resourceId);
                 const data = allPluginStates[resource.resourceId];
-                updateBatchTask({ currentLabel: resource.label });
-
-                let shouldSaveCheckpoint = false;
-                try {
-                    if (!plugin || !data || !await fs.pathExists(data.mainDoc)) {
-                        throw new Error(t('Manager.Plugins.Errors.MainNotFound'));
-                    }
-
-                    const [mainStr, manifestJSON] = await Promise.all([
-                        fs.readFile(data.mainDoc, 'utf8'),
-                        fs.readJson(data.manifestDoc)
-                    ]);
-
-                    if (hasChineseText(`${manifestJSON.name || plugin.name}\n${manifestJSON.description || ''}\n${mainStr}`)) {
-                        skippedCount++;
-                        shouldSaveCheckpoint = true;
-                    } else {
-                        const translationJson = generatePlugin(plugin.version, manifestJSON, mainStr, settings.language, i18n.settings);
-                        const extractedSources = getPluginTranslationSources(translationJson);
-                        if (!hasExtractedTranslationContent(extractedSources)) {
-                            skippedCount++;
-                            shouldSaveCheckpoint = true;
-                        } else {
-                            pendingEntries.push({ pluginId: plugin.id, content: translationJson, options: { title: plugin.name } });
-                            successCount++;
-
-                            if (pendingEntries.length >= Math.max(5, extractConcurrency * 2)) {
-                                flushPendingEntries();
-                            }
-                        }
-                    }
-                } catch (error) {
-                    failedCount++;
-                    console.error(`[i18n] Failed to batch extract plugin ${resource.resourceId}:`, error);
-                }
-
-                processedResources++;
-                markResourceDone(index);
-                if (shouldSaveCheckpoint) {
-                    saveProgressCheckpoint();
-                }
-                updateBatchTask({
-                    processedResources,
-                    successCount,
-                    failedCount,
-                    skippedCount,
-                });
+                if (!plugin || !data) throw new Error(t('Manager.Plugins.Errors.MainNotFound'));
+                return {
+                    resourceId: resource.resourceId,
+                    label: resource.label,
+                    pluginName: plugin.name,
+                    pluginVersion: plugin.version,
+                    mainDoc: data.mainDoc,
+                    manifestDoc: data.manifestDoc,
+                    language: settings.language,
+                    settings: getCompanionExtractionSettings(i18n.settings),
+                };
             });
-
-            if (stopRequestedRef.current) {
-                saveStopCheckpoint();
+            const payload: CompanionPluginBatchExtractPayload = {
+                persistence: { basePath: i18n.sourceManager.getBasePath() },
+                resources: workerResources,
+                concurrency: getPositiveInt(i18n.settings.batchExtractConcurrency, 3),
+                checkpointKey: PLUGIN_EXTRACT_CHECKPOINT_KEY,
+                completedResources: pluginExtractCheckpoint?.completedResources || 0,
+            };
+            const progress = await runWorkerTask('plugin-batch-extract', payload);
+            if (progress.status === 'cancelled') {
                 new Notice(t('Common.Notices.TaskStopped'));
                 return;
             }
-
-            flushPendingEntries();
-            i18n.sourceManager.clearBatchTaskCheckpoint(PLUGIN_EXTRACT_CHECKPOINT_KEY);
-            handleRefresh();
-            new Notice(t('Manager.Plugins.Notices.BatchExtractComplete', { success: successCount, fail: failedCount, skip: skippedCount, defaultValue: `批量提取完成：成功 ${successCount}，失败 ${failedCount}，跳过 ${skippedCount}` }));
+            new Notice(t('Manager.Plugins.Notices.BatchExtractComplete', { success: progress.successCount, fail: progress.failedCount, skip: progress.skippedCount, defaultValue: `批量提取完成：成功 ${progress.successCount}，失败 ${progress.failedCount}，跳过 ${progress.skippedCount}` }));
+        } catch (error) {
+            console.error('[i18n] Batch plugin extraction failed:', error);
+            new Notice(t('Common.Notices.TranslateFail', { message: String(error) }));
         } finally {
-            stopRequestedRef.current = false;
-            setBatchTask(prev => ({
-                ...prev,
-                isRunning: false,
-                currentLabel: '',
-                processedResources,
-                successCount,
-                failedCount,
-                skippedCount,
-            }));
+            taskIdRef.current = null;
+            setBatchTask(prev => ({ ...prev, isRunning: false, currentLabel: '' }));
         }
-    }, [allPluginStates, batchTask.isRunning, extractablePlugins, handleRefresh, i18n, plugins, pluginExtractCheckpoint, savePluginExtractCheckpoint, settings.language, t, updateBatchTask]);
+    }, [allPluginStates, batchTask.isRunning, extractablePlugins, i18n, plugins, pluginExtractCheckpoint, runWorkerTask, settings.language, t]);
 
     const handleBatchExtract = useCallback(() => startPluginBatchExtract(false), [startPluginBatchExtract]);
     const handleResumeExtract = useCallback(() => startPluginBatchExtract(true), [startPluginBatchExtract]);
-
-    const applyAstBatchResults = useCallback((translationJson: PluginTranslationV1, mappings: Map<number, { file: string; index: number }>, batchResult: AstItem[]) => {
-        for (const result of batchResult) {
-            const mapping = mappings.get(result.id);
-            if (!mapping) continue;
-            translationJson.dict[mapping.file].ast[mapping.index].target = result.target;
-        }
-    }, []);
-
-    const applyRegexBatchResults = useCallback((translationJson: PluginTranslationV1, mappings: Map<number, { file: string; index: number }>, batchResult: RegexItem[]) => {
-        for (const result of batchResult) {
-            const mapping = mappings.get(result.id);
-            if (!mapping) continue;
-            translationJson.dict[mapping.file].regex[mapping.index].target = result.target;
-        }
-    }, []);
-
-    const translatePluginSource = useCallback(async (
-        translationJson: PluginTranslationV1,
-        context: { resourceId: string; resourceLabel: string; sourceId: string },
-        onItemsProcessed: (count: number) => void,
-        onBatchPersist: () => void,
-        signal?: AbortSignal,
-        onBatchFailure: (failure: Omit<BatchTaskFailureRecord, 'id' | 'failedAt' | 'scope'>) => void = recordPluginFailure,
-    ) => {
-        const provider = createTranslationProvider();
-        const astItems: AstItem[] = [];
-        const regexItems: RegexItem[] = [];
-        const astMappings = new Map<number, { file: string; index: number }>();
-        const regexMappings = new Map<number, { file: string; index: number }>();
-        let nextId = 0;
-
-        for (const [file, dict] of Object.entries(translationJson.dict || {})) {
-            dict.ast.forEach((item, index) => {
-                if (!shouldTranslateText(item.target, item.source)) return;
-                const id = nextId++;
-                astItems.push({
-                    id,
-                    type: item.type,
-                    name: item.name,
-                    source: item.source,
-                    target: item.target,
-                });
-                astMappings.set(id, { file, index });
-            });
-
-            dict.regex.forEach((item, index) => {
-                if (!shouldTranslateText(item.target, item.source)) return;
-                const id = nextId++;
-                regexItems.push({
-                    id,
-                    source: item.source,
-                    target: item.target,
-                });
-                regexMappings.set(id, { file, index });
-            });
-        }
-
-        const translateTasks: Promise<void>[] = [];
-
-        if (astItems.length > 0) {
-            translateTasks.push(provider.astTranslate(astItems, async (batchResult) => {
-                applyAstBatchResults(translationJson, astMappings, batchResult);
-                onItemsProcessed(batchResult.length);
-                onBatchPersist();
-            }, signal, async (batchItems, error) => {
-                onBatchFailure({
-                    ...context,
-                    batchType: 'ast',
-                    errorMessage: error.message,
-                    items: batchItems.map(item => {
-                        const mapping = astMappings.get(item.id);
-                        return {
-                            source: item.source,
-                            target: item.target,
-                            dictIndex: mapping?.index ?? -1,
-                            file: mapping?.file,
-                            type: item.type,
-                            name: item.name,
-                        };
-                    }).filter(item => item.dictIndex >= 0 && item.file),
-                });
-            }).then(() => undefined));
-        }
-
-        if (regexItems.length > 0) {
-            translateTasks.push(provider.regexTranslate(regexItems, async (batchResult) => {
-                applyRegexBatchResults(translationJson, regexMappings, batchResult);
-                onItemsProcessed(batchResult.length);
-                onBatchPersist();
-            }, signal, async (batchItems, error) => {
-                onBatchFailure({
-                    ...context,
-                    batchType: 'regex',
-                    errorMessage: error.message,
-                    items: batchItems.map(item => {
-                        const mapping = regexMappings.get(item.id);
-                        return {
-                            source: item.source,
-                            target: item.target,
-                            dictIndex: mapping?.index ?? -1,
-                            file: mapping?.file,
-                        };
-                    }).filter(item => item.dictIndex >= 0 && item.file),
-                });
-            }).then(() => undefined));
-        }
-
-        await Promise.all(translateTasks);
-    }, [applyAstBatchResults, applyRegexBatchResults, recordPluginFailure]);
 
     const startPluginBatchTranslate = useCallback(async (resume: boolean) => {
         const resources: PluginBatchResource[] = resume && pluginTranslateCheckpoint?.resources.length
@@ -781,8 +668,6 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             return sum + (allPluginStates[resource.resourceId]?.pendingTranslationCount || 0);
         }, 0);
 
-        stopRequestedRef.current = false;
-        translateAbortControllerRef.current = new AbortController();
         setBatchTask({
             mode: 'translate',
             isRunning: true,
@@ -796,172 +681,46 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             skippedCount: 0,
         });
 
-        const translateConcurrency = getPositiveInt(i18n.settings.batchTranslateConcurrency, 2);
-        let processedResources = 0;
-        let processedItems = 0;
-        let successCount = 0;
-        let failedCount = 0;
-        let skippedCount = 0;
-        let nextCheckpointIndex = 0;
-        const completedIndexes = new Set<number>();
-        const pendingFailures: BatchTaskFailureRecord[] = [];
-        const flushPendingFailures = () => {
-            if (pendingFailures.length === 0) return;
-            i18n.sourceManager.saveBatchTaskFailures(pendingFailures.splice(0, pendingFailures.length));
-        };
-
-        const markResourceDone = (index: number) => {
-            completedIndexes.add(index);
-            while (completedIndexes.has(nextCheckpointIndex)) nextCheckpointIndex++;
-        };
-
-        const saveStopCheckpoint = () => {
-            flushPendingFailures();
-            savePluginTranslateCheckpoint(resources, nextCheckpointIndex, processedResources, resources.length, totalItems, processedItems);
-        };
-
         try {
-            await runConcurrentTasks(resources, translateConcurrency, () => stopRequestedRef.current || !!translateAbortControllerRef.current?.signal.aborted, async (resource, index) => {
-                if (stopRequestedRef.current || translateAbortControllerRef.current?.signal.aborted) return;
-
-                const data = allPluginStates[resource.resourceId];
-                updateBatchTask({ currentLabel: resource.label });
-
-                try {
-                    const sourceId = resource.sourceId || data?.activeSourceId;
-                    if (!sourceId || !data?.langDoc || !data.translationFormatMark) {
-                        skippedCount++;
-                    } else {
-                        const source = i18n.sourceManager.getSource(sourceId);
-                        const translationPath = i18n.sourceManager.getSourceFilePath(sourceId);
-                        const translationJson = loadTranslationFile(translationPath) as PluginTranslationV1 | null;
-                        const pendingCount = translationJson ? countPendingTranslationItems(translationJson) : 0;
-
-                        if (!source || !translationJson || pendingCount === 0) {
-                            skippedCount++;
-                        } else {
-                            await yieldToMainThread();
-                            const persistCurrentSource = () => {
-                                i18n.sourceManager.saveSourceFile(source.id, translationJson);
-                                i18n.sourceManager.saveSource(buildPluginSourceUpdate(source, translationJson));
-                            };
-                            let lastPersistAt = 0;
-                            let lastProgressUpdateAt = 0;
-                            let hasPendingPersist = false;
-
-                            const scheduleCurrentSourcePersist = () => {
-                                hasPendingPersist = true;
-                                const now = Date.now();
-                                if (now - lastPersistAt < BATCH_PERSIST_INTERVAL) return;
-                                persistCurrentSource();
-                                lastPersistAt = now;
-                                hasPendingPersist = false;
-                            };
-
-                            const flushCurrentSourcePersist = () => {
-                                if (!hasPendingPersist) return;
-                                persistCurrentSource();
-                                lastPersistAt = Date.now();
-                                hasPendingPersist = false;
-                            };
-
-                            const updateProcessedItems = (count: number) => {
-                                processedItems += count;
-                                const now = Date.now();
-                                if (now - lastProgressUpdateAt < BATCH_PROGRESS_UPDATE_INTERVAL) return;
-                                updateBatchTask({ processedItems });
-                                lastProgressUpdateAt = now;
-                            };
-
-                            await translatePluginSource(translationJson, {
-                                resourceId: resource.resourceId,
-                                resourceLabel: resource.label,
-                                sourceId: source.id,
-                            }, updateProcessedItems, scheduleCurrentSourcePersist, translateAbortControllerRef.current?.signal, (failure) => {
-                                pendingFailures.push(buildPluginFailureRecord(failure));
-                            });
-                            flushCurrentSourcePersist();
-                            persistCurrentSource();
-                            clearPluginFailuresForSource(source.id);
-                            updateBatchTask({ processedItems });
-                            successCount++;
-                        }
-                    }
-                    processedResources++;
-                    markResourceDone(index);
-                } catch (error) {
-                    if (isAbortError(error)) {
-                        stopRequestedRef.current = true;
-                        saveStopCheckpoint();
-                        return;
-                    }
-                    failedCount++;
-                    processedResources++;
-                    markResourceDone(index);
-                    console.error(`[i18n] Failed to batch translate plugin ${resource.resourceId}:`, error);
-                }
-
-                updateBatchTask({
-                    processedResources,
-                    processedItems,
-                    successCount,
-                    failedCount,
-                    skippedCount,
-                });
-            });
-
-            if (stopRequestedRef.current || translateAbortControllerRef.current?.signal.aborted) {
-                saveStopCheckpoint();
+            const payload: CompanionPluginBatchTranslatePayload = {
+                persistence: { basePath: i18n.sourceManager.getBasePath() },
+                resources,
+                config: getCompanionTranslationConfig(i18n.settings),
+                checkpointKey: PLUGIN_TRANSLATE_CHECKPOINT_KEY,
+                concurrency: getPositiveInt(i18n.settings.batchTranslateConcurrency, 2),
+                completedResources: pluginTranslateCheckpoint?.completedResources || 0,
+                processedItems: pluginTranslateCheckpoint?.processedItems || 0,
+                totalItems,
+            };
+            const progress = await runWorkerTask('plugin-batch-translate', payload);
+            if (progress.status === 'cancelled') {
                 new Notice(t('Common.Notices.TaskStopped'));
                 return;
             }
-
-            flushPendingFailures();
-            i18n.sourceManager.clearBatchTaskCheckpoint(PLUGIN_TRANSLATE_CHECKPOINT_KEY);
-            handleRefresh();
-            new Notice(t('Manager.Plugins.Notices.BatchTranslateComplete', { success: successCount, fail: failedCount, skip: skippedCount, defaultValue: `批量翻译完成：成功 ${successCount}，失败 ${failedCount}，跳过 ${skippedCount}` }));
+            new Notice(t('Manager.Plugins.Notices.BatchTranslateComplete', { success: progress.successCount, fail: progress.failedCount, skip: progress.skippedCount, defaultValue: `批量翻译完成：成功 ${progress.successCount}，失败 ${progress.failedCount}，跳过 ${progress.skippedCount}` }));
         } catch (error) {
             console.error('[i18n] Batch plugin translation failed:', error);
             new Notice(t('Common.Notices.TranslateFail', { message: String(error) }));
         } finally {
-            flushPendingFailures();
-            stopRequestedRef.current = false;
-            translateAbortControllerRef.current = null;
-            setBatchTask(prev => ({
-                ...prev,
-                isRunning: false,
-                currentLabel: '',
-                processedResources,
-                processedItems,
-                successCount,
-                failedCount,
-                skippedCount,
-            }));
+            taskIdRef.current = null;
+            setBatchTask(prev => ({ ...prev, isRunning: false, currentLabel: '' }));
         }
-    }, [allPluginStates, batchTask.isRunning, buildPluginFailureRecord, buildPluginSourceUpdate, clearPluginFailuresForSource, countPendingTranslationItems, handleRefresh, i18n, isAbortError, pluginTranslateCheckpoint, savePluginTranslateCheckpoint, t, translatablePlugins, translatePluginSource, updateBatchTask]);
+    }, [allPluginStates, batchTask.isRunning, i18n, pluginTranslateCheckpoint, runWorkerTask, t, translatablePlugins]);
 
     const handleBatchTranslate = useCallback(() => startPluginBatchTranslate(false), [startPluginBatchTranslate]);
     const handleResumeTranslate = useCallback(() => startPluginBatchTranslate(true), [startPluginBatchTranslate]);
 
     const handleStopBatchTask = useCallback(() => {
-        stopRequestedRef.current = true;
-        translateAbortControllerRef.current?.abort();
+        const taskId = taskIdRef.current;
+        if (taskId) {
+            i18n.companionWorkerManager.cancelTask(taskId).catch(error => console.warn('[i18n] Failed to cancel companion task:', error));
+        }
         setBatchTask(prev => ({ ...prev, currentLabel: t('Manager.Common.Status.Stopping', '正在停止') }));
-    }, [t]);
+    }, [i18n, t]);
 
     const handleRetryPluginFailures = useCallback(async () => {
         if (batchTask.isRunning || pluginFailureRecords.length === 0) return;
 
-        const retryConcurrency = getPositiveInt(i18n.settings.batchTranslateConcurrency, 2);
-        const failureGroups = Array.from(pluginFailureRecords.reduce((map, failure) => {
-            const group = map.get(failure.sourceId) || [];
-            group.push(failure);
-            map.set(failure.sourceId, group);
-            return map;
-        }, new Map<string, BatchTaskFailureRecord[]>()).values());
-
-        stopRequestedRef.current = false;
-        translateAbortControllerRef.current = new AbortController();
         setBatchTask({
             mode: 'translate',
             isRunning: true,
@@ -975,230 +734,27 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             skippedCount: 0,
         });
 
-        let processedResources = 0;
-        let processedItems = 0;
-        let successCount = 0;
-        let failedCount = 0;
-        let skippedCount = 0;
-
-        const updateRetryProgress = () => {
-            updateBatchTask({ processedResources, processedItems, successCount, failedCount, skippedCount });
-        };
-
-        const markProcessedRecords = (count: number) => {
-            processedResources += count;
-            updateRetryProgress();
-        };
-
-        const processFailureGroup = async (failures: BatchTaskFailureRecord[]) => {
-            if (failures.length === 0 || stopRequestedRef.current || translateAbortControllerRef.current?.signal.aborted) return;
-
-            const firstFailure = failures[0];
-            updateBatchTask({ currentLabel: firstFailure.resourceLabel });
-
-            let source: any | null = null;
-            let translationJson: PluginTranslationV1 | null = null;
-            try {
-                source = i18n.sourceManager.getSource(firstFailure.sourceId);
-                translationJson = i18n.sourceManager.readSourceFile(firstFailure.sourceId) as PluginTranslationV1 | null;
-            } catch (error) {
-                console.error(`[i18n] Failed to load plugin retry source ${firstFailure.sourceId}:`, error);
-            }
-
-            if (!source || !translationJson) {
-                skippedCount += failures.length;
-                markProcessedRecords(failures.length);
-                return;
-            }
-
-            const provider = createTranslationProvider();
-            let sourceDirty = false;
-            let lastPersistAt = 0;
-            const attemptedRecordIds = new Set<string>();
-            const failedRecordIds = new Set<string>();
-            const recordTotalItems = new Map<string, number>();
-            const recordSucceededItems = new Map<string, number>();
-
-            const persistSource = () => {
-                if (!sourceDirty) return;
-                i18n.sourceManager.saveSourceFile(source.id, translationJson);
-                i18n.sourceManager.saveSource(buildPluginSourceUpdate(source, translationJson));
-                sourceDirty = false;
-                lastPersistAt = Date.now();
-            };
-
-            const schedulePersistSource = () => {
-                if (!sourceDirty) return;
-                if (Date.now() - lastPersistAt < BATCH_PERSIST_INTERVAL) return;
-                persistSource();
-            };
-
-            const addRecordItems = (failureId: string, count: number) => {
-                if (count <= 0) return;
-                attemptedRecordIds.add(failureId);
-                recordTotalItems.set(failureId, (recordTotalItems.get(failureId) || 0) + count);
-            };
-
-            const markRecordItemSucceeded = (failureId: string) => {
-                recordSucceededItems.set(failureId, (recordSucceededItems.get(failureId) || 0) + 1);
-            };
-
-            const getCompletedRecordIds = () => Array.from(attemptedRecordIds).filter(id => {
-                if (failedRecordIds.has(id)) return false;
-                return (recordSucceededItems.get(id) || 0) >= (recordTotalItems.get(id) || 0);
-            });
-
-            const astItems: AstItem[] = [];
-            const regexItems: RegexItem[] = [];
-            const astMappings = new Map<number, { failureId: string; file: string; index: number }>();
-            const regexMappings = new Map<number, { failureId: string; file: string; index: number }>();
-            let nextAstId = 0;
-            let nextRegexId = 0;
-
-            for (const failure of failures) {
-                if (failure.batchType === 'ast') {
-                    let itemCount = 0;
-                    for (const item of failure.items) {
-                        if (!item.file || item.dictIndex < 0) {
-                            failedRecordIds.add(failure.id);
-                            continue;
-                        }
-                        const id = nextAstId++;
-                        astItems.push({
-                            id,
-                            type: item.type || '',
-                            name: item.name || '',
-                            source: item.source,
-                            target: item.target,
-                        });
-                        astMappings.set(id, { failureId: failure.id, file: item.file, index: item.dictIndex });
-                        itemCount++;
-                    }
-                    addRecordItems(failure.id, itemCount);
-                    if (itemCount === 0) skippedCount++;
-                } else if (failure.batchType === 'regex') {
-                    let itemCount = 0;
-                    for (const item of failure.items) {
-                        if (!item.file || item.dictIndex < 0) {
-                            failedRecordIds.add(failure.id);
-                            continue;
-                        }
-                        const id = nextRegexId++;
-                        regexItems.push({ id, source: item.source, target: item.target });
-                        regexMappings.set(id, { failureId: failure.id, file: item.file, index: item.dictIndex });
-                        itemCount++;
-                    }
-                    addRecordItems(failure.id, itemCount);
-                    if (itemCount === 0) skippedCount++;
-                } else {
-                    skippedCount++;
-                }
-            }
-
-            const retryTasks: Promise<void>[] = [];
-
-            if (astItems.length > 0) {
-                retryTasks.push(provider.astTranslate(astItems, async (batchResult) => {
-                    for (const result of batchResult) {
-                        const mapping = astMappings.get(result.id);
-                        if (!mapping) continue;
-                        const dictItem = translationJson.dict[mapping.file]?.ast[mapping.index];
-                        if (!dictItem) {
-                            failedRecordIds.add(mapping.failureId);
-                            continue;
-                        }
-                        dictItem.target = result.target;
-                        sourceDirty = true;
-                        markRecordItemSucceeded(mapping.failureId);
-                    }
-                    processedItems += batchResult.length;
-                    schedulePersistSource();
-                    updateBatchTask({ processedItems });
-                }, translateAbortControllerRef.current?.signal, async (batchItems) => {
-                    for (const item of batchItems) {
-                        const mapping = astMappings.get(item.id);
-                        if (mapping) failedRecordIds.add(mapping.failureId);
-                    }
-                }).then(() => undefined));
-            }
-
-            if (regexItems.length > 0) {
-                retryTasks.push(provider.regexTranslate(regexItems, async (batchResult) => {
-                    for (const result of batchResult) {
-                        const mapping = regexMappings.get(result.id);
-                        if (!mapping) continue;
-                        const dictItem = translationJson.dict[mapping.file]?.regex[mapping.index];
-                        if (!dictItem) {
-                            failedRecordIds.add(mapping.failureId);
-                            continue;
-                        }
-                        dictItem.target = result.target;
-                        sourceDirty = true;
-                        markRecordItemSucceeded(mapping.failureId);
-                    }
-                    processedItems += batchResult.length;
-                    schedulePersistSource();
-                    updateBatchTask({ processedItems });
-                }, translateAbortControllerRef.current?.signal, async (batchItems) => {
-                    for (const item of batchItems) {
-                        const mapping = regexMappings.get(item.id);
-                        if (mapping) failedRecordIds.add(mapping.failureId);
-                    }
-                }).then(() => undefined));
-            }
-
-            try {
-                await Promise.all(retryTasks);
-            } catch (error) {
-                if (isAbortError(error)) {
-                    stopRequestedRef.current = true;
-                } else {
-                    for (const id of attemptedRecordIds) failedRecordIds.add(id);
-                    console.error(`[i18n] Failed to retry plugin source ${firstFailure.sourceId}:`, error);
-                }
-            } finally {
-                persistSource();
-                const completedRecordIds = getCompletedRecordIds();
-                if (completedRecordIds.length > 0) {
-                    i18n.sourceManager.removeBatchTaskFailures(completedRecordIds);
-                    successCount += completedRecordIds.length;
-                }
-
-                const failedRecords = Array.from(attemptedRecordIds).filter(id => failedRecordIds.has(id));
-                if (!stopRequestedRef.current && !translateAbortControllerRef.current?.signal.aborted) {
-                    failedCount += failedRecords.length;
-                    markProcessedRecords(failures.length);
-                } else {
-                    markProcessedRecords(completedRecordIds.length);
-                }
-            }
-        };
-
         try {
-            await runConcurrentTasks(failureGroups, retryConcurrency, () => stopRequestedRef.current || !!translateAbortControllerRef.current?.signal.aborted, processFailureGroup);
-
-            handleRefresh();
-            if (stopRequestedRef.current || translateAbortControllerRef.current?.signal.aborted) {
+            const payload: CompanionPluginFailureRetryPayload = {
+                persistence: { basePath: i18n.sourceManager.getBasePath() },
+                failures: pluginFailureRecords,
+                config: getCompanionTranslationConfig(i18n.settings),
+                concurrency: getPositiveInt(i18n.settings.batchTranslateConcurrency, 2),
+            };
+            const progress = await runWorkerTask('plugin-failure-retry', payload);
+            if (progress.status === 'cancelled') {
                 new Notice(t('Common.Notices.TaskStopped'));
                 return;
             }
-
-            new Notice(t('Manager.Common.Notices.RetryFailuresComplete', { success: successCount, fail: failedCount, skip: skippedCount, defaultValue: `失败批次重试完成：成功 ${successCount}，失败 ${failedCount}，跳过 ${skippedCount}` }));
+            new Notice(t('Manager.Common.Notices.RetryFailuresComplete', { success: progress.successCount, fail: progress.failedCount, skip: progress.skippedCount, defaultValue: `失败批次重试完成：成功 ${progress.successCount}，失败 ${progress.failedCount}，跳过 ${progress.skippedCount}` }));
+        } catch (error) {
+            console.error('[i18n] Failed to retry plugin failures:', error);
+            new Notice(t('Common.Notices.TranslateFail', { message: String(error) }));
         } finally {
-            stopRequestedRef.current = false;
-            translateAbortControllerRef.current = null;
-            setBatchTask(prev => ({
-                ...prev,
-                isRunning: false,
-                currentLabel: '',
-                processedResources,
-                processedItems,
-                successCount,
-                failedCount,
-                skippedCount,
-            }));
+            taskIdRef.current = null;
+            setBatchTask(prev => ({ ...prev, isRunning: false, currentLabel: '' }));
         }
-    }, [batchTask.isRunning, buildPluginSourceUpdate, handleRefresh, i18n, isAbortError, pluginFailureRecords, t, updateBatchTask]);
+    }, [batchTask.isRunning, i18n, pluginFailureRecords, runWorkerTask, t]);
 
     const batchProgressValue = useMemo(() => {
         if (!batchTask.totalResources) return 0;
@@ -1304,6 +860,18 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                                 variant="outline"
                                 size="sm"
                                 className="h-9 rounded-none gap-1.5 text-[13px]"
+                                onClick={() => setShowFailureDetails(prev => !prev)}
+                            >
+                                <AlertTriangle className="w-4 h-4" />
+                                {showFailureDetails ? '隐藏失败原因' : '失败原因'}
+                                <span className="text-muted-foreground">{pluginFailureRecords.length}</span>
+                            </Button>
+                        )}
+                        {!batchTask.isRunning && pluginFailureRecords.length > 0 && (
+                            <Button
+                                variant="outline"
+                                size="sm"
+                                className="h-9 rounded-none gap-1.5 text-[13px]"
                                 onClick={handleRetryPluginFailures}
                             >
                                 <RotateCcw className="w-4 h-4" />
@@ -1357,6 +925,10 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                             {batchTask.skippedCount > 0 && <span>{t('Common.Status.Skipped', '跳过')}: {batchTask.skippedCount}</span>}
                         </div>
                     </div>
+                )}
+
+                {!batchTask.isRunning && showFailureDetails && (
+                    <BatchFailureDetails records={pluginFailureRecords} title="插件失败原因" />
                 )}
             </div>
 

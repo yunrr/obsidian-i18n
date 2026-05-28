@@ -15,19 +15,7 @@ const banner = ``;
  */
 const prod = (process.argv[2] === "production");
 
-/**
- * 创建 esbuild 的构建上下文。
- * context 允许我们配置构建参数，并开启监视模式 (watch) 或重建功能。
- */
-const context = await esbuild.context({
-    // 在生成的 JS 文件开头插入代码
-    banner: {
-        js: banner,
-    },
-
-    // 构建的入口文件，esbuild 会从这里开始递归分析所有的 import 依赖
-    entryPoints: ["main.ts"],
-
+const commonOptions = {
     // 是否将所有依赖合并到一个文件中。对于 Obsidian 插件来说，必须设为 true
     bundle: true,
 
@@ -84,17 +72,41 @@ const context = await esbuild.context({
 
     // 控制如何处理法律注释（如特殊的版权声明）。'none' 表示全部移除。
     legalComments: "none",
+};
+
+/**
+ * 创建 esbuild 的构建上下文。
+ * context 允许我们配置构建参数，并开启监视模式 (watch) 或重建功能。
+ */
+const mainContext = await esbuild.context({
+    // 在生成的 JS 文件开头插入代码
+    banner: {
+        js: banner,
+    },
+
+    // 构建的入口文件，esbuild 会从这里开始递归分析所有的 import 依赖
+    entryPoints: ["main.ts"],
+
+    ...commonOptions,
 
     // 最终生成的产物路径及文件名
     outfile: "main.js",
 });
 
+const workerContext = await esbuild.context({
+    entryPoints: ["src/manager/companion-worker.ts"],
+    ...commonOptions,
+    platform: "node",
+    outfile: "i18n-companion-worker.cjs",
+});
+
 if (prod) {
     // 生产模式：直接运行一次构建流程并退出
-    await context.rebuild();
+    await Promise.all([mainContext.rebuild(), workerContext.rebuild()]);
     if (fs.existsSync("main.js.map")) fs.unlinkSync("main.js.map");
+    if (fs.existsSync("i18n-companion-worker.cjs.map")) fs.unlinkSync("i18n-companion-worker.cjs.map");
     process.exit(0);
 } else {
     // 开发模式：开启监视模式，每当你修改并保存源码时，esbuild 会秒级自动重新构建
-    await context.watch();
+    await Promise.all([mainContext.watch(), workerContext.watch()]);
 }

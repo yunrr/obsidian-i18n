@@ -6,7 +6,7 @@ import { useTranslation } from 'react-i18next';
 import { Settings, FolderOpen, Pen, FileOutput, XCircle, Loader2, MoreHorizontal, CloudDownload, Cloud } from 'lucide-react';
 import I18N from 'src/main';
 import { PluginTranslationV1 } from 'src/types';
-import { i18nOpen, AstTranslator, RegexTranslator, isValidPluginTranslationV1Format, getPluginTranslationSources, hasChineseText, hasExtractedTranslationContent } from '../../../utils';
+import { i18nOpen, AstTranslator, RegexTranslator, isValidPluginTranslationV1Format, getPluginTranslationSources, hasBoundedChineseRuns, hasChineseText, hasExtractedTranslationContent } from '../../../utils';
 import { loadTranslationFile } from '../../../manager/io-manager';
 import { useGlobalStoreInstance } from '~/utils';
 import { EDITOR_VIEW_TYPE } from '../../../views';
@@ -156,7 +156,7 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
             const mainStr = mainBuffer.toString();
             const manifestJSON = await fs.readJson(manifestDoc);
 
-            if (hasChineseText(`${manifestJSON.name || plugin.name}\n${manifestJSON.description || ''}\n${mainStr}`)) {
+            if (hasChineseText(`${manifestJSON.name || plugin.name}\n${manifestJSON.description || ''}`) || hasBoundedChineseRuns(mainStr)) {
                 i18n.notice.result(false, '检测到插件已包含中文内容，已跳过提取');
                 return;
             }

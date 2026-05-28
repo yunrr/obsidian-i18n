@@ -127,6 +127,15 @@ export class SourceManager {
 
     // ========== 基础查询 ==========
 
+    public getBasePath(): string {
+        return this.basePath;
+    }
+
+    public reloadFromDisk(): void {
+        this.meta = this.loadMeta();
+        useGlobalStoreInstance.getState().triggerSourceUpdate();
+    }
+
     /**
      * 根据ID获取翻译源
      */

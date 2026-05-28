@@ -1,6 +1,6 @@
 import fs from 'fs';
-import { PluginTranslationV1Regex } from '~/types';
-import { I18nSettings } from 'src/settings/data';
+import type { PluginTranslationV1Regex } from '~/types';
+import type { I18nSettings } from 'src/settings/data';
 
 import { REGEX_DEFAULT_CONFIG } from './config';
 

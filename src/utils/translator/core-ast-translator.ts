@@ -3,8 +3,8 @@ import { parse, parseExpression } from "@babel/parser";
 import traverse from '@babel/traverse';
 import { generate } from "@babel/generator";
 import * as t from '@babel/types';
-import { PluginTranslationV1Ast } from '~/types';
-import { I18nSettings } from '../../settings/data';
+import type { PluginTranslationV1Ast } from '~/types';
+import type { I18nSettings } from '../../settings/data';
 
 // ====================================================================================================
 //                                      Configuration (白名单配置)
