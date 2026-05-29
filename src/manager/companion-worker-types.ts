@@ -1,4 +1,24 @@
-import type { BatchTaskFailureRecord, BatchTaskMode, BatchTaskScope, PluginTranslationV1, ThemeTranslationV1 } from '../types';
+import type { PluginManifest } from 'obsidian';
+import type { BatchTaskFailureRecord, BatchTaskMode, BatchTaskScope, OBThemeManifest, PluginTranslationV1, ThemeTranslationV1 } from '../types';
+
+export interface CompanionDiscoveredPlugin {
+    manifest: PluginManifest;
+    dir: string;
+    mainDoc: string;
+    manifestDoc: string;
+}
+
+export interface CompanionDiscoveredTheme {
+    name: string;
+    manifest: OBThemeManifest | null;
+    dir: string;
+    themeCssPath: string;
+}
+
+export interface CompanionResourceDiscoveryResponse {
+    plugins?: CompanionDiscoveredPlugin[];
+    themes?: CompanionDiscoveredTheme[];
+}
 
 export interface CompanionProxyRequest {
     url: string;
@@ -15,6 +35,101 @@ export interface CompanionProxyResponse {
     body: string;
 }
 
+export interface CompanionGithubReadRequest {
+    operation: string;
+    token?: string;
+    githubProxyUrl?: string;
+    owner?: string;
+    repo?: string;
+    path?: string;
+    branch?: string;
+    ref?: string;
+    username?: string;
+    repoName?: string;
+    url?: string;
+    targetOwner?: string;
+    targetRepo?: string;
+    repoAddress?: string;
+    creator?: string;
+    page?: number;
+    perPage?: number;
+    recursive?: boolean;
+    timeoutMs?: number;
+}
+
+export interface CompanionGithubReadResponse {
+    state: boolean;
+    data: any;
+    status?: number;
+    scopes?: string[];
+    isRateLimit?: boolean;
+    hasOpenIssue?: boolean;
+}
+
+export interface CompanionGithubWriteRequest {
+    operation: string;
+    token?: string;
+    owner?: string;
+    repo?: string;
+    name?: string;
+    path?: string;
+    content?: string;
+    message?: string;
+    branch?: string;
+    sha?: string;
+    title?: string;
+    body?: string;
+    label?: string;
+    targetOwner?: string;
+    targetRepo?: string;
+    baseTree?: string;
+    treeData?: any[];
+    tree?: string;
+    parents?: string[];
+    ref?: string;
+    files?: { path: string; content: string }[];
+    timeoutMs?: number;
+}
+
+export interface CompanionGithubWriteResponse {
+    state: boolean;
+    data: any;
+    status?: number;
+}
+
+export interface CompanionAutoMatchRequest {
+    matches: { repoAddress: string; entry: any }[];
+    stats: any;
+    targetVersion: string;
+    targetLanguage: string;
+    isTheme: boolean;
+    strategy: 'comprehensive' | 'version_first' | 'popularity' | 'latest_update';
+}
+
+export interface CompanionAutoMatchResponse {
+    match: { repoAddress: string; entry: any } | null;
+    scoreInfo: {
+        version: number;
+        popularity: number;
+        freshness: number;
+        total: number;
+    };
+}
+
+export type CompanionCloudTaskType = 'cloud-publish-source' | 'cloud-download-source' | 'cloud-update-sources' | 'cloud-prepare-backup' | 'cloud-restore-all' | 'cloud-backup-all';
+
+export interface CompanionCloudResponse {
+    state: boolean;
+    data?: any;
+    manifest?: any[];
+    source?: any;
+    sources?: any[];
+    restored?: number;
+    skipped?: number;
+    total?: number;
+    error?: string;
+}
+
 export interface CompanionExtractionSettings {
     author: string;
     reFlags: string;
@@ -22,9 +137,11 @@ export interface CompanionExtractionSettings {
     reDatas: string[];
     reRejectRe: string[];
     reValidRe: string[];
+    chineseSkipMode: 'none' | 'source' | 'extracted';
     astAssignments: string[];
     astFunctions: string[];
     astKeys: string[];
+    astMaxLength: number;
     astRejectRe: string[];
     astValidRe: string[];
 }
@@ -38,6 +155,8 @@ export interface CompanionPluginExtractRequest {
     manifestDoc: string;
     language: string;
 }
+
+export type CompanionPluginBatchExtractResource = Omit<CompanionPluginExtractRequest, 'language'>;
 
 export interface CompanionThemeExtractRequest {
     resourceId: string;
@@ -215,18 +334,23 @@ export interface CompanionTaskCancelResponse {
 
 export interface CompanionPluginBatchExtractPayload {
     persistence: CompanionWorkerPersistenceConfig;
-    resources: CompanionPluginExtractPayload[];
+    resources: CompanionPluginBatchExtractResource[];
+    language: string;
+    settings: CompanionExtractionSettings;
     concurrency: number;
     checkpointKey: string;
     completedResources?: number;
+    totalResources?: number;
 }
 
 export interface CompanionThemeBatchExtractPayload {
     persistence: CompanionWorkerPersistenceConfig;
-    resources: CompanionThemeExtractPayload[];
+    resources: CompanionThemeExtractRequest[];
+    settings: CompanionExtractionSettings;
     concurrency: number;
     checkpointKey: string;
     completedResources?: number;
+    totalResources?: number;
 }
 
 export interface CompanionPluginBatchTranslatePayload {
@@ -236,6 +360,7 @@ export interface CompanionPluginBatchTranslatePayload {
     checkpointKey: string;
     concurrency: number;
     completedResources?: number;
+    totalResources?: number;
     processedItems?: number;
     totalItems?: number;
 }
@@ -247,6 +372,7 @@ export interface CompanionThemeBatchTranslatePayload {
     checkpointKey: string;
     concurrency: number;
     completedResources?: number;
+    totalResources?: number;
     processedItems?: number;
     totalItems?: number;
 }
@@ -265,6 +391,6 @@ export interface CompanionThemeFailureRetryPayload {
     concurrency: number;
 }
 
-export type CompanionAsyncTaskType = 'plugin-batch-extract' | 'theme-batch-extract' | 'plugin-batch-translate' | 'theme-batch-translate' | 'plugin-failure-retry' | 'theme-failure-retry';
+export type CompanionAsyncTaskType = 'plugin-batch-extract' | 'theme-batch-extract' | 'plugin-batch-translate' | 'theme-batch-translate' | 'plugin-failure-retry' | 'theme-failure-retry' | 'cloud-backup-all';
 
-export type CompanionBatchTaskType = 'plugin-extract' | 'theme-extract' | 'plugin-translate' | 'theme-translate' | 'plugin-retry' | 'theme-retry';
+export type CompanionBatchTaskType = 'plugin-extract' | 'theme-extract' | 'plugin-translate' | 'theme-translate' | 'plugin-retry' | 'theme-retry' | CompanionCloudTaskType;

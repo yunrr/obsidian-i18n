@@ -13,6 +13,7 @@ import I18N from "main";
 import { I18nSettings } from "src/settings/data";
 import { RequestUrlParam, requestUrl, RequestUrlResponse, Notice } from "obsidian";
 import { t } from "src/locales";
+import type { CompanionGithubReadRequest, CompanionGithubReadResponse, CompanionGithubWriteRequest, CompanionGithubWriteResponse } from "src/manager/companion-worker-types";
 
 /**
  * 包装并扩展 requestUrl 功能：加入了本地的 Promise.race 强硬超时设计。
@@ -109,6 +110,35 @@ export class GitHubAPI {
         return { state: false, data: error, isRateLimit };
     }
 
+    private async readViaWorker(request: CompanionGithubReadRequest): Promise<CompanionGithubReadResponse | null> {
+        if (!this.settings.llmCompanionWorkerEnabled) return null;
+        try {
+            return await this.i18n.companionWorkerManager.githubRead({
+                token: this.token,
+                githubProxyUrl: this.settings.githubProxyUrl,
+                timeoutMs: 10000,
+                ...request,
+            });
+        } catch (error) {
+            console.warn('[I18N Companion] GitHub read fallback:', error);
+            return null;
+        }
+    }
+
+    private async writeViaWorker(request: CompanionGithubWriteRequest): Promise<CompanionGithubWriteResponse | null> {
+        if (!this.settings.llmCompanionWorkerEnabled) return null;
+        try {
+            return await this.i18n.companionWorkerManager.githubWrite({
+                token: this.token,
+                timeoutMs: 10000,
+                ...request,
+            });
+        } catch (error) {
+            console.warn('[I18N Companion] GitHub write fallback:', error);
+            return null;
+        }
+    }
+
     // ========== 用户信息 ==========
 
     /** 获取当前 Token 对应的 GitHub 用户信息 */
@@ -116,6 +146,13 @@ export class GitHubAPI {
         { state: true; data: any; scopes: string[] } |
         { state: false; data: any; isRateLimit?: boolean }
     > {
+        const workerRes = await this.readViaWorker({ operation: 'getUser' });
+        if (workerRes) {
+            return workerRes.state
+                ? { state: true, data: workerRes.data, scopes: workerRes.scopes || [] }
+                : { state: false, data: workerRes.data, isRateLimit: workerRes.isRateLimit };
+        }
+
         try {
             const params: RequestUrlParam = {
                 url: `https://api.github.com/user`,
@@ -143,6 +180,9 @@ export class GitHubAPI {
      * 检查用户名下是否存在指定仓库
      */
     public async checkRepoExists(username: string, repoName: string): Promise<{ state: boolean; data: any }> {
+        const workerRes = await this.readViaWorker({ operation: 'checkRepoExists', username, repoName });
+        if (workerRes) return { state: workerRes.state, data: workerRes.data };
+
         try {
             const params: RequestUrlParam = {
                 url: `https://api.github.com/repos/${username}/${repoName}`,
@@ -161,6 +201,9 @@ export class GitHubAPI {
      * 获取仓库详细信息 (如 stargazers_count 等)
      */
     public async getRepoInfo(owner: string, repo: string): Promise<{ state: boolean; data: any }> {
+        const workerRes = await this.readViaWorker({ operation: 'getRepoInfo', owner, repo });
+        if (workerRes) return { state: workerRes.state, data: workerRes.data };
+
         try {
             const params: RequestUrlParam = {
                 url: `https://api.github.com/repos/${owner}/${repo}`,
@@ -178,6 +221,9 @@ export class GitHubAPI {
      * 获取最新 Release 信息
      */
     public async getLatestRelease(owner: string, repo: string): Promise<{ state: boolean; data: any }> {
+        const workerRes = await this.readViaWorker({ operation: 'getLatestRelease', owner, repo });
+        if (workerRes) return { state: workerRes.state, data: workerRes.data };
+
         try {
             const params: RequestUrlParam = {
                 url: `https://api.github.com/repos/${owner}/${repo}/releases/latest`,
@@ -196,6 +242,9 @@ export class GitHubAPI {
      * @param name 仓库名称
      */
     public async createRepo(name: string): Promise<{ state: boolean; data: any }> {
+        const workerRes = await this.writeViaWorker({ operation: 'createRepo', name });
+        if (workerRes) return { state: workerRes.state, data: workerRes.data };
+
         try {
             const params: RequestUrlParam = {
                 url: `https://api.github.com/user/repos`,
@@ -224,6 +273,9 @@ export class GitHubAPI {
      * @param repo 仓库名
      */
     public async initRepoStructure(owner: string, repo: string): Promise<{ state: boolean; data: any }> {
+        const workerRes = await this.writeViaWorker({ operation: 'initRepoStructure', owner, repo });
+        if (workerRes) return { state: workerRes.state, data: workerRes.data };
+
         try {
             // 检查 metadata.json 是否已存在
             const existing = await this.getFileContent(owner, repo, 'metadata.json');
@@ -253,6 +305,9 @@ export class GitHubAPI {
      * @param ref 分支/标签 (可选)
      */
     public async getFileContent(owner: string, repo: string, path: string, ref?: string): Promise<{ state: boolean; data: any; status?: number }> {
+        const workerRes = await this.readViaWorker({ operation: 'getFileContent', owner, repo, path, ref });
+        if (workerRes) return { state: workerRes.state, data: workerRes.data, status: workerRes.status };
+
         try {
             let url = `https://api.github.com/repos/${owner}/${repo}/contents/${path}`;
             const separator = url.includes('?') ? '&' : '?';
@@ -286,6 +341,9 @@ export class GitHubAPI {
     public async getFileContentWithFallback(
         owner: string, repo: string, path: string, branch: string = 'main'
     ): Promise<{ state: boolean; data: any; status?: number; isRateLimit?: boolean }> {
+        const workerRes = await this.readViaWorker({ operation: 'getFileContentWithFallback', owner, repo, path, branch });
+        if (workerRes) return { state: workerRes.state, data: workerRes.data, status: workerRes.status, isRateLimit: workerRes.isRateLimit };
+
         // 策略 1: 先尝试普通 Contents API（带 Auth）
         try {
             const res = await this.getFileContent(owner, repo, path, branch);
@@ -354,6 +412,9 @@ export class GitHubAPI {
         branch: string = 'main',
         shaFromExternal?: string
     ): Promise<{ state: boolean; data: any }> {
+        const workerRes = await this.writeViaWorker({ operation: 'uploadFile', owner, repo, path, content, message, branch, sha: shaFromExternal });
+        if (workerRes) return { state: workerRes.state, data: workerRes.data };
+
         try {
             if (!this.token) {
                 return { state: false, data: t('Settings.Basis.GithubApiTokenMissing') };
@@ -427,6 +488,9 @@ export class GitHubAPI {
         message: string,
         branch: string = 'main'
     ): Promise<{ state: boolean; data: any }> {
+        const workerRes = await this.writeViaWorker({ operation: 'deleteFile', owner, repo, path, message, branch });
+        if (workerRes) return { state: workerRes.state, data: workerRes.data };
+
         try {
             if (!this.token) {
                 return { state: false, data: t('Settings.Basis.GithubApiTokenMissing') };
@@ -517,6 +581,9 @@ export class GitHubAPI {
      * 获取 raw 文件内容（无需认证，用于快速读取公开仓库文件）
      */
     public async getRawContent(owner: string, repo: string, path: string, branch: string = 'main'): Promise<{ state: boolean; data: any }> {
+        const workerRes = await this.readViaWorker({ operation: 'getRawContent', owner, repo, path, branch });
+        if (workerRes) return { state: workerRes.state, data: workerRes.data };
+
         try {
             // 注意：raw.githubusercontent.com 有 5 分钟 CDN 缓存
             // 我们通过添加随机参数尝试强制刷新，但在某些情况下仍可能受限
@@ -536,6 +603,9 @@ export class GitHubAPI {
      * 下载二进制或文本资产
      */
     public async downloadAsset(url: string): Promise<{ state: boolean; data: any }> {
+        const workerRes = await this.readViaWorker({ operation: 'downloadAsset', url });
+        if (workerRes) return { state: workerRes.state, data: workerRes.data };
+
         try {
             const params: RequestUrlParam = {
                 url: url,
@@ -551,6 +621,9 @@ export class GitHubAPI {
 
     /** 检查是否已有同仓库正在申请收录的 Issue */
     public async checkHasOpenRegistrationIssue(targetOwner: string, targetRepo: string, repoAddress: string, creator: string): Promise<{ state: boolean; data: any; hasOpenIssue: boolean }> {
+        const workerRes = await this.readViaWorker({ operation: 'checkHasOpenRegistrationIssue', targetOwner, targetRepo, repoAddress, creator });
+        if (workerRes) return { state: workerRes.state, data: workerRes.data, hasOpenIssue: !!workerRes.hasOpenIssue };
+
         try {
             if (!this.token) {
                 return { state: false, data: '请先在设置中配置 GitHub Token', hasOpenIssue: false };
@@ -573,6 +646,9 @@ export class GitHubAPI {
 
     /** 创建 GitHub Issue（支持指定目标仓库） */
     public async postIssue(title: string, body: string, label?: string, targetOwner?: string, targetRepo?: string) {
+        const workerRes = await this.writeViaWorker({ operation: 'postIssue', title, body, label, targetOwner, targetRepo });
+        if (workerRes) return { state: workerRes.state, data: workerRes.data };
+
         try {
             if (!this.token) {
                 return { state: false, data: t('Settings.Basis.GithubApiTokenMissing') };
@@ -617,6 +693,9 @@ export class GitHubAPI {
         page: number = 1,
         perPage: number = 20
     ): Promise<{ state: boolean; data: any }> {
+        const workerRes = await this.readViaWorker({ operation: 'getFileCommits', owner, repo, path, page, perPage });
+        if (workerRes) return { state: workerRes.state, data: workerRes.data };
+
         try {
             const params: RequestUrlParam = {
                 url: `https://api.github.com/repos/${owner}/${repo}/commits?path=${encodeURIComponent(path)}&page=${page}&per_page=${perPage}&t=${Date.now()}`,
@@ -644,6 +723,9 @@ export class GitHubAPI {
         path: string,
         ref: string
     ): Promise<{ state: boolean; data: any }> {
+        const workerRes = await this.readViaWorker({ operation: 'getFileAtCommit', owner, repo, path, ref });
+        if (workerRes) return { state: workerRes.state, data: workerRes.data };
+
         try {
             const params: RequestUrlParam = {
                 url: `https://api.github.com/repos/${owner}/${repo}/contents/${path}?ref=${ref}&t=${Date.now()}`,
@@ -671,6 +753,9 @@ export class GitHubAPI {
         treeSha: string = 'main',
         recursive: boolean = true
     ): Promise<{ state: boolean; data: any }> {
+        const workerRes = await this.readViaWorker({ operation: 'getRepoTree', owner, repo, ref: treeSha, recursive });
+        if (workerRes) return { state: workerRes.state, data: workerRes.data };
+
         try {
             const params: RequestUrlParam = {
                 url: `https://api.github.com/repos/${owner}/${repo}/git/trees/${treeSha}${recursive ? '?recursive=1' : ''}&t=${Date.now()}`,
@@ -689,6 +774,9 @@ export class GitHubAPI {
      * 获取引用 (Ref) 的详细信息，主要是为了拿到最新的 Commit SHA
      */
     public async getRef(owner: string, repo: string, ref: string = 'heads/main'): Promise<{ state: boolean; data: any }> {
+        const workerRes = await this.readViaWorker({ operation: 'getRef', owner, repo, ref });
+        if (workerRes) return { state: workerRes.state, data: workerRes.data };
+
         try {
             const params: RequestUrlParam = {
                 url: `https://api.github.com/repos/${owner}/${repo}/git/refs/${ref}?t=${Date.now()}`,
@@ -707,6 +795,9 @@ export class GitHubAPI {
      * @param treeData 
      */
     public async createTree(owner: string, repo: string, baseTree: string, treeData: any[]): Promise<{ state: boolean; data: any }> {
+        const workerRes = await this.writeViaWorker({ operation: 'createTree', owner, repo, baseTree, treeData });
+        if (workerRes) return { state: workerRes.state, data: workerRes.data };
+
         try {
             const params: RequestUrlParam = {
                 url: `https://api.github.com/repos/${owner}/${repo}/git/trees`,
@@ -731,6 +822,9 @@ export class GitHubAPI {
      * 创建一个新的 Commit 对象
      */
     public async createCommit(owner: string, repo: string, message: string, tree: string, parents: string[]): Promise<{ state: boolean; data: any }> {
+        const workerRes = await this.writeViaWorker({ operation: 'createCommit', owner, repo, message, tree, parents });
+        if (workerRes) return { state: workerRes.state, data: workerRes.data };
+
         try {
             const params: RequestUrlParam = {
                 url: `https://api.github.com/repos/${owner}/${repo}/git/commits`,
@@ -756,6 +850,9 @@ export class GitHubAPI {
      * 更新引用指向新的 Commit
      */
     public async updateRef(owner: string, repo: string, ref: string, sha: string): Promise<{ state: boolean; data: any }> {
+        const workerRes = await this.writeViaWorker({ operation: 'updateRef', owner, repo, ref, sha });
+        if (workerRes) return { state: workerRes.state, data: workerRes.data };
+
         try {
             const params: RequestUrlParam = {
                 url: `https://api.github.com/repos/${owner}/${repo}/git/refs/${ref}`,
@@ -787,6 +884,9 @@ export class GitHubAPI {
         message: string,
         branch: string = 'main'
     ): Promise<{ state: boolean; data: any }> {
+        const workerRes = await this.writeViaWorker({ operation: 'batchUploadFiles', owner, repo, files, message, branch });
+        if (workerRes) return { state: workerRes.state, data: workerRes.data };
+
         try {
             if (!this.token) return { state: false, data: t('Settings.Basis.GithubApiTokenMissing') };
             if (files.length === 0) return { state: true, data: 'no files to upload' };

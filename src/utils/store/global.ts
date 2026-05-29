@@ -13,11 +13,13 @@ interface GlobalStore {
     editorThemeDir: string;
     editorThemeTranslationPath: string;
     sourceUpdateTick: number;
+    settingsUpdateTick: number;
     setI18n: (i18n: I18n) => void;
     setEditorPluginTranslation: (translation: PluginTranslationV1) => void;
     setEditorPluginTranslationPath: (path: string) => void;
     setEditorTheme: (translation: ThemeTranslationV1, name: string, dir: string, translationPath: string) => void;
     triggerSourceUpdate: () => void;
+    triggerSettingsUpdate: () => void;
 }
 
 const useGlobalStoreBase = create<GlobalStore>()((set, get) => {
@@ -31,6 +33,7 @@ const useGlobalStoreBase = create<GlobalStore>()((set, get) => {
         editorThemeDir: '',
         editorThemeTranslationPath: '',
         sourceUpdateTick: 0,
+        settingsUpdateTick: 0,
 
         setI18n: (i18n) => set({ i18n }),
         setEditorPluginTranslation: (translation) => set({ editorPluginTranslation: translation }),
@@ -42,6 +45,7 @@ const useGlobalStoreBase = create<GlobalStore>()((set, get) => {
             editorThemeTranslationPath: translationPath,
         }),
         triggerSourceUpdate: () => set((state) => ({ sourceUpdateTick: state.sourceUpdateTick + 1 })),
+        triggerSettingsUpdate: () => set((state) => ({ settingsUpdateTick: state.settingsUpdateTick + 1 })),
     }
 })
 

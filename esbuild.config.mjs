@@ -93,20 +93,12 @@ const mainContext = await esbuild.context({
     outfile: "main.js",
 });
 
-const workerContext = await esbuild.context({
-    entryPoints: ["src/manager/companion-worker.ts"],
-    ...commonOptions,
-    platform: "node",
-    outfile: "i18n-companion-worker.cjs",
-});
-
 if (prod) {
     // 生产模式：直接运行一次构建流程并退出
-    await Promise.all([mainContext.rebuild(), workerContext.rebuild()]);
+    await mainContext.rebuild();
     if (fs.existsSync("main.js.map")) fs.unlinkSync("main.js.map");
-    if (fs.existsSync("i18n-companion-worker.cjs.map")) fs.unlinkSync("i18n-companion-worker.cjs.map");
     process.exit(0);
 } else {
     // 开发模式：开启监视模式，每当你修改并保存源码时，esbuild 会秒级自动重新构建
-    await Promise.all([mainContext.watch(), workerContext.watch()]);
+    await mainContext.watch();
 }

@@ -25,7 +25,6 @@ import type {
     CompanionExtractionSettings,
     CompanionPluginBatchExtractPayload,
     CompanionPluginBatchTranslatePayload,
-    CompanionPluginExtractPayload,
     CompanionPluginFailureRetryPayload,
     CompanionTaskProgress,
     CompanionTranslationConfig,
@@ -137,9 +136,11 @@ const getCompanionExtractionSettings = (settings: I18N['settings']): CompanionEx
     reDatas: settings.reDatas,
     reRejectRe: settings.reRejectRe,
     reValidRe: settings.reValidRe,
+    chineseSkipMode: settings.chineseSkipMode || 'source',
     astAssignments: settings.astAssignments,
     astFunctions: settings.astFunctions,
     astKeys: settings.astKeys,
+    astMaxLength: settings.astMaxLength ?? 300,
     astRejectRe: settings.astRejectRe,
     astValidRe: settings.astValidRe,
 });
@@ -244,13 +245,29 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
     ], [t]);
 
     useEffect(() => {
-        // @ts-ignore
-        const allPlugins = Object.values(app.plugins.manifests) as PluginManifest[];
-        const filteredPlugins = allPlugins.filter(item => item.id !== i18n.manifest.id);
-        setPlugins(filteredPlugins);
-        // @ts-ignore
-        setEnabledPlugins(new Set(app.plugins.enabledPlugins));
-    }, [app, refreshKey, i18n.manifest.id]);
+        let disposed = false;
+        const loadPlugins = async () => {
+            try {
+                const discovered = await i18n.companionWorkerManager.discoverPlugins();
+                if (disposed) return;
+                setPlugins(discovered.map(item => item.manifest));
+            } catch (error) {
+                console.warn('[i18n] Failed to load plugins from worker, falling back to Obsidian manifests:', error);
+                if (disposed) return;
+                // @ts-ignore
+                const allPlugins = Object.values(app.plugins.manifests) as PluginManifest[];
+                const filteredPlugins = allPlugins.filter(item => item.id !== i18n.manifest.id);
+                setPlugins(filteredPlugins);
+            }
+            if (!disposed) {
+                // @ts-ignore
+                setEnabledPlugins(new Set(app.plugins.enabledPlugins));
+            }
+        };
+
+        loadPlugins();
+        return () => { disposed = true; };
+    }, [app, refreshKey, i18n]);
 
     const sourceIndex = useMemo(() => {
         const byPlugin: Record<string, any[]> = {};
@@ -571,7 +588,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
 
         let progress = started.progress;
         while (progress.status === 'queued' || progress.status === 'running') {
-            await new Promise(resolve => window.setTimeout(resolve, 300));
+            await new Promise(resolve => window.setTimeout(resolve, 150));
             const status = await i18n.companionWorkerManager.getTaskStatus(started.taskId);
             progress = status.progress;
             syncWorkerProgress(progress);
@@ -593,14 +610,41 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             }))
             : extractablePlugins.map(plugin => ({ resourceId: plugin.id, label: plugin.name }));
 
+        const completedResources = resume ? pluginExtractCheckpoint?.completedResources || 0 : 0;
+        const totalResources = resume ? pluginExtractCheckpoint?.totalResources || resources.length : resources.length;
+
         if (batchTask.isRunning || resources.length === 0) return;
+
+        const pluginMap = new Map(plugins.map(plugin => [plugin.id, plugin]));
+        const workerResources = resources.flatMap(resource => {
+            const plugin = pluginMap.get(resource.resourceId);
+            const data = allPluginStates[resource.resourceId];
+            if (!plugin || !data) return [];
+            return [{
+                resourceId: resource.resourceId,
+                label: resource.label,
+                pluginName: plugin.name,
+                pluginVersion: plugin.version,
+                mainDoc: data.mainDoc,
+                manifestDoc: data.manifestDoc,
+            }];
+        });
+
+        if (workerResources.length === 0) {
+            new Notice(t('Manager.Plugins.Errors.MainNotFound'));
+            return;
+        }
+
+        const skippedResumeResources = Math.max(0, resources.length - workerResources.length);
+        const displayedCompletedResources = resume ? completedResources + skippedResumeResources : completedResources;
+        const displayedTotalResources = resume ? totalResources : workerResources.length;
 
         setBatchTask({
             mode: 'extract',
             isRunning: true,
             currentLabel: '',
-            processedResources: 0,
-            totalResources: resources.length,
+            processedResources: displayedCompletedResources,
+            totalResources: displayedTotalResources,
             processedItems: 0,
             totalItems: 0,
             successCount: 0,
@@ -609,27 +653,15 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         });
 
         try {
-            const workerResources: CompanionPluginExtractPayload[] = resources.map(resource => {
-                const plugin = plugins.find(item => item.id === resource.resourceId);
-                const data = allPluginStates[resource.resourceId];
-                if (!plugin || !data) throw new Error(t('Manager.Plugins.Errors.MainNotFound'));
-                return {
-                    resourceId: resource.resourceId,
-                    label: resource.label,
-                    pluginName: plugin.name,
-                    pluginVersion: plugin.version,
-                    mainDoc: data.mainDoc,
-                    manifestDoc: data.manifestDoc,
-                    language: settings.language,
-                    settings: getCompanionExtractionSettings(i18n.settings),
-                };
-            });
             const payload: CompanionPluginBatchExtractPayload = {
                 persistence: { basePath: i18n.sourceManager.getBasePath() },
                 resources: workerResources,
+                language: settings.language,
+                settings: getCompanionExtractionSettings(i18n.settings),
                 concurrency: getPositiveInt(i18n.settings.batchExtractConcurrency, 3),
                 checkpointKey: PLUGIN_EXTRACT_CHECKPOINT_KEY,
-                completedResources: pluginExtractCheckpoint?.completedResources || 0,
+                completedResources: displayedCompletedResources,
+                totalResources: displayedTotalResources,
             };
             const progress = await runWorkerTask('plugin-batch-extract', payload);
             if (progress.status === 'cancelled') {
@@ -664,7 +696,12 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
 
         if (batchTask.isRunning || resources.length === 0) return;
 
-        const totalItems = resources.reduce((sum, resource) => {
+        const completedResources = resume ? pluginTranslateCheckpoint?.completedResources || 0 : 0;
+        const totalResources = resume ? pluginTranslateCheckpoint?.totalResources || resources.length : resources.length;
+        const processedItems = resume ? pluginTranslateCheckpoint?.processedItems || 0 : 0;
+        const totalItems = resume ? pluginTranslateCheckpoint?.totalItems || resources.reduce((sum, resource) => {
+            return sum + (allPluginStates[resource.resourceId]?.pendingTranslationCount || 0);
+        }, 0) : resources.reduce((sum, resource) => {
             return sum + (allPluginStates[resource.resourceId]?.pendingTranslationCount || 0);
         }, 0);
 
@@ -672,9 +709,9 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             mode: 'translate',
             isRunning: true,
             currentLabel: '',
-            processedResources: 0,
-            totalResources: resources.length,
-            processedItems: 0,
+            processedResources: completedResources,
+            totalResources,
+            processedItems,
             totalItems,
             successCount: 0,
             failedCount: 0,
@@ -688,8 +725,9 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                 config: getCompanionTranslationConfig(i18n.settings),
                 checkpointKey: PLUGIN_TRANSLATE_CHECKPOINT_KEY,
                 concurrency: getPositiveInt(i18n.settings.batchTranslateConcurrency, 2),
-                completedResources: pluginTranslateCheckpoint?.completedResources || 0,
-                processedItems: pluginTranslateCheckpoint?.processedItems || 0,
+                completedResources,
+                totalResources,
+                processedItems,
                 totalItems,
             };
             const progress = await runWorkerTask('plugin-batch-translate', payload);
@@ -713,10 +751,12 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
     const handleStopBatchTask = useCallback(() => {
         const taskId = taskIdRef.current;
         if (taskId) {
-            i18n.companionWorkerManager.cancelTask(taskId).catch(error => console.warn('[i18n] Failed to cancel companion task:', error));
+            i18n.companionWorkerManager.cancelTask(taskId)
+                .then(({ progress }) => syncWorkerProgress(progress))
+                .catch(error => console.warn('[i18n] Failed to cancel companion task:', error));
         }
         setBatchTask(prev => ({ ...prev, currentLabel: t('Manager.Common.Status.Stopping', '正在停止') }));
-    }, [i18n, t]);
+    }, [i18n, syncWorkerProgress, t]);
 
     const handleRetryPluginFailures = useCallback(async () => {
         if (batchTask.isRunning || pluginFailureRecords.length === 0) return;

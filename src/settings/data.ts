@@ -202,6 +202,7 @@ export interface I18nSettings {
     reDatas: string[];        // 核心源码中用于捕获文本的正式正则表达式列表
     reRejectRe: string[];    // 正则提取排除正则
     reValidRe: string[];     // 正则提取有效正则
+    chineseSkipMode: 'none' | 'source' | 'extracted'; // 中文资源跳过策略
 
     // ==============================
     // AST 提取规则
@@ -209,6 +210,7 @@ export interface I18nSettings {
     astAssignments: string[]; // 赋值白名单
     astFunctions: string[];   // 函数白名单
     astKeys: string[];        // 键名白名单
+    astMaxLength: number;     // AST 提取文本最大长度限制，0 为不限制
     astRejectRe: string[];   // 排除正则 (字符串形式)
     astValidRe: string[];    // 有效正则 (字符串形式)
 
@@ -560,6 +562,7 @@ export const DEFAULT_SETTINGS: I18nSettings = {
     reDatas: REGEX_DEFAULT_CONFIG.patterns,
     reRejectRe: REGEX_DEFAULT_CONFIG.rejectPatterns,
     reValidRe: REGEX_DEFAULT_CONFIG.validPatterns,
+    chineseSkipMode: 'source',
 
     // ==============================
     // AST 提取规则
@@ -567,6 +570,7 @@ export const DEFAULT_SETTINGS: I18nSettings = {
     astAssignments: AST_DEFAULT_CONFIG.assignments,
     astFunctions: AST_DEFAULT_CONFIG.functions,
     astKeys: AST_DEFAULT_CONFIG.keys,
+    astMaxLength: 300,
     astRejectRe: REGEX_DEFAULT_CONFIG.rejectPatterns, // Regex defaults are used as strings for UI
     astValidRe: REGEX_DEFAULT_CONFIG.validPatterns,
 

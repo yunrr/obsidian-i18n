@@ -12,9 +12,12 @@ export const useAstTranslation = () => {
     const astItems = useRegexStore.use.astItems();
     const updateAstItems = useRegexStore.use.updateAstItems();
     const i18n = useGlobalStore.use.i18n();
+    const settingsUpdateTick = useGlobalStore.use.settingsUpdateTick();
+
+    const getLanguageSetting = () => SUPPORTED_LANGUAGES.find(language => language.value === i18n.settings.llmLanguage)?.label || i18n.settings.llmLanguage || '简体中文';
 
     // Local State
-    const [language, setLanguage] = useState(i18n.settings.language || i18n.settings.llmLanguage || 'zh-cn');
+    const [language, setLanguage] = useState(getLanguageSetting());
     const [style, setStyle] = useState(i18n.settings.llmStyle);
     const [batchSize, setBatchSize] = useState(i18n.settings.llmBatchSize?.toString() || '20');
     const [concurrencyLimit, setConcurrencyLimit] = useState(i18n.settings.llmConcurrencyLimit?.toString() || '3');
@@ -48,12 +51,12 @@ export const useAstTranslation = () => {
 
     // Sync from Global Settings
     useEffect(() => {
-        setLanguage(i18n.settings.language || i18n.settings.llmLanguage || 'zh-cn');
+        setLanguage(getLanguageSetting());
         setStyle(i18n.settings.llmStyle);
-        setBatchSize(i18n.settings.llmBatchSize?.toString() || '20');
+        setBatchSize(i18n.settings.llmBatchSize?.toString() || '10');
         setConcurrencyLimit(i18n.settings.llmConcurrencyLimit?.toString() || '3');
         setTimeoutVal(i18n.settings.llmTimeout?.toString() || '60000');
-    }, [i18n.settings.language, i18n.settings.llmLanguage, i18n.settings.llmStyle, i18n.settings.llmBatchSize, i18n.settings.llmConcurrencyLimit, i18n.settings.llmTimeout]);
+    }, [settingsUpdateTick, i18n.settings.llmLanguage, i18n.settings.llmStyle, i18n.settings.llmBatchSize, i18n.settings.llmConcurrencyLimit, i18n.settings.llmTimeout]);
 
 
     // Handlers
@@ -64,7 +67,7 @@ export const useAstTranslation = () => {
 
     const handleLanguageChange = (value: string) => {
         setLanguage(value);
-        saveSettings({ language: value, llmLanguage: value });
+        saveSettings({ llmLanguage: value });
     }
 
     const handleStyleChange = (value: string) => {
@@ -90,7 +93,7 @@ export const useAstTranslation = () => {
             saveSettings({ llmBatchSize: size });
             setInputError(false);
         } else {
-            setBatchSize(i18n.settings.llmBatchSize?.toString() || '20');
+            setBatchSize(i18n.settings.llmBatchSize?.toString() || '10');
             setInputError(false);
         }
     }

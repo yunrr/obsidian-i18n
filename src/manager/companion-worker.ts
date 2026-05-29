@@ -1046,7 +1046,7 @@ async function handlePluginBatchExtract(task: CompanionTaskRuntime, payload: Com
     await runConcurrentCancellable(payload.resources, payload.concurrency, task, async (resource, index) => {
         if (!isTaskActive(task)) return;
         touchProgress(task, { currentLabel: resource.label });
-        const result = await handlePluginExtract(resource);
+        const result = await handlePluginExtract({ ...resource, language: payload.language, settings: payload.settings });
         if (result.status === 'success') {
             await saveExtractedSource(paths, result.pluginId, result.content, result.options);
             bumpSourceRevision(task);
@@ -1075,7 +1075,7 @@ async function handleThemeBatchExtract(task: CompanionTaskRuntime, payload: Comp
     await runConcurrentCancellable(payload.resources, payload.concurrency, task, async (resource, index) => {
         if (!isTaskActive(task)) return;
         touchProgress(task, { currentLabel: resource.label });
-        const result = await handleThemeExtract(resource);
+        const result = await handleThemeExtract({ ...resource, settings: payload.settings });
         if (result.status === 'success') {
             await saveExtractedSource(paths, result.pluginId, result.content, { title: result.options.title, type: 'theme' });
             bumpSourceRevision(task);
@@ -1315,7 +1315,7 @@ function createInitialProgress(type: CompanionAsyncTaskType, payload: any, taskI
         status: 'queued',
         currentLabel: '',
         processedResources: Number(payload.completedResources || 0),
-        totalResources: resources.length,
+        totalResources: Number(payload.totalResources || resources.length),
         processedItems: Number(payload.processedItems || 0),
         totalItems: isRetry
             ? resources.reduce((sum: number, failure: BatchTaskFailureRecord) => sum + failure.items.length, 0)

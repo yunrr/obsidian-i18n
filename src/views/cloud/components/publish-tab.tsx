@@ -208,118 +208,32 @@ export const PublishTab: React.FC = () => {
 
         setIsUploading(true);
         try {
-            const fileContent = fs.readFileSync(localFile.path, 'utf-8');
             const username = githubUser.login;
-            const uid = githubUser.id;
-
-            // 1. 获取源ID和计算 hash
             const source = i18n.sourceManager.getSource(selectedSourceId);
             if (!source?.id) {
                 throw new Error(t('Cloud.Errors.InvalidSourceConfig'));
             }
-            const entryId = source.id;
-            const hash = simpleHash(fileContent);
-
-            // 2. 上传翻译文件
-            const filePath = getCloudFilePath(entryId, source.type);
-            const b64Content = Buffer.from(fileContent, 'utf-8').toString('base64');
-            const commitMessage = t(isUpdateMode ? 'Cloud.Labels.UpdateTranslationMsg' : 'Cloud.Labels.AddTranslationMsg', { title: uploadForm.title, plugin: selectedPluginId });
 
             i18n.notice.successPrefix(t('Cloud.Status.Processing'), t('Cloud.Status.UploadingFile'));
-            const uploadRes = await i18n.api.github.uploadFile(
-                username, userRepo, filePath, b64Content, commitMessage
-            );
-            if (!uploadRes.state) {
-                throw new Error(`${t('Cloud.Errors.UploadFileFail')}: ${uploadRes.data?.message || uploadRes.data}`);
-            }
-
-            // 3. 读取当前 metadata.json，追加新条目
-            // Assuming `setLoadingText` and `t_i18n` are defined elsewhere or need to be added.
-            // For now, I'll use the existing `i18n.notice.successPrefix` and `t`.
-            i18n.notice.successPrefix(t('Cloud.Status.Processing'), t('Cloud.Status.UpdatingIndex'));
-            let manifest: ManifestEntry[] = [];
-            let manifestSha: string | undefined;
-            // 获取最新内容
-            const manifestRes = await i18n.api.github.getFileContent(username, userRepo, 'metadata.json');
-
-            if (manifestRes.state && manifestRes.data?.content) {
-                manifestSha = manifestRes.data.sha;
-                const decoded = Buffer.from(manifestRes.data.content, 'base64').toString('utf-8');
-                const parsed = JSON.parse(decoded);
-                if (Array.isArray(parsed)) {
-                    manifest = parsed;
-                }
-            } else if (manifestRes.status !== 404) {
-                // 熔断：除了“文件确实不存在”之外，任何错误（频率限制、授权过期、网络超时）都不允许覆盖索引
-                throw new Error(t('Cloud.Errors.UpdateManifestFail') + ': ' + (manifestRes.data?.message || 'Network Error'));
-            }
-
-            const now = new Date().toISOString();
-            const newEntry: ManifestEntry = {
-                id: entryId,
-                plugin: selectedPluginId,
+            const result = await i18n.companionWorkerManager.runCloudTask('cloud-publish-source', {
+                persistence: { basePath: i18n.sourceManager.getBasePath() },
+                token: i18n.settings.shareToken,
+                owner: username,
+                repo: userRepo,
+                branch: 'main',
                 language: i18n.settings.language,
-                version: uploadForm.version,
-                supported_versions: uploadForm.version,
+                sourceId: source.id,
                 title: uploadForm.title,
                 description: uploadForm.description || '',
-                hash: hash,
-                created_at: now,
-                updated_at: now,
-                type: source.type,
-            };
+                version: uploadForm.version,
+            });
 
-            // 查找是否已经存在同 id 的条目
-            const existingIndex = manifest.findIndex(e => e.id === entryId);
-            if (existingIndex >= 0) {
-                // 如果存在，只更新涉及到修改的字段（保留 id, created_at 及其他未变更属性）
-                manifest[existingIndex] = {
-                    ...manifest[existingIndex],
-                    version: uploadForm.version,
-                    supported_versions: uploadForm.version,
-                    title: uploadForm.title,
-                    description: uploadForm.description || '',
-                    hash: hash,
-                    updated_at: now,
-                };
-                // 如果之前因为Bug导致了多条同 ID 的脏数据，顺便把它们也清理掉以防后患
-                manifest = manifest.filter((e, index) => e.id !== entryId || index === existingIndex);
-            } else {
-                manifest.push(newEntry);
+            if (!result.state) {
+                throw new Error(`${t('Cloud.Errors.UploadFailed')}: ${result.error || result.data?.message || result.data}`);
             }
 
-            // 4. 更新 metadata.json
-            i18n.notice.successPrefix(t('Cloud.Status.Processing'), t('Cloud.Status.UpdatingIndex'));
-            const manifestContent = Buffer.from(
-                JSON.stringify(manifest, null, 4), 'utf-8'
-            ).toString('base64');
-
-            const uploadManifestRes = await i18n.api.github.uploadFile(
-                username, userRepo, 'metadata.json', manifestContent,
-                t('Cloud.Labels.UpdateManifestMsg', { plugin: selectedPluginId }),
-                'main',
-                manifestSha
-            );
-
-            if (!uploadManifestRes.state) {
-                throw new Error(`${t('Cloud.Errors.UpdateManifestFail')}: ${uploadManifestRes.data?.message || uploadManifestRes.data}`);
-            }
-
-            // 5. 更新本地实体源的云端绑定
-            const updatedSource = {
-                ...source,
-                origin: 'cloud' as const,
-                cloud: {
-                    owner: username,
-                    repo: userRepo,
-                    hash: hash
-                },
-                updatedAt: Date.now()
-            };
-            i18n.sourceManager.saveSource(updatedSource);
-
-            // 6. 更新 UI 状态
-            setRepoManifest(manifest);
+            i18n.sourceManager.reloadFromDisk();
+            setRepoManifest(result.manifest || []);
             i18n.notice.successPrefix(t('Cloud.Notices.UploadSuccess'), t('Cloud.Notices.UploadCompleteDesc'));
 
         } catch (error) {

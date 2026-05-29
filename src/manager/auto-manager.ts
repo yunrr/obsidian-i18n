@@ -215,7 +215,7 @@ export class AutoManager {
                         continue;
                     }
 
-                    const { match: bestMatch, scoreInfo } = this.selectBestTranslation(
+                    const { match: bestMatch, scoreInfo } = await this.selectBestTranslation(
                         matches,
                         stats,
                         installed.version,
@@ -364,7 +364,7 @@ export class AutoManager {
                 return;
             }
 
-            const { match: bestMatch } = this.selectBestTranslation(matches, stats, installedVersion, this.i18n.settings.language, type === 'theme');
+            const { match: bestMatch } = await this.selectBestTranslation(matches, stats, installedVersion, this.i18n.settings.language, type === 'theme');
 
             if (!bestMatch) {
                 store.updateTaskStatus(id, 'skipped', t('Manager.Auto.Status.SkipReasons.NoVersion'));
@@ -476,7 +476,7 @@ export class AutoManager {
             const installed = installedById.get(id);
             if (!installed) continue;
 
-            const { match: bestMatch, scoreInfo } = this.selectBestTranslation(
+            const { match: bestMatch, scoreInfo } = await this.selectBestTranslation(
                 matches,
                 stats,
                 installed.version,
@@ -526,14 +526,29 @@ export class AutoManager {
         this.syncStore();
     }
 
-    private selectBestTranslation(
+    private async selectBestTranslation(
         matches: { repoAddress: string; entry: ManifestEntry }[],
         stats: CommunityStatsData,
         targetVersion: string,
         targetLanguage: string,
         isTheme: boolean
-    ): { match: { repoAddress: string; entry: ManifestEntry } | null, scoreInfo: any } {
+    ): Promise<{ match: { repoAddress: string; entry: ManifestEntry } | null, scoreInfo: any }> {
         const strategy = this.i18n.settings.autoMatchStrategy || 'comprehensive';
+        if (this.i18n.settings.llmCompanionWorkerEnabled) {
+            try {
+                return await this.i18n.companionWorkerManager.autoMatch({
+                    matches,
+                    stats,
+                    targetVersion,
+                    targetLanguage,
+                    isTheme,
+                    strategy,
+                }) as { match: { repoAddress: string; entry: ManifestEntry } | null, scoreInfo: any };
+            } catch (error) {
+                console.warn('[I18N Companion] Automation match fallback:', error);
+            }
+        }
+
         let hasLanguageMatch = false;
         for (const match of matches) {
             if (match.entry.language === targetLanguage) {
