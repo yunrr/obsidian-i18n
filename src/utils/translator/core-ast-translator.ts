@@ -271,6 +271,8 @@ export class AstTranslator {
     private isValidText(text: string): boolean {
         // 0. 基础长度
         if (text.length < 2) return false;
+        const maxLength = Number(this.settings?.astMaxLength ?? 300);
+        if (Number.isFinite(maxLength) && maxLength > 0 && text.length > maxLength) return false;
 
         // 1. 拒绝匹配任何 REJECT 模式
         if (this.contentRules.REJECT_PATTERNS.some((regex: RegExp) => regex.test(text))) {

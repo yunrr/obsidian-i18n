@@ -6,7 +6,17 @@ import type { ChildProcess } from 'child_process';
 import type I18N from '../main';
 import type {
     CompanionAsyncTaskType,
+    CompanionAutoMatchRequest,
+    CompanionAutoMatchResponse,
     CompanionBatchTaskType,
+    CompanionCloudResponse,
+    CompanionCloudTaskType,
+    CompanionDiscoveredPlugin,
+    CompanionDiscoveredTheme,
+    CompanionGithubReadRequest,
+    CompanionGithubReadResponse,
+    CompanionGithubWriteRequest,
+    CompanionGithubWriteResponse,
     CompanionProxyRequest,
     CompanionProxyResponse,
     CompanionTaskCancelResponse,
@@ -17,10 +27,20 @@ import type {
 
 export type {
     CompanionAsyncTaskType,
+    CompanionAutoMatchRequest,
+    CompanionAutoMatchResponse,
     CompanionBatchFailure,
+    CompanionCloudResponse,
+    CompanionCloudTaskType,
     CompanionBatchResource,
     CompanionBatchTaskType,
+    CompanionDiscoveredPlugin,
+    CompanionDiscoveredTheme,
     CompanionExtractionSettings,
+    CompanionGithubReadRequest,
+    CompanionGithubReadResponse,
+    CompanionGithubWriteRequest,
+    CompanionGithubWriteResponse,
     CompanionExtractResult,
     CompanionPluginBatchExtractPayload,
     CompanionPluginBatchTranslatePayload,
@@ -61,17 +81,17 @@ export class CompanionWorkerManager {
     private workerProcess: ChildProcess | null = null;
     private endpoint = '';
     private startPromise: Promise<boolean> | null = null;
-    private readonly scriptPath: string;
     private readonly rustWorkerPath: string;
+    private readonly normalizedPluginDir: string;
 
     constructor(private readonly plugin: I18N, private readonly pluginDir: string) {
-        this.scriptPath = path.join(pluginDir, 'i18n-companion-worker.cjs');
         this.rustWorkerPath = path.join(pluginDir, process.platform === 'win32' ? 'i18n-companion-worker.exe' : 'i18n-companion-worker');
+        this.normalizedPluginDir = path.resolve(pluginDir);
     }
 
     public async start(): Promise<boolean> {
         if (!this.plugin.settings.llmCompanionWorkerEnabled) return false;
-        if (this.endpoint && this.workerProcess && !this.workerProcess.killed) return true;
+        if (this.endpoint) return true;
         if (this.startPromise) return this.startPromise;
 
         this.startPromise = this.startInner().finally(() => {
@@ -81,12 +101,31 @@ export class CompanionWorkerManager {
     }
 
     public stop(): void {
-        this.endpoint = '';
-        if (!this.workerProcess) return;
+        void this.stopAsync();
+    }
 
+    public async stopAsync(): Promise<void> {
+        const endpoint = this.endpoint || `http://127.0.0.1:${this.getPort()}`;
         const worker = this.workerProcess;
+
+        this.endpoint = '';
         this.workerProcess = null;
-        if (!worker.killed) worker.kill();
+
+        try {
+            await Promise.race([
+                requestUrl({ url: `${endpoint}/shutdown`, method: 'POST', throw: false }),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('shutdown timeout')), 500)),
+            ]);
+        } catch {
+            if (worker && !worker.killed) worker.kill();
+            return;
+        }
+
+        if (worker && !worker.killed) {
+            setTimeout(() => {
+                if (!worker.killed) worker.kill();
+            }, 1000);
+        }
     }
 
     public async proxyRequest(request: CompanionProxyRequest): Promise<CompanionProxyResponse> {
@@ -107,6 +146,25 @@ export class CompanionWorkerManager {
         }
 
         return payload.response;
+    }
+
+    public async githubRead(request: CompanionGithubReadRequest): Promise<CompanionGithubReadResponse> {
+        const response = await this.postWorker<{ result: CompanionGithubReadResponse }>('/github/read', request);
+        return response.result;
+    }
+
+    public async githubWrite(request: CompanionGithubWriteRequest): Promise<CompanionGithubWriteResponse> {
+        const response = await this.postWorker<{ result: CompanionGithubWriteResponse }>('/github/write', request);
+        return response.result;
+    }
+
+    public async autoMatch(request: CompanionAutoMatchRequest): Promise<CompanionAutoMatchResponse> {
+        const response = await this.postWorker<{ result: CompanionAutoMatchResponse }>('/automation/match', request);
+        return response.result;
+    }
+
+    public async runCloudTask(type: CompanionCloudTaskType, payload: unknown): Promise<CompanionCloudResponse> {
+        return this.runTask<CompanionCloudResponse>(type, payload);
     }
 
     public async runTask<TResult>(type: CompanionBatchTaskType, payload: unknown, signal?: AbortSignal): Promise<TResult> {
@@ -172,6 +230,34 @@ export class CompanionWorkerManager {
         return this.postWorker<CompanionTaskCancelResponse>('/task/cancel', { taskId });
     }
 
+    public async discoverPlugins(): Promise<CompanionDiscoveredPlugin[]> {
+        const response = await this.getWorker<{ plugins: CompanionDiscoveredPlugin[] }>('/resources/plugins');
+        return response.plugins || [];
+    }
+
+    public async discoverThemes(): Promise<CompanionDiscoveredTheme[]> {
+        const response = await this.getWorker<{ themes: CompanionDiscoveredTheme[] }>('/resources/themes');
+        return response.themes || [];
+    }
+
+    private async getWorker<TResult>(route: string): Promise<TResult> {
+        const started = await this.start();
+        if (!started || !this.endpoint) throw new Error('本地伴生服务未启动');
+
+        const response = await requestUrl({
+            url: `${this.endpoint}${route}`,
+            method: 'GET',
+            throw: false,
+        });
+
+        const payload = response.json || (response.text ? JSON.parse(response.text) : null);
+        if (!payload?.ok) {
+            throw new Error(payload?.error || `本地伴生服务返回异常 (${response.status})`);
+        }
+
+        return payload as TResult;
+    }
+
     private async postWorker<TResult>(route: string, body: unknown): Promise<TResult> {
         const started = await this.start();
         if (!started || !this.endpoint) throw new Error('本地伴生服务未启动');
@@ -195,12 +281,15 @@ export class CompanionWorkerManager {
     private async startInner(): Promise<boolean> {
         try {
             const port = this.getPort();
-            if (existsSync(this.rustWorkerPath) && await this.spawnWorker(this.rustWorkerPath, [String(port)], port, { I18N_COMPANION_NODE_PATH: this.plugin.settings.llmCompanionNodePath?.trim() || 'node' }, true)) {
+            const endpoint = `http://127.0.0.1:${port}`;
+            if (await this.isWorkerReady(endpoint, 500)) {
+                this.endpoint = endpoint;
                 return true;
             }
-
-            const nodePath = this.plugin.settings.llmCompanionNodePath?.trim() || 'node';
-            return this.spawnWorker(nodePath, [this.scriptPath, String(port)], port);
+            if (!existsSync(this.rustWorkerPath)) {
+                throw new Error(`Rust 伴生 worker 不存在: ${this.rustWorkerPath}`);
+            }
+            return this.spawnWorker(this.rustWorkerPath, [String(port)], port);
         } catch (error) {
             console.warn('[I18N Companion] 启动失败', error);
             this.stop();
@@ -213,7 +302,7 @@ export class CompanionWorkerManager {
             const worker = spawn(command, args, {
                 cwd: this.pluginDir,
                 windowsHide: true,
-                stdio: ['ignore', 'pipe', 'pipe'],
+                stdio: ['pipe', 'pipe', 'pipe'],
                 env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
             });
 
@@ -236,7 +325,7 @@ export class CompanionWorkerManager {
                 }
             });
 
-            const ready = await this.waitForHealth(this.endpoint, 5000);
+            const ready = await this.isWorkerReady(this.endpoint, 5000);
             if (!ready) {
                 this.stop();
                 return false;
@@ -255,20 +344,25 @@ export class CompanionWorkerManager {
         return Number.isFinite(port) && port > 0 && port <= 65535 ? Math.floor(port) : 18743;
     }
 
-    private async waitForHealth(endpoint: string, timeoutMs: number): Promise<boolean> {
+    private async isWorkerReady(endpoint: string, timeoutMs: number): Promise<boolean> {
         const startedAt = Date.now();
         while (Date.now() - startedAt < timeoutMs) {
             try {
                 const response = await Promise.race([
-                    requestUrl({ url: `${endpoint}/health`, method: 'GET', throw: false }),
-                    new Promise((_, reject) => setTimeout(() => reject(new Error('health timeout')), 500)),
+                    requestUrl({ url: `${endpoint}/identity`, method: 'GET', throw: false }),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('identity timeout')), 500)),
                 ]) as any;
-                if (response.status === 200) return true;
+                const payload = response.json || (response.text ? JSON.parse(response.text) : null);
+                if (response.status === 200 && payload?.ok && this.isSamePluginDir(payload.pluginDir)) return true;
             } catch {
                 await new Promise(resolve => setTimeout(resolve, 150));
             }
         }
         return false;
+    }
+
+    private isSamePluginDir(pluginDir: unknown): boolean {
+        return typeof pluginDir === 'string' && path.resolve(pluginDir) === this.normalizedPluginDir;
     }
 }
 

@@ -108,12 +108,17 @@ function normalizeRequestUrlResponse(response: any): any {
         }
     }
 
-    return { ...response, text, json };
+    return { ...response, text: json ? JSON.stringify(json) : text, json, rawJson: json };
 }
 
 function parseRequestUrlJson(response: any): any | null {
     const normalized = normalizeRequestUrlResponse(response);
     return normalized.json ?? null;
+}
+
+function parseRawRequestUrlJson(response: any): any | null {
+    const normalized = normalizeRequestUrlResponse(response);
+    return normalized.rawJson ?? null;
 }
 
 function extractOpenAIContent(body: any): string {
@@ -131,6 +136,45 @@ function extractOpenAIContent(body: any): string {
     }
 
     return typeof content === 'string' ? content : '';
+}
+
+function extractJsonObjectFromContent(content: string): any | null {
+    const trimmed = content.trim();
+    if (!trimmed) return null;
+
+    try {
+        const parsed = JSON.parse(trimmed);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+    } catch { }
+
+    const first = trimmed.indexOf('{');
+    const last = trimmed.lastIndexOf('}');
+    if (first >= 0 && last > first) {
+        try {
+            const parsed = JSON.parse(trimmed.slice(first, last + 1));
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+        } catch { }
+    }
+
+    return null;
+}
+
+function hasUsableJsonObjectOutput(response: any): boolean {
+    if (!isSuccessStatus(response?.status)) return false;
+    const body = parseRequestUrlJson(response);
+    const content = extractOpenAIContent(body);
+    return !!extractJsonObjectFromContent(content);
+}
+
+function hasReasoningOnlyTruncation(body: any): boolean {
+    const choice = body?.choices?.[0];
+    const finishReason = choice?.finish_reason;
+    const content = choice?.message?.content ?? choice?.text ?? choice?.delta?.content;
+    const reasoningContent = choice?.message?.reasoning_content ?? choice?.reasoning_content ?? choice?.delta?.reasoning_content;
+    const reasoningTokens = body?.usage?.completion_tokens_details?.reasoning_tokens;
+    return (!content || (typeof content === 'string' && content.trim() === ''))
+        && (typeof reasoningContent === 'string' && reasoningContent.trim().length > 0 || Number(reasoningTokens || 0) > 0)
+        && finishReason === 'length';
 }
 
 export class ConnectivityTester {
@@ -353,7 +397,7 @@ export class ConnectivityTester {
         const modelRes = await this.safeRequest(`${testUrl}/chat/completions`, 'POST', true, {
             model: this.model,
             messages: [{ role: 'user', content: 'hi' }],
-            max_tokens: 1
+            max_tokens: 5000
         });
         report.model.latency = Date.now() - modelStartTime;
 
@@ -390,7 +434,7 @@ export class ConnectivityTester {
                 { role: 'system', content: 'You are a helpful assistant. Reply only with: OK' },
                 { role: 'user', content: 'hi' }
             ],
-            max_tokens: 5
+            max_tokens: 5000
         });
         report.systemRole.latency = Date.now() - sysRoleStartTime;
 
@@ -414,17 +458,22 @@ export class ConnectivityTester {
             model: this.model,
             messages: [{ role: 'user', content: 'respond with json: {"ok":true}' }],
             response_format: { type: 'json_object' },
-            max_tokens: 10
+            max_tokens: 5000
         });
-        if (isSuccessStatus(jsonModeRes.status)) {
+        if (hasUsableJsonObjectOutput(jsonModeRes)) {
             report.jsonMode.status = 'pass';
             report.jsonMode.value = '已支持';
-            this.addLog('Capabilities', '探测通过：原生 JSON_OBJECT 强制输出工作正常');
+            this.addLog('Capabilities', '探测通过：模型返回了可解析 JSON 对象');
+        } else if (isSuccessStatus(jsonModeRes.status)) {
+            report.jsonMode.status = 'warn';
+            report.jsonMode.tip = '接口接受了 JSON_OBJECT 参数，但模型内容不是可解析 JSON 对象。建议改用 Text，或换支持强制 JSON 的模型。';
+            report.overallStatus = report.overallStatus === 'healthy' ? 'warning' : report.overallStatus;
+            this.addLog('Capabilities', '接口接受 JSON_OBJECT，但模型未按 JSON 对象输出', 'warn', normalizeRequestUrlText(jsonModeRes).substring(0, 1000));
         } else {
             report.jsonMode.status = 'warn';
-            report.jsonMode.tip = '该模型不支持原生 JSON_OBJECT，建议在“响应格式”中回退为 Text';
+            report.jsonMode.tip = '该模型或网关拒绝原生 JSON_OBJECT 参数。可改用 Text；Text 模式下仍可输出插件需要的 JSON 数组。';
             report.overallStatus = report.overallStatus === 'healthy' ? 'warning' : report.overallStatus;
-            this.addLog('Capabilities', `模型明确拒绝或不支持 JSON 模式强制约束，状态码: ${jsonModeRes.status}`, 'warn');
+            this.addLog('Capabilities', `模型明确拒绝或不支持 JSON_OBJECT 参数，状态码: ${jsonModeRes.status}`, 'warn');
         }
         onProgress?.(report);
 
@@ -443,16 +492,23 @@ export class ConnectivityTester {
                     strict: true
                 }
             },
-            max_tokens: 10
+            max_tokens: 5000
         });
-        if (isSuccessStatus(jsonSchemaRes.status)) {
+        const jsonSchemaBody = parseRequestUrlJson(jsonSchemaRes);
+        const jsonSchemaContent = extractOpenAIContent(jsonSchemaBody);
+        const jsonSchemaObject = extractJsonObjectFromContent(jsonSchemaContent);
+        if (isSuccessStatus(jsonSchemaRes.status) && typeof jsonSchemaObject?.ok === 'boolean') {
             report.jsonSchema.status = 'pass';
             report.jsonSchema.value = '已支持';
-            this.addLog('Capabilities', '探测通过：基于 JSON Schema 的高度结构化约束功能完好');
+            this.addLog('Capabilities', '探测通过：基于 JSON Schema 的结构化约束返回了目标字段');
+        } else if (isSuccessStatus(jsonSchemaRes.status)) {
+            report.jsonSchema.status = 'warn';
+            report.jsonSchema.tip = '接口接受了 JSON_SCHEMA 参数，但模型内容没有按 schema 返回目标字段。若实际翻译报错，建议改回 Text。';
+            report.overallStatus = report.overallStatus === 'healthy' ? 'warning' : report.overallStatus;
+            this.addLog('Capabilities', 'JSON_SCHEMA 请求成功，但内容未严格符合 schema', 'warn', normalizeRequestUrlText(jsonSchemaRes).substring(0, 1000));
         } else {
             report.jsonSchema.status = 'warn';
-            // 使用具体指导替换原先的提示词变量
-            report.jsonSchema.tip = '该模型不支持原生 JSON_SCHEMA。若实际翻译报错，建议将响应格式改回 Text';
+            report.jsonSchema.tip = '该模型或网关拒绝原生 JSON_SCHEMA。若实际翻译报错，建议将响应格式改回 Text';
             report.overallStatus = report.overallStatus === 'healthy' ? 'warning' : report.overallStatus;
             this.addLog('Capabilities', `高级结构化输出功能遭拒或未实现，降级为常规生成 ${jsonSchemaRes.status}`, 'warn');
         }
@@ -478,7 +534,7 @@ export class ConnectivityTester {
                     ])
                 }
             ],
-            max_tokens: 150,
+            max_tokens: 5000,
             temperature: 0.3,
         };
 
@@ -534,8 +590,17 @@ export class ConnectivityTester {
                 this.addLog('Translation', `翻译模拟请求失败，状态码: ${transRes.status}`, 'error', transRes.text?.substring(0, 1000));
             } else {
                 let parseSuccess = false;
+                let reasoningOnlyTruncation = false;
                 try {
+                    const rawBody = parseRawRequestUrlJson(transRes);
+                    reasoningOnlyTruncation = hasReasoningOnlyTruncation(rawBody);
                     const body = parseRequestUrlJson(transRes);
+                    if (body?.usage) {
+                        report.translation.usage = {
+                            prompt: body.usage.prompt_tokens,
+                            completion: body.usage.completion_tokens
+                        };
+                    }
                     const content = extractOpenAIContent(body);
                     if (content) {
                         let resultArray: any[] = [];
@@ -556,13 +621,6 @@ export class ConnectivityTester {
                                 report.translation.status = 'pass';
                                 report.translation.value = `✔ 通过 (${transLatency}ms)`;
                                 this.addLog('Translation', `✔ 沙盒全链路通过：成功捕获并重组出 ${resultArray.length} 条元数据，响应耗时 ${transLatency}ms`);
-
-                                if (body?.usage) {
-                                    report.translation.usage = {
-                                        prompt: body.usage.prompt_tokens,
-                                        completion: body.usage.completion_tokens
-                                    };
-                                }
                             }
                         }
                     }
@@ -581,10 +639,12 @@ export class ConnectivityTester {
 
                     const outputPreview = contentPreview.trim()
                         ? `"${contentPreview.substring(0, 200)}..."`
-                        : '未能从响应中提取模型内容，可能是本地网关返回格式不是标准 OpenAI Chat Completion。';
-                    const suggestion = this.responseFormat === 'text'
-                        ? '当前已是 Text 模式，说明模型输出内容不是插件需要的 JSON 数组，或本地网关返回结构不符合 OpenAI Chat Completion 格式。请确认模型实际输出包含 [{ "i": 1, "t": "译文" }] 这样的数组。'
-                        : `当前使用 ${this.responseFormat} 模式，若模型或网关不支持该响应格式，可改用 Text；但 Text 模式下模型仍必须按提示词输出 JSON 数组。`;
+                        : '未能从响应中提取模型内容。';
+                    const suggestion = reasoningOnlyTruncation
+                        ? '模型返回了 reasoning_content，但 message.content 为空且 finish_reason=length，说明输出额度被思考内容耗尽。已在诊断展示中丢弃思考字段，但需要在服务商/网关侧关闭或降低 reasoning，或提高 max_tokens。'
+                        : this.responseFormat === 'text'
+                            ? '当前已是 Text 模式，说明模型输出内容不是插件需要的 JSON 数组，或本地网关返回结构不符合 OpenAI Chat Completion 格式。请确认模型实际输出包含 [{ "i": 1, "t": "译文" }] 这样的数组。'
+                            : `当前使用 ${this.responseFormat} 模式，若模型或网关不支持该响应格式，可改用 Text；但 Text 模式下模型仍必须按提示词输出 JSON 数组。`;
 
                     report.translation.tip = `模型返回了无法被解析的内容。当前选择格式: "${this.responseFormat}"。\n模型实际输出预览: ${outputPreview}\n建议: ${suggestion}`;
                     report.translation.rawResponse = rawBody;
@@ -634,7 +694,7 @@ export class ConnectivityTester {
                     content: 'Source: "Save changes"; Broken: "保存 [错误]"; Error: "Bracket mismatch"'
                 }
             ],
-            max_tokens: 50,
+            max_tokens: 5000,
             temperature: 0.3
         };
 
@@ -675,7 +735,7 @@ export class ConnectivityTester {
                 const burstBody = {
                     model: this.model,
                     messages: [{ role: 'user', content: 'hi' }],
-                    max_tokens: 1
+                    max_tokens: 5000
                 };
                 const burstPromises = Array.from({ length: burstCount }, () =>
                     this.safeRequest(`${testUrl}/chat/completions`, 'POST', true, burstBody)

@@ -60,13 +60,13 @@ const ThemeLLMCard: React.FC<Props> = ({ controller }) => {
                         {t('Editor.Labels.SelectLang')}
                     </label>
                     <div className="flex gap-2">
-                        <Select value={SUPPORTED_LANGUAGES.some(l => l.value === language) ? language : undefined} onValueChange={setLanguage}>
+                        <Select value={SUPPORTED_LANGUAGES.some(l => l.label === language) ? language : undefined} onValueChange={setLanguage}>
                             <SelectTrigger size="sm" className="w-[110px] text-xs bg-background">
                                 <SelectValue placeholder={t('Editor.Labels.SelectLang')} />
                             </SelectTrigger>
                             <SelectContent>
                                 {SUPPORTED_LANGUAGES.map(l => (
-                                    <SelectItem key={l.value} value={l.value} className="text-xs">
+                                    <SelectItem key={l.value} value={l.label} className="text-xs">
                                         {l.label}
                                     </SelectItem>
                                 ))}

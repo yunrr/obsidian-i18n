@@ -4,32 +4,15 @@
  */
 import React, { useCallback, useState } from 'react';
 import { Button } from '@/src/shadcn';
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/src/shadcn/ui/dialog';
 import { Progress } from '@/src/shadcn/ui/progress';
 import { ScrollArea } from '@/src/shadcn/ui/scroll-area';
-import { Badge } from '@/src/shadcn/ui/badge';
-import { Loader2, Upload, Download, CheckCircle2, AlertCircle, Cloud, HardDrive, ArrowRight, Package, ArrowLeft, RotateCcw } from 'lucide-react';
+import { Upload, Download, CheckCircle2, Cloud, HardDrive, ArrowRight, Package, ArrowLeft, RotateCcw } from 'lucide-react';
 import { useCloudStore } from '../cloud-store';
 import { useGlobalStoreInstance } from '~/utils';
 import { t } from '@/src/locales/index';
-import { ManifestEntry, BackupProgress, getCloudFilePath } from '../types';
+import { ManifestEntry } from '../types';
 import { cn } from '@/src/shadcn/lib/utils';
-import { calculateChecksum } from '@/src/utils/translator/translation';
-import { TranslationSource } from '@/src/types';
-import * as fs from 'fs-extra';
 import { LoginRequired } from './login-required';
-
-/** 计算字符串的简单 hash (与 publish-tab 一致) */
-function simpleHash(str: string): string {
-    let hash = 0;
-    for (let i = 0; i < str.length; i++) {
-        const char = str.charCodeAt(i);
-        hash = ((hash << 5) - hash) + char;
-        hash = hash & hash;
-    }
-    const hex = Math.abs(hash).toString(16).padStart(8, '0');
-    return hex.repeat(4);
-}
 
 export const BackupSyncTab: React.FC = () => {
     const i18n = useGlobalStoreInstance.getState().i18n;
@@ -40,7 +23,6 @@ export const BackupSyncTab: React.FC = () => {
     const setBackupDialogMode = useCloudStore.use.setBackupDialogMode();
     const setBackupProgress = useCloudStore.use.setBackupProgress();
     const githubUser = useCloudStore.use.githubUser();
-    const repoManifest = useCloudStore.use.repoManifest();
     const setRepoManifest = useCloudStore.use.setRepoManifest();
 
     const userRepo = i18n.settings.shareRepo;
@@ -68,19 +50,8 @@ export const BackupSyncTab: React.FC = () => {
         const username = githubUser.login;
 
         try {
-            let filesToUpload: { path: string; content: string }[] = [];
-            let sourcesToSave: TranslationSource[] = [];
-            let manifest: ManifestEntry[] = [];
-            let currentIdx = 0;
-            let total = 0;
-
-            if (isResume && checkpoint) {
+            if (isResume) {
                 addLog(t('Cloud.Status.ResumingBackup'));
-                filesToUpload = checkpoint.filesToUpload || [];
-                sourcesToSave = checkpoint.sourcesToSave || [];
-                manifest = checkpoint.manifest || [];
-                total = checkpoint.total || filesToUpload.length;
-                currentIdx = checkpoint.currentIdx || 0;
             } else {
                 const allSources = i18n.sourceManager.getAllSources();
                 if (allSources.length === 0) {
@@ -88,161 +59,59 @@ export const BackupSyncTab: React.FC = () => {
                     setBackupProgress({ total: 0, current: 0, currentPlugin: '', phase: 'done' });
                     return;
                 }
-
                 addLog(t('Cloud.Notices.FoundLocalSources', { count: allSources.length }));
-                setBackupProgress({ total: allSources.length, current: 0, currentPlugin: '', phase: 'uploading' });
-
-                // 1. 获取云端 manifest
-                addLog(t('Cloud.Status.FetchingManifest'));
-                try {
-                    const manifestRes = await i18n.api.github.getFileContentWithFallback(username, userRepo, 'metadata.json');
-                    if (manifestRes.state && Array.isArray(manifestRes.data)) {
-                        manifest = manifestRes.data;
-                    }
-                } catch { /* ignore */ }
-
-                // 2. 并发准备数据 (优化：避免大循环阻塞 UI)
-                addLog(t('Cloud.Status.PreparingData'));
-                const prepTasks = allSources.map(async (source) => {
-                    try {
-                        const filePath = i18n.sourceManager.getSourceFilePath(source.id);
-                        if (!filePath || !fs.existsSync(filePath)) return null;
-
-                        const content = await fs.readFile(filePath, 'utf-8');
-                        const hash = simpleHash(content);
-
-                        const existingEntry = manifest.find(e => e.id === source.id);
-                        if (existingEntry && existingEntry.hash === hash) return null;
-
-                        const remoteFilePath = getCloudFilePath(source.id, source.type);
-
-                        // 更新 manifest
-                        const now = new Date().toISOString();
-                        const newEntry: ManifestEntry = {
-                            id: source.id,
-                            plugin: source.plugin,
-                            type: source.type,
-                            language: i18n.settings.language,
-                            version: '',
-                            supported_versions: '',
-                            title: source.title || t('Cloud.Labels.UnnamedTranslation'),
-                            description: '',
-                            hash,
-                            created_at: existingEntry?.created_at || now,
-                            updated_at: now,
-                        };
-
-                        try {
-                            const parsed = JSON.parse(content);
-                            if (parsed?.metadata?.version) newEntry.version = parsed.metadata.version;
-                            if (parsed?.metadata?.supportedVersions) newEntry.supported_versions = parsed.metadata.supportedVersions;
-                            if (parsed?.metadata?.description) newEntry.description = parsed.metadata.description;
-                        } catch { /* ignore */ }
-
-                        return {
-                            file: { path: remoteFilePath, content },
-                            sourceUpdate: {
-                                ...source,
-                                origin: 'cloud' as const,
-                                cloud: { owner: username, repo: userRepo, hash },
-                                updatedAt: Date.now(),
-                            },
-                            manifestEntry: newEntry
-                        };
-                    } catch (e) {
-                        console.error(`Prep failed for ${source.id}:`, e);
-                        return null;
-                    }
-                });
-
-                const results = (await Promise.all(prepTasks)).filter(r => r !== null) as any[];
-
-                if (results.length === 0) {
-                    addLog(t('Cloud.Notices.BackupNoChanges'));
-                    setBackupProgress({ total: allSources.length, current: allSources.length, currentPlugin: '', phase: 'done' });
-                    return;
-                }
-
-                filesToUpload = results.map(r => r.file);
-                sourcesToSave = results.map(r => r.sourceUpdate);
-
-                // 更新内存中的 manifest
-                results.forEach(r => {
-                    const idx = manifest.findIndex(e => e.id === r.manifestEntry.id);
-                    if (idx >= 0) manifest[idx] = r.manifestEntry;
-                    else manifest.push(r.manifestEntry);
-                });
-
-                total = filesToUpload.length;
-                addLog(t('Cloud.Notices.ItemsToUpload', { count: total }));
             }
 
-            // 3. 分批上传 (Chunking)
-            const CHUNK_SIZE = 20;
-            const chunks: any[][] = [];
-            for (let i = currentIdx; i < filesToUpload.length; i += CHUNK_SIZE) {
-                chunks.push(filesToUpload.slice(i, i + CHUNK_SIZE));
-            }
+            addLog(t('Cloud.Status.PreparingData'));
+            const started = await i18n.companionWorkerManager.startTask('cloud-backup-all', {
+                persistence: { basePath: i18n.sourceManager.getBasePath() },
+                token: i18n.settings.shareToken,
+                owner: username,
+                repo: userRepo,
+                branch: 'main',
+                language: i18n.settings.language,
+                resume: isResume,
+            });
 
-            for (let i = 0; i < chunks.length; i++) {
-                const chunk = chunks[i];
-                const realIdx = currentIdx + (i * CHUNK_SIZE);
-
+            let progress = started.progress;
+            let loggedUpload = false;
+            const syncProgress = () => {
                 setBackupProgress({
-                    total: filesToUpload.length,
-                    current: realIdx,
-                    currentPlugin: t('Cloud.Status.UploadingBatch', { current: i + 1, total: chunks.length }),
-                    phase: 'uploading',
+                    total: progress.totalResources,
+                    current: progress.processedResources,
+                    currentPlugin: progress.currentLabel,
+                    phase: progress.status === 'failed' ? 'error' : 'uploading',
+                    errorMessage: progress.error,
                 });
-
-                addLog(t('Cloud.Status.UploadingBatchLog', { current: i + 1, total: chunks.length, count: chunk.length }));
-
-                const uploadRes = await i18n.api.github.batchUploadFiles(
-                    username, userRepo, chunk,
-                    t('Cloud.Labels.BulkBackupMsgBatch', { current: i + 1, total: chunks.length })
-                );
-
-                if (!uploadRes.state) {
-                    // 保存检查点并报错
-                    i18n.sourceManager.saveCheckpoint({
-                        filesToUpload, sourcesToSave, manifest, total, currentIdx: realIdx
-                    });
-                    throw new Error(uploadRes.data);
+                if (!loggedUpload && progress.totalResources > 0) {
+                    addLog(t('Cloud.Notices.ItemsToUpload', { count: progress.totalResources }));
+                    loggedUpload = true;
                 }
+            };
 
-                // 每个 Batch 成功后更新检查点
-                i18n.sourceManager.saveCheckpoint({
-                    filesToUpload, sourcesToSave, manifest, total, currentIdx: realIdx + chunk.length
-                });
+            syncProgress();
+            while (progress.status === 'queued' || progress.status === 'running') {
+                await new Promise(resolve => window.setTimeout(resolve, 150));
+                const status = await i18n.companionWorkerManager.getTaskStatus(started.taskId);
+                progress = status.progress;
+                syncProgress();
             }
 
-            // 4. 上传最终 metadata.json
-            addLog(t('Cloud.Status.UpdatingIndex'));
-            const finalManifestContent = JSON.stringify(manifest, null, 4);
-            const manifestUploadRes = await i18n.api.github.uploadFile(
-                username, userRepo, 'metadata.json',
-                Buffer.from(finalManifestContent).toString('base64'),
-                t('Cloud.Labels.UpdateManifestGlobalMsg'),
-                'main'
-            );
+            if (progress.status === 'failed') throw new Error(progress.error || t('Cloud.Errors.BackupErrorMsg', { error: '' }));
+            if (progress.status === 'cancelled') throw new Error(t('Common.Errors.TaskCancelled'));
 
-            if (!manifestUploadRes.state) {
-                throw new Error(t('Cloud.Errors.UpdateManifestFail'));
-            }
-
-            // 5. 最终完成：同步本地元数据
             addLog(t('Cloud.Status.FinalizingLocal'));
-            i18n.sourceManager.batchSaveSources(sourcesToSave);
-
-            setRepoManifest(manifest);
+            i18n.sourceManager.reloadFromDisk();
+            const manifestRes = await i18n.api.github.getFileContentWithFallback(username, userRepo, 'metadata.json');
+            if (manifestRes.state && Array.isArray(manifestRes.data)) {
+                setRepoManifest(manifestRes.data as ManifestEntry[]);
+            }
             useGlobalStoreInstance.getState().triggerSourceUpdate();
-            i18n.sourceManager.clearCheckpoint();
             setCheckpoint(null);
 
-            setBackupProgress({ total, current: total, currentPlugin: '', phase: 'done' });
-            addLog(t('Cloud.Status.BackupDone'));
-            i18n.notice.successPrefix(t('Common.Notices.Success'), t('Cloud.Notices.BackupSuccessCount', { count: total }));
-
+            setBackupProgress({ total: progress.totalResources, current: progress.totalResources, currentPlugin: '', phase: 'done' });
+            addLog(progress.totalResources === 0 ? t('Cloud.Notices.BackupNoChanges') : t('Cloud.Status.BackupDone'));
+            i18n.notice.successPrefix(t('Common.Notices.Success'), t('Cloud.Notices.BackupSuccessCount', { count: progress.totalResources }));
         } catch (error) {
             console.error('Backup failed:', error);
             addLog(t('Cloud.Errors.BackupErrorMsg', { error: `${error}` }));
@@ -251,7 +120,7 @@ export const BackupSyncTab: React.FC = () => {
         } finally {
             setIsRunning(false);
         }
-    }, [githubUser, userRepo, i18n, setRepoManifest, setBackupProgress, checkpoint]);
+    }, [githubUser, userRepo, i18n, setRepoManifest, setBackupProgress]);
 
     const handleRestore = useCallback(async () => {
         if (!githubUser || !userRepo) return;
@@ -262,93 +131,34 @@ export const BackupSyncTab: React.FC = () => {
         const username = githubUser.login;
 
         try {
-            // 获取 manifest
             addLog(t('Cloud.Hints.FetchingManifest'));
-            const manifestRes = await i18n.api.github.getFileContentWithFallback(username, userRepo, 'metadata.json');
-            if (!manifestRes.state || !manifestRes.data) {
-                addLog(t('Cloud.Errors.GetManifestFail'));
-                setBackupProgress({ total: 0, current: 0, currentPlugin: '', phase: 'error', errorMessage: t('Cloud.Errors.GetManifestFail') });
+            const result = await i18n.companionWorkerManager.runCloudTask('cloud-restore-all', {
+                persistence: { basePath: i18n.sourceManager.getBasePath() },
+                token: i18n.settings.shareToken,
+                owner: username,
+                repo: userRepo,
+                branch: 'main',
+            });
+
+            if (!result.state) {
+                addLog(result.error || t('Cloud.Errors.GetManifestFail'));
+                setBackupProgress({ total: 0, current: 0, currentPlugin: '', phase: 'error', errorMessage: result.error || t('Cloud.Errors.GetManifestFail') });
                 return;
             }
-            const manifest: ManifestEntry[] = manifestRes.data;
+
+            const manifest = result.manifest || [];
             if (!Array.isArray(manifest) || manifest.length === 0) {
                 addLog(t('Cloud.Hints.NoCloudData'));
                 setBackupProgress({ total: 0, current: 0, currentPlugin: '', phase: 'done' });
                 return;
             }
 
-            addLog(t('Cloud.Notices.FoundCloudSources', { count: manifest.length }));
-            setBackupProgress({ total: manifest.length, current: 0, currentPlugin: '', phase: 'downloading' });
-
-            let restored = 0;
-            let skipped = 0;
-
-            for (let i = 0; i < manifest.length; i++) {
-                const entry = manifest[i];
-                setBackupProgress({
-                    total: manifest.length,
-                    current: i,
-                    currentPlugin: entry.title || entry.plugin,
-                    phase: 'downloading',
-                });
-
-                try {
-                    // 检查本地是否已有且 hash 一致
-                    const existingSource = i18n.sourceManager.getSource(entry.id);
-                    if (existingSource) {
-                        const localPath = i18n.sourceManager.getSourceFilePath(entry.id);
-                        if (localPath && fs.existsSync(localPath)) {
-                            const localContent = fs.readFileSync(localPath, 'utf-8');
-                            const localHash = simpleHash(localContent);
-                            if (localHash === entry.hash) {
-                                addLog(t('Cloud.Notices.SkipLocalLatest', { title: entry.title || entry.plugin }));
-                                skipped++;
-                                continue;
-                            }
-                        }
-                    }
-
-                    // 下载文件
-                    const fileRes = await i18n.api.github.getFileContentWithFallback(username, userRepo, getCloudFilePath(entry.id, entry.type));
-                    if (!fileRes.state || !fileRes.data) {
-                        const errorDetail = fileRes.isRateLimit ? t('Cloud.Hints.RateLimitTitle') : (fileRes.data?.message || fileRes.data || '');
-                        addLog(`${t('Cloud.Errors.DownloadFailItem', { title: entry.title || entry.plugin })}: ${errorDetail}`);
-                        continue;
-                    }
-
-                    const content = typeof fileRes.data === 'string' ? JSON.parse(fileRes.data) : fileRes.data;
-
-                    // 保存到本地
-                    i18n.sourceManager.saveSourceFile(entry.id, content);
-
-                    // 更新或创建元数据
-                    const sourceInfo: TranslationSource = {
-                        id: entry.id,
-                        plugin: entry.plugin,
-                        title: entry.title || t('Cloud.Labels.UnnamedTranslation'),
-                        type: entry.type,
-                        origin: 'cloud',
-                        isActive: existingSource?.isActive || false,
-                        checksum: calculateChecksum(content),
-                        cloud: { owner: username, repo: userRepo, hash: entry.hash },
-                        updatedAt: Date.now(),
-                        createdAt: existingSource?.createdAt || Date.now(),
-                    };
-                    const shouldActivate = !existingSource && !i18n.sourceManager.hasAnySources(entry.plugin);
-                    i18n.sourceManager.saveSource(sourceInfo, { activate: shouldActivate });
-
-                    restored++;
-                    addLog(t('Cloud.Notices.RestoreSuccessItem', { title: entry.title || entry.plugin }));
-                } catch (e) {
-                    addLog(t('Cloud.Errors.ProcessingFailItem', { title: entry.title || entry.plugin, error: `${e}` }));
-                }
-            }
-
-            setRepoManifest(manifest);
+            setRepoManifest(manifest as ManifestEntry[]);
+            i18n.sourceManager.reloadFromDisk();
             useGlobalStoreInstance.getState().triggerSourceUpdate();
-            setBackupProgress({ total: manifest.length, current: manifest.length, currentPlugin: '', phase: 'done' });
-            addLog(t('Cloud.Notices.RestoreCompleteStat', { restored, skipped }));
-            i18n.notice.successPrefix(t('Common.Notices.Success'), t('Cloud.Notices.RestoreSuccessCount', { count: restored }));
+            setBackupProgress({ total: result.total || manifest.length, current: result.total || manifest.length, currentPlugin: '', phase: 'done' });
+            addLog(t('Cloud.Notices.RestoreCompleteStat', { restored: result.restored || 0, skipped: result.skipped || 0 }));
+            i18n.notice.successPrefix(t('Common.Notices.Success'), t('Cloud.Notices.RestoreSuccessCount', { count: result.restored || 0 }));
         } catch (error) {
             console.error(t('Cloud.Errors.RestoreFail'), error);
             addLog(t('Cloud.Errors.RestoreErrorMsg', { error: `${error}` }));
@@ -500,7 +310,7 @@ export const BackupSyncTab: React.FC = () => {
                                 </Button>
                                 <Button
                                     className="flex-1"
-                                    onClick={() => handleBackup(false)}
+                                    onClick={() => backupDialogMode === 'backup' ? handleBackup(false) : handleRestore()}
                                 >
                                     {backupDialogMode === 'backup' ? (
                                         <><Upload className="w-4 h-4 mr-2" />{t('Cloud.Actions.StartBackup')}</>

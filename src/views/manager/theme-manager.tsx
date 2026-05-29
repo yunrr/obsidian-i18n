@@ -25,7 +25,6 @@ import type {
     CompanionTaskProgress,
     CompanionThemeBatchExtractPayload,
     CompanionThemeBatchTranslatePayload,
-    CompanionThemeExtractPayload,
     CompanionThemeFailureRetryPayload,
     CompanionTranslationConfig,
 } from '~/manager/companion-worker-manager';
@@ -51,6 +50,7 @@ interface ThemeInfo {
     name: string;
     manifest: OBThemeManifest | null;
     dir: string;
+    themeCssPath?: string;
     isActive: boolean;
 }
 
@@ -142,9 +142,11 @@ const getCompanionExtractionSettings = (settings: I18N['settings']): CompanionEx
     reDatas: settings.reDatas,
     reRejectRe: settings.reRejectRe,
     reValidRe: settings.reValidRe,
+    chineseSkipMode: settings.chineseSkipMode || 'source',
     astAssignments: settings.astAssignments,
     astFunctions: settings.astFunctions,
     astKeys: settings.astKeys,
+    astMaxLength: settings.astMaxLength ?? 300,
     astRejectRe: settings.astRejectRe,
     astValidRe: settings.astValidRe,
 });
@@ -246,53 +248,74 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
     ], [t]);
 
     useEffect(() => {
-        const loadThemes = () => {
-            try {
-                // @ts-ignore
-                const basePath = path.normalize(app.vault.adapter.getBasePath());
-                const themesDir = path.join(basePath, '.obsidian', 'themes');
+        let disposed = false;
+        const loadThemes = async () => {
+            const fallbackLoadThemes = () => {
+                try {
+                    // @ts-ignore
+                    const basePath = path.normalize(app.vault.adapter.getBasePath());
+                    const themesDir = path.join(basePath, '.obsidian', 'themes');
 
-                if (!fs.existsSync(themesDir)) {
-                    setThemes([]);
-                    return;
-                }
-
-                const entries = fs.readdirSync(themesDir, { withFileTypes: true });
-                const themeList: ThemeInfo[] = [];
-                // @ts-ignore
-                const currentTheme = app.customCss?.theme || '';
-
-                for (const entry of entries) {
-                    if (!entry.isDirectory()) continue;
-                    const themeDir = path.join(themesDir, entry.name);
-                    const manifestPath = path.join(themeDir, 'manifest.json');
-
-                    let manifest: OBThemeManifest | null = null;
-                    if (fs.existsSync(manifestPath)) {
-                        try {
-                            manifest = fs.readJsonSync(manifestPath);
-                        } catch (e) {
-                            // ignore invalid manifest
-                        }
+                    if (!fs.existsSync(themesDir)) {
+                        setThemes([]);
+                        return;
                     }
 
-                    themeList.push({
-                        name: entry.name,
-                        manifest,
-                        dir: themeDir,
-                        isActive: entry.name === currentTheme,
-                    });
-                }
+                    const entries = fs.readdirSync(themesDir, { withFileTypes: true });
+                    const themeList: ThemeInfo[] = [];
+                    // @ts-ignore
+                    const currentTheme = app.customCss?.theme || '';
 
-                setThemes(themeList);
+                    for (const entry of entries) {
+                        if (!entry.isDirectory()) continue;
+                        const themeDir = path.join(themesDir, entry.name);
+                        const manifestPath = path.join(themeDir, 'manifest.json');
+
+                        let manifest: OBThemeManifest | null = null;
+                        if (fs.existsSync(manifestPath)) {
+                            try {
+                                manifest = fs.readJsonSync(manifestPath);
+                            } catch (e) {
+                            }
+                        }
+
+                        themeList.push({
+                            name: entry.name,
+                            manifest,
+                            dir: themeDir,
+                            themeCssPath: path.join(themeDir, 'theme.css'),
+                            isActive: entry.name === currentTheme,
+                        });
+                    }
+
+                    setThemes(themeList);
+                } catch (error) {
+                    console.error('[i18n] Failed to load themes:', error);
+                    setThemes([]);
+                }
+            };
+
+            try {
+                const discovered = await i18n.companionWorkerManager.discoverThemes();
+                if (disposed) return;
+                // @ts-ignore
+                const currentTheme = app.customCss?.theme || '';
+                setThemes(discovered.map(theme => ({
+                    name: theme.name,
+                    manifest: theme.manifest,
+                    dir: theme.dir,
+                    themeCssPath: theme.themeCssPath,
+                    isActive: theme.name === currentTheme,
+                })));
             } catch (error) {
-                console.error('[i18n] Failed to load themes:', error);
-                setThemes([]);
+                console.warn('[i18n] Failed to load themes from worker, falling back to filesystem scan:', error);
+                if (!disposed) fallbackLoadThemes();
             }
         };
 
         loadThemes();
-    }, [app, refreshKey]);
+        return () => { disposed = true; };
+    }, [app, refreshKey, i18n]);
 
     const sourceIndex = useMemo(() => {
         const byTheme: Record<string, any[]> = {};
@@ -353,7 +376,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
 
         for (const theme of themes) {
             const themeDir = theme.dir;
-            const themeCssPath = path.join(themeDir, 'theme.css');
+            const themeCssPath = theme.themeCssPath || path.join(themeDir, 'theme.css');
             const sources = sourceIndex.byTheme[theme.name] || [];
             const activeSourceId = sourceIndex.activeByTheme[theme.name] || null;
             const translationPath = activeSourceId ? i18n.sourceManager.getSourceFilePath(activeSourceId) : '';
@@ -525,7 +548,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
 
         let progress = started.progress;
         while (progress.status === 'queued' || progress.status === 'running') {
-            await new Promise(resolve => window.setTimeout(resolve, 300));
+            await new Promise(resolve => window.setTimeout(resolve, 150));
             const status = await i18n.companionWorkerManager.getTaskStatus(started.taskId);
             progress = status.progress;
             syncWorkerProgress(progress);
@@ -547,14 +570,40 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             }))
             : extractableThemes.map(theme => ({ resourceId: theme.name, label: theme.name }));
 
+        const completedResources = resume ? themeExtractCheckpoint?.completedResources || 0 : 0;
+        const totalResources = resume ? themeExtractCheckpoint?.totalResources || resources.length : resources.length;
+
         if (batchTask.isRunning || resources.length === 0) return;
+
+        const themeMap = new Map(themes.map(theme => [theme.name, theme]));
+        const workerResources = resources.flatMap(resource => {
+            const theme = themeMap.get(resource.resourceId);
+            const data = allThemeStates[resource.resourceId];
+            if (!theme || !data) return [];
+            return [{
+                resourceId: resource.resourceId,
+                label: resource.label,
+                themeName: theme.name,
+                themeDir: theme.dir,
+                themeCssPath: data.themeCssPath,
+            }];
+        });
+
+        if (workerResources.length === 0) {
+            new Notice(t('Manager.Themes.Errors.ThemeCssNotFound'));
+            return;
+        }
+
+        const skippedResumeResources = Math.max(0, resources.length - workerResources.length);
+        const displayedCompletedResources = resume ? completedResources + skippedResumeResources : completedResources;
+        const displayedTotalResources = resume ? totalResources : workerResources.length;
 
         setBatchTask({
             mode: 'extract',
             isRunning: true,
             currentLabel: '',
-            processedResources: 0,
-            totalResources: resources.length,
+            processedResources: displayedCompletedResources,
+            totalResources: displayedTotalResources,
             processedItems: 0,
             totalItems: 0,
             successCount: 0,
@@ -563,26 +612,14 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
         });
 
         try {
-            const themeMap = new Map(themes.map(theme => [theme.name, theme]));
-            const workerResources: CompanionThemeExtractPayload[] = resources.map(resource => {
-                const theme = themeMap.get(resource.resourceId);
-                const data = allThemeStates[resource.resourceId];
-                if (!theme || !data) throw new Error(t('Manager.Themes.Errors.ThemeCssNotFound'));
-                return {
-                    resourceId: resource.resourceId,
-                    label: resource.label,
-                    themeName: theme.name,
-                    themeDir: theme.dir,
-                    themeCssPath: data.themeCssPath,
-                    settings: getCompanionExtractionSettings(i18n.settings),
-                };
-            });
             const payload: CompanionThemeBatchExtractPayload = {
                 persistence: { basePath: i18n.sourceManager.getBasePath() },
                 resources: workerResources,
+                settings: getCompanionExtractionSettings(i18n.settings),
                 concurrency: getPositiveInt(i18n.settings.batchExtractConcurrency, 3),
                 checkpointKey: THEME_EXTRACT_CHECKPOINT_KEY,
-                completedResources: themeExtractCheckpoint?.completedResources || 0,
+                completedResources: displayedCompletedResources,
+                totalResources: displayedTotalResources,
             };
             const progress = await runWorkerTask('theme-batch-extract', payload);
             if (progress.status === 'cancelled') {
@@ -617,7 +654,12 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
 
         if (batchTask.isRunning || resources.length === 0) return;
 
-        const totalItems = resources.reduce((sum, resource) => {
+        const completedResources = resume ? themeTranslateCheckpoint?.completedResources || 0 : 0;
+        const totalResources = resume ? themeTranslateCheckpoint?.totalResources || resources.length : resources.length;
+        const processedItems = resume ? themeTranslateCheckpoint?.processedItems || 0 : 0;
+        const totalItems = resume ? themeTranslateCheckpoint?.totalItems || resources.reduce((sum, resource) => {
+            return sum + (allThemeStates[resource.resourceId]?.pendingTranslationCount || 0);
+        }, 0) : resources.reduce((sum, resource) => {
             return sum + (allThemeStates[resource.resourceId]?.pendingTranslationCount || 0);
         }, 0);
 
@@ -625,9 +667,9 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             mode: 'translate',
             isRunning: true,
             currentLabel: '',
-            processedResources: 0,
-            totalResources: resources.length,
-            processedItems: 0,
+            processedResources: completedResources,
+            totalResources,
+            processedItems,
             totalItems,
             successCount: 0,
             failedCount: 0,
@@ -641,8 +683,9 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                 config: getCompanionTranslationConfig(i18n.settings),
                 checkpointKey: THEME_TRANSLATE_CHECKPOINT_KEY,
                 concurrency: getPositiveInt(i18n.settings.batchTranslateConcurrency, 2),
-                completedResources: themeTranslateCheckpoint?.completedResources || 0,
-                processedItems: themeTranslateCheckpoint?.processedItems || 0,
+                completedResources,
+                totalResources,
+                processedItems,
                 totalItems,
             };
             const progress = await runWorkerTask('theme-batch-translate', payload);
@@ -666,10 +709,12 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
     const handleStopBatchTask = useCallback(() => {
         const taskId = taskIdRef.current;
         if (taskId) {
-            i18n.companionWorkerManager.cancelTask(taskId).catch(error => console.warn('[i18n] Failed to cancel companion task:', error));
+            i18n.companionWorkerManager.cancelTask(taskId)
+                .then(({ progress }) => syncWorkerProgress(progress))
+                .catch(error => console.warn('[i18n] Failed to cancel companion task:', error));
         }
         setBatchTask(prev => ({ ...prev, currentLabel: t('Manager.Common.Status.Stopping', '正在停止') }));
-    }, [i18n, t]);
+    }, [i18n, syncWorkerProgress, t]);
 
     const handleRetryThemeFailures = useCallback(async () => {
         if (batchTask.isRunning || themeFailureRecords.length === 0) return;

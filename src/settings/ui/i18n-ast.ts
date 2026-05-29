@@ -66,6 +66,20 @@ export default class I18nAST extends BaseSetting {
             .setName(t('Settings.Ast.RegexHeader'))
             .setHeading();
 
+        // 内容长度上限
+        new Setting(containerEl)
+            .setName(t('Settings.Ast.MaxLengthTitle'))
+            .setDesc(t('Settings.Ast.MaxLengthDesc'))
+            .addSlider(slider => slider
+                .setDynamicTooltip()
+                .setLimits(0, 3000, 100)
+                .setValue(this.settings.astMaxLength ?? 300)
+                .onChange(async (value) => {
+                    this.settings.astMaxLength = value;
+                    await this.i18n.saveSettings();
+                })
+            );
+
         // 排除正则列表
         new Setting(containerEl)
             .setName(t('Settings.Ast.RejectReTitle'))

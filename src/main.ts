@@ -110,7 +110,7 @@ export default class I18N extends Plugin {
 
     async onunload() {
         this.view.deactivateAllViews(); // 卸载所有视图
-        this.companionWorkerManager?.stop();
+        await this.companionWorkerManager?.stopAsync();
         if (this.settings.modeImt) this.coreManager.deactivateIMT();  // 卸载沉浸式翻译
         this.cleanupDevDebug();
     }
@@ -134,7 +134,10 @@ export default class I18N extends Plugin {
         await this.migrateLLMProfiles();
     }
     // [配置类] 保存
-    public async saveSettings() { await this.saveData(this.settings); }
+    public async saveSettings() {
+        await this.saveData(this.settings);
+        useGlobalStoreInstance.getState().triggerSettingsUpdate();
+    }
 
     /**
      * 统一迁移所有旧版服务商配置到多 Profile 结构

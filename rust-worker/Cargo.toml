@@ -6,7 +6,9 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0"
 axum = { version = "0.7", features = ["macros"] }
+base64 = "0.22"
 brotli = "8.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 flate2 = "1.0"
 hex = "0.4"
 nanoid = "0.4"
