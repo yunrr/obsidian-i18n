@@ -12,12 +12,16 @@ import type { BatchTaskCheckpoint, BatchTaskFailureRecord, BatchTaskRecordMeta, 
 import type {
     CompanionProxyRequest,
     CompanionProxyResponse,
+    CompanionAstReplaceRequest,
+    CompanionAstReplaceResponse,
     CompanionCodeExtractRequest,
     CompanionCodeExtractResponse,
+    CompanionPluginApplyTranslationRequest,
     CompanionPluginExtractPayload,
     CompanionPluginExtractResult,
     CompanionThemeExtractPayload,
     CompanionThemeExtractResult,
+    CompanionThemeApplyTranslationRequest,
     CompanionTranslationConfig,
     CompanionBatchFailure,
     CompanionAsyncTaskType,
@@ -445,6 +449,142 @@ async function handleCodeExtract(payload: CompanionCodeExtractRequest): Promise<
             state: false,
             ast: [],
             regex: [],
+            error: error instanceof Error ? error.message : String(error),
+        };
+    }
+}
+
+function safeJoin(baseDir: string, relativePath: string) {
+    const base = path.resolve(baseDir);
+    const target = path.resolve(base, relativePath);
+    if (target !== base && !target.startsWith(base + path.sep)) {
+        throw new Error(`Unsafe path: ${relativePath}`);
+    }
+    return target;
+}
+
+async function createWorkerBackup(backupBasePath: string, resourceId: string, resourceDir: string, files: string[]) {
+    const backupDir = path.join(backupBasePath, 'backups', resourceId);
+    await fs.ensureDir(backupDir);
+
+    for (const file of files) {
+        const originalPath = safeJoin(resourceDir, file);
+        if (!await fs.pathExists(originalPath)) continue;
+
+        const backupPath = path.join(backupDir, `${file}.gz`);
+        if (await fs.pathExists(backupPath)) continue;
+
+        await fs.ensureDir(path.dirname(backupPath));
+        const content = await fs.readFile(originalPath);
+        await fs.writeFile(backupPath, zlib.gzipSync(content));
+    }
+
+    for (const legacyPath of [
+        path.join(backupBasePath, 'backups', `${resourceId}.js.gz`),
+        path.join(backupBasePath, 'backups', `${resourceId}.js`),
+    ]) {
+        await fs.remove(legacyPath).catch(() => undefined);
+    }
+}
+
+async function readWorkerBackupContent(backupBasePath: string, resourceId: string, file: string) {
+    const backupPath = path.join(backupBasePath, 'backups', resourceId, `${file}.gz`);
+    if (await fs.pathExists(backupPath)) {
+        return zlib.gunzipSync(await fs.readFile(backupPath)).toString('utf8');
+    }
+    if (file === 'main.js') {
+        const legacyPath = path.join(backupBasePath, 'backups', `${resourceId}.js.gz`);
+        if (await fs.pathExists(legacyPath)) {
+            return zlib.gunzipSync(await fs.readFile(legacyPath)).toString('utf8');
+        }
+    }
+    return null;
+}
+
+async function handleAstReplace(payload: CompanionAstReplaceRequest): Promise<CompanionAstReplaceResponse> {
+    try {
+        const translator = new AstTranslator({} as any);
+        const ast = translator.loadCode(payload.code);
+        if (!ast) throw new Error('AST parse failed');
+        return { state: true, code: translator.translate(ast, payload.translations as any) };
+    } catch (error) {
+        return { state: false, code: payload.code, error: error instanceof Error ? error.message : String(error) };
+    }
+}
+
+async function handlePluginApplyTranslation(payload: CompanionPluginApplyTranslationRequest) {
+    try {
+        const dict = payload.translationJson.dict || {};
+        const files = Object.keys(dict);
+        await createWorkerBackup(payload.backupBasePath, payload.pluginId, payload.pluginDir, files);
+
+        let processedFiles = 0;
+        for (const file of files) {
+            const targetFilePath = safeJoin(payload.pluginDir, file);
+            if (!await fs.pathExists(targetFilePath)) continue;
+
+            let fileString = await readWorkerBackupContent(payload.backupBasePath, payload.pluginId, file)
+                || await fs.readFile(targetFilePath, 'utf8');
+            const fileDict = dict[file];
+
+            if (fileDict?.ast?.length) {
+                const astTranslator = new AstTranslator({} as any);
+                const ast = astTranslator.loadCode(fileString);
+                if (ast) fileString = astTranslator.translate(ast, fileDict.ast as any);
+            }
+            if (fileDict?.regex?.length) {
+                const regexTranslator = new RegexTranslator({} as any);
+                fileString = regexTranslator.translate(fileString, fileDict.regex as any);
+            }
+
+            await fs.writeFile(targetFilePath, fileString);
+            processedFiles++;
+        }
+
+        return {
+            state: true,
+            processedFiles,
+            translationVersion: payload.translationJson.metadata?.version || '0.0.0',
+        };
+    } catch (error) {
+        return {
+            state: false,
+            processedFiles: 0,
+            translationVersion: payload.translationJson?.metadata?.version || '0.0.0',
+            error: error instanceof Error ? error.message : String(error),
+        };
+    }
+}
+
+function applyThemeSettingsTranslations(css: string, translations: Array<{ source?: string; target?: string }>) {
+    return css.replace(/\/\* @settings([\s\S]*?)\*\//g, (block) => {
+        let output = block;
+        for (const item of translations) {
+            if (!item.source || !item.target || item.source === item.target) continue;
+            output = output.split(item.source).join(item.target);
+        }
+        return output;
+    });
+}
+
+async function handleThemeApplyTranslation(payload: CompanionThemeApplyTranslationRequest) {
+    try {
+        await createWorkerBackup(payload.backupBasePath, payload.themeId, payload.themeDir, ['theme.css']);
+        const backupCss = await readWorkerBackupContent(payload.backupBasePath, payload.themeId, 'theme.css');
+        const sourceCss = backupCss || await fs.readFile(payload.themeCssPath, 'utf8');
+        const translatedCss = applyThemeSettingsTranslations(sourceCss, payload.translationJson.dict || []);
+        await fs.writeFile(payload.themeCssPath, translatedCss);
+
+        return {
+            state: true,
+            processedFiles: 1,
+            translationVersion: payload.translationJson.metadata?.version || '0.0.0',
+        };
+    } catch (error) {
+        return {
+            state: false,
+            processedFiles: 0,
+            translationVersion: payload.translationJson?.metadata?.version || '0.0.0',
             error: error instanceof Error ? error.message : String(error),
         };
     }
@@ -1402,6 +1542,9 @@ async function handleTask(type: string, payload: any) {
     if (type === 'plugin-extract') return handlePluginExtract(payload);
     if (type === 'theme-extract') return handleThemeExtract(payload);
     if (type === 'code-extract') return handleCodeExtract(payload);
+    if (type === 'ast-replace') return handleAstReplace(payload);
+    if (type === 'plugin-apply-translation') return handlePluginApplyTranslation(payload);
+    if (type === 'theme-apply-translation') return handleThemeApplyTranslation(payload);
     if (type === 'plugin-translate') return handlePluginTranslate(payload);
     if (type === 'theme-translate') return handleThemeTranslate(payload);
     if (type === 'plugin-retry') return handlePluginRetry(payload);

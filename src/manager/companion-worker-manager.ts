@@ -54,7 +54,6 @@ export type {
     CompanionGithubReadRequest,
     CompanionGithubReadResponse,
     CompanionGithubWriteRequest,
-    CompanionGithubWriteResponse,
     CompanionExtractResult,
     CompanionPluginApplyTranslationRequest,
     CompanionPluginBatchExtractPayload,
@@ -95,27 +94,32 @@ export type {
     CompanionTranslateResult,
 } from './companion-worker-types';
 
+type WorkerBackend = 'rust' | 'cjs';
+
+interface WorkerRuntime {
+    process: ChildProcess | null;
+    endpoint: string;
+    startPromise: Promise<boolean> | null;
+}
+
 export class CompanionWorkerManager {
-    private workerProcess: ChildProcess | null = null;
-    private endpoint = '';
-    private startPromise: Promise<boolean> | null = null;
+    private readonly runtimes: Record<WorkerBackend, WorkerRuntime> = {
+        rust: { process: null, endpoint: '', startPromise: null },
+        cjs: { process: null, endpoint: '', startPromise: null },
+    };
     private readonly rustWorkerPath: string;
+    private readonly cjsWorkerPath: string;
     private readonly normalizedPluginDir: string;
+    private readonly taskBackends = new Map<string, WorkerBackend>();
 
     constructor(private readonly plugin: I18N, private readonly pluginDir: string) {
-        this.rustWorkerPath = path.join(pluginDir, 'i18n-companion-worker.cjs');
+        this.rustWorkerPath = path.join(pluginDir, process.platform === 'win32' ? 'i18n-companion-worker.exe' : 'i18n-companion-worker');
+        this.cjsWorkerPath = path.join(pluginDir, 'i18n-companion-worker.cjs');
         this.normalizedPluginDir = path.resolve(pluginDir);
     }
 
     public async start(): Promise<boolean> {
-        if (!this.plugin.settings.llmCompanionWorkerEnabled) return false;
-        if (this.endpoint) return true;
-        if (this.startPromise) return this.startPromise;
-
-        this.startPromise = this.startInner().finally(() => {
-            this.startPromise = null;
-        });
-        return this.startPromise;
+        return this.startBackend('rust');
     }
 
     public stop(): void {
@@ -123,61 +127,33 @@ export class CompanionWorkerManager {
     }
 
     public async stopAsync(): Promise<void> {
-        const endpoint = this.endpoint || `http://127.0.0.1:${this.getPort()}`;
-        const worker = this.workerProcess;
-
-        this.endpoint = '';
-        this.workerProcess = null;
-
-        try {
-            await Promise.race([
-                requestUrl({ url: `${endpoint}/shutdown`, method: 'POST', throw: false }),
-                new Promise((_, reject) => setTimeout(() => reject(new Error('shutdown timeout')), 500)),
-            ]);
-        } catch {
-            if (worker && !worker.killed) worker.kill();
-            return;
-        }
-
-        if (worker && !worker.killed) {
-            setTimeout(() => {
-                if (!worker.killed) worker.kill();
-            }, 1000);
-        }
+        await Promise.all([
+            this.stopBackend('rust'),
+            this.stopBackend('cjs'),
+        ]);
+        this.taskBackends.clear();
     }
 
     public async proxyRequest(request: CompanionProxyRequest): Promise<CompanionProxyResponse> {
-        const started = await this.start();
-        if (!started || !this.endpoint) throw new Error('本地伴生服务未启动');
-
-        const response = await requestUrl({
-            url: `${this.endpoint}/proxy`,
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(request),
-            throw: false,
-        });
-
-        const payload = response.json || (response.text ? JSON.parse(response.text) : null);
-        if (!payload?.ok || !payload.response) {
-            throw new Error(payload?.error || `本地伴生服务返回异常 (${response.status})`);
+        const response = await this.postRaw('rust', '/proxy', request);
+        if (!response?.ok || !response.response) {
+            throw new Error(response?.error || 'Local companion worker returned an invalid proxy response');
         }
-
-        return payload.response;
+        return response.response;
     }
 
     public async githubRead(request: CompanionGithubReadRequest): Promise<CompanionGithubReadResponse> {
-        const response = await this.postWorker<{ result: CompanionGithubReadResponse }>('/github/read', request);
+        const response = await this.postWorker<{ result: CompanionGithubReadResponse }>('rust', '/github/read', request);
         return response.result;
     }
 
     public async githubWrite(request: CompanionGithubWriteRequest): Promise<CompanionGithubWriteResponse> {
-        const response = await this.postWorker<{ result: CompanionGithubWriteResponse }>('/github/write', request);
+        const response = await this.postWorker<{ result: CompanionGithubWriteResponse }>('rust', '/github/write', request);
         return response.result;
     }
 
     public async autoMatch(request: CompanionAutoMatchRequest): Promise<CompanionAutoMatchResponse> {
-        const response = await this.postWorker<{ result: CompanionAutoMatchResponse }>('/automation/match', request);
+        const response = await this.postWorker<{ result: CompanionAutoMatchResponse }>('rust', '/automation/match', request);
         return response.result;
     }
 
@@ -218,12 +194,12 @@ export class CompanionWorkerManager {
     }
 
     public async runTask<TResult>(type: CompanionBatchTaskType, payload: unknown, signal?: AbortSignal): Promise<TResult> {
-        const started = await this.start();
-        if (!started || !this.endpoint) throw new Error('本地伴生服务未启动');
+        const backend = this.getTaskBackend(type);
+        const endpoint = await this.getEndpoint(backend);
 
         return new Promise<TResult>((resolve, reject) => {
             const abortHandler = () => {
-                this.stop();
+                void this.stopBackend(backend);
                 const abortError = new Error('AbortError');
                 abortError.name = 'AbortError';
                 reject(abortError);
@@ -232,7 +208,7 @@ export class CompanionWorkerManager {
             signal?.addEventListener('abort', abortHandler, { once: true });
 
             requestUrl({
-                url: `${this.endpoint}/task`,
+                url: `${endpoint}/task`,
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ type, payload }),
@@ -241,7 +217,7 @@ export class CompanionWorkerManager {
                 signal?.removeEventListener('abort', abortHandler);
                 const responsePayload = response.json || (response.text ? JSON.parse(response.text) : null);
                 if (!responsePayload?.ok) {
-                    reject(new Error(responsePayload?.error || `本地伴生服务返回异常 (${response.status})`));
+                    reject(new Error(responsePayload?.error || `Local companion worker returned ${response.status}`));
                     return;
                 }
                 resolve(responsePayload.result as TResult);
@@ -253,146 +229,204 @@ export class CompanionWorkerManager {
     }
 
     public async startTask(type: CompanionAsyncTaskType, payload: unknown): Promise<CompanionTaskStartResponse> {
-        const response = await this.postWorker<{ taskId: string; progress: CompanionTaskProgress }>('/task/start', { type, payload });
+        const backend = this.getTaskBackend(type);
+        const response = await this.postWorker<{ taskId: string; progress: CompanionTaskProgress }>(backend, '/task/start', { type, payload });
+        if (response.taskId) this.taskBackends.set(response.taskId, backend);
         return response;
     }
 
     public async getTaskStatus(taskId: string): Promise<CompanionTaskStatusResponse> {
+        const backend = this.taskBackends.get(taskId) || 'rust';
+        const endpoint = await this.getEndpoint(backend);
         const query = encodeURIComponent(taskId);
-        const started = await this.start();
-        if (!started || !this.endpoint) throw new Error('本地伴生服务未启动');
 
         const response = await requestUrl({
-            url: `${this.endpoint}/task/status?id=${query}`,
+            url: `${endpoint}/task/status?id=${query}`,
             method: 'GET',
             throw: false,
         });
 
         const payload = response.json || (response.text ? JSON.parse(response.text) : null);
         if (!payload?.ok || !payload.progress) {
-            throw new Error(payload?.error || `本地伴生服务返回异常 (${response.status})`);
+            throw new Error(payload?.error || `Local companion worker returned ${response.status}`);
         }
 
+        if (payload.progress.status === 'completed' || payload.progress.status === 'cancelled' || payload.progress.status === 'failed') {
+            this.taskBackends.delete(taskId);
+        }
         return { progress: payload.progress as CompanionTaskProgress };
     }
 
     public async cancelTask(taskId: string): Promise<CompanionTaskCancelResponse> {
-        return this.postWorker<CompanionTaskCancelResponse>('/task/cancel', { taskId });
+        const backend = this.taskBackends.get(taskId) || 'rust';
+        return this.postWorker<CompanionTaskCancelResponse>(backend, '/task/cancel', { taskId });
     }
 
     public async discoverPlugins(): Promise<CompanionDiscoveredPlugin[]> {
-        const response = await this.getWorker<{ plugins: CompanionDiscoveredPlugin[] }>('/resources/plugins');
+        const response = await this.getWorker<{ plugins: CompanionDiscoveredPlugin[] }>('rust', '/resources/plugins');
         return response.plugins || [];
     }
 
     public async discoverThemes(): Promise<CompanionDiscoveredTheme[]> {
-        const response = await this.getWorker<{ themes: CompanionDiscoveredTheme[] }>('/resources/themes');
+        const response = await this.getWorker<{ themes: CompanionDiscoveredTheme[] }>('rust', '/resources/themes');
         return response.themes || [];
     }
 
-    private async getWorker<TResult>(route: string): Promise<TResult> {
-        const started = await this.start();
-        if (!started || !this.endpoint) throw new Error('本地伴生服务未启动');
-
-        const response = await requestUrl({
-            url: `${this.endpoint}${route}`,
-            method: 'GET',
-            throw: false,
-        });
-
-        const payload = response.json || (response.text ? JSON.parse(response.text) : null);
-        if (!payload?.ok) {
-            throw new Error(payload?.error || `本地伴生服务返回异常 (${response.status})`);
+    private getTaskBackend(type: CompanionBatchTaskType | CompanionAsyncTaskType): WorkerBackend {
+        if (
+            type === 'plugin-extract' ||
+            type === 'theme-extract' ||
+            type === 'plugin-batch-extract' ||
+            type === 'theme-batch-extract' ||
+            type === 'code-extract' ||
+            type === 'ast-replace' ||
+            type === 'plugin-apply-translation' ||
+            type === 'theme-apply-translation'
+        ) {
+            return 'cjs';
         }
+        return 'rust';
+    }
 
+    private async getEndpoint(backend: WorkerBackend): Promise<string> {
+        const started = await this.startBackend(backend);
+        const endpoint = this.runtimes[backend].endpoint;
+        if (!started || !endpoint) throw new Error(`Local ${backend} companion worker is not running`);
+        return endpoint;
+    }
+
+    private async getWorker<TResult>(backend: WorkerBackend, route: string): Promise<TResult> {
+        const endpoint = await this.getEndpoint(backend);
+        const response = await requestUrl({ url: `${endpoint}${route}`, method: 'GET', throw: false });
+        const payload = response.json || (response.text ? JSON.parse(response.text) : null);
+        if (!payload?.ok) throw new Error(payload?.error || `Local companion worker returned ${response.status}`);
         return payload as TResult;
     }
 
-    private async postWorker<TResult>(route: string, body: unknown): Promise<TResult> {
-        const started = await this.start();
-        if (!started || !this.endpoint) throw new Error('本地伴生服务未启动');
+    private async postWorker<TResult>(backend: WorkerBackend, route: string, body: unknown): Promise<TResult> {
+        const payload = await this.postRaw(backend, route, body);
+        if (!payload?.ok) throw new Error(payload?.error || 'Local companion worker returned an invalid response');
+        return payload as TResult;
+    }
 
+    private async postRaw(backend: WorkerBackend, route: string, body: unknown): Promise<any> {
+        const endpoint = await this.getEndpoint(backend);
         const response = await requestUrl({
-            url: `${this.endpoint}${route}`,
+            url: `${endpoint}${route}`,
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body),
             throw: false,
         });
-
-        const payload = response.json || (response.text ? JSON.parse(response.text) : null);
-        if (!payload?.ok) {
-            throw new Error(payload?.error || `本地伴生服务返回异常 (${response.status})`);
-        }
-
-        return payload as TResult;
+        return response.json || (response.text ? JSON.parse(response.text) : null);
     }
 
-    private async startInner(): Promise<boolean> {
+    private async startBackend(backend: WorkerBackend): Promise<boolean> {
+        if (!this.plugin.settings.llmCompanionWorkerEnabled) return false;
+        const runtime = this.runtimes[backend];
+        if (runtime.endpoint) return true;
+        if (runtime.startPromise) return runtime.startPromise;
+
+        runtime.startPromise = this.startBackendInner(backend).finally(() => {
+            runtime.startPromise = null;
+        });
+        return runtime.startPromise;
+    }
+
+    private async startBackendInner(backend: WorkerBackend): Promise<boolean> {
         try {
-            const port = this.getPort();
+            const port = this.getPort(backend);
             const endpoint = `http://127.0.0.1:${port}`;
             if (await this.isWorkerReady(endpoint, 500)) {
-                this.endpoint = endpoint;
+                this.runtimes[backend].endpoint = endpoint;
                 return true;
             }
-            if (!existsSync(this.rustWorkerPath)) {
-                throw new Error(`Rust 伴生 worker 不存在: ${this.rustWorkerPath}`);
+
+            if (backend === 'rust') {
+                if (!existsSync(this.rustWorkerPath)) {
+                    throw new Error(`Rust companion worker not found: ${this.rustWorkerPath}`);
+                }
+                return this.spawnWorker(backend, this.rustWorkerPath, [String(port)], port);
+            }
+
+            if (!existsSync(this.cjsWorkerPath)) {
+                throw new Error(`CJS companion worker not found: ${this.cjsWorkerPath}`);
             }
             const nodePath = this.plugin.settings.llmCompanionNodePath?.trim() || 'node';
-            return this.spawnWorker(nodePath, [this.rustWorkerPath, String(port)], port);
+            return this.spawnWorker(backend, nodePath, [this.cjsWorkerPath, String(port)], port);
         } catch (error) {
-            console.warn('[I18N Companion] 启动失败', error);
-            this.stop();
+            console.warn(`[I18N Companion] Failed to start ${backend} worker`, error);
+            await this.stopBackend(backend);
             return false;
         }
     }
 
-    private async spawnWorker(command: string, args: string[], port: number, extraEnv?: Record<string, string>, quiet = false): Promise<boolean> {
-        try {
-            const worker = spawn(command, args, {
-                cwd: this.pluginDir,
-                windowsHide: true,
-                stdio: ['pipe', 'pipe', 'pipe'],
-                env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
-            });
+    private async spawnWorker(backend: WorkerBackend, command: string, args: string[], port: number): Promise<boolean> {
+        const runtime = this.runtimes[backend];
+        const worker = spawn(command, args, {
+            cwd: this.pluginDir,
+            windowsHide: true,
+            stdio: ['pipe', 'pipe', 'pipe'],
+            env: process.env,
+        });
 
-            this.workerProcess = worker;
-            this.endpoint = `http://127.0.0.1:${port}`;
+        runtime.process = worker;
+        runtime.endpoint = `http://127.0.0.1:${port}`;
 
-            worker.stdout?.on('data', data => console.debug(`[I18N Companion] ${String(data).trim()}`));
-            worker.stderr?.on('data', data => console.warn(`[I18N Companion] ${String(data).trim()}`));
-            worker.once('exit', () => {
-                if (this.workerProcess === worker) {
-                    this.workerProcess = null;
-                    this.endpoint = '';
-                }
-            });
-            worker.once('error', error => {
-                if (!quiet) console.warn('[I18N Companion] 启动失败', error);
-                if (this.workerProcess === worker) {
-                    this.workerProcess = null;
-                    this.endpoint = '';
-                }
-            });
-
-            const ready = await this.isWorkerReady(this.endpoint, 5000);
-            if (!ready) {
-                this.stop();
-                return false;
+        worker.stdout?.on('data', data => console.debug(`[I18N Companion:${backend}] ${String(data).trim()}`));
+        worker.stderr?.on('data', data => console.warn(`[I18N Companion:${backend}] ${String(data).trim()}`));
+        worker.once('exit', () => {
+            if (runtime.process === worker) {
+                runtime.process = null;
+                runtime.endpoint = '';
             }
+        });
+        worker.once('error', error => {
+            console.warn(`[I18N Companion] Failed to start ${backend} worker`, error);
+            if (runtime.process === worker) {
+                runtime.process = null;
+                runtime.endpoint = '';
+            }
+        });
 
-            return true;
-        } catch (error) {
-            if (!quiet) console.warn('[I18N Companion] 启动失败', error);
-            this.stop();
+        const ready = await this.isWorkerReady(runtime.endpoint, 5000);
+        if (!ready) {
+            await this.stopBackend(backend);
             return false;
+        }
+
+        return true;
+    }
+
+    private async stopBackend(backend: WorkerBackend): Promise<void> {
+        const runtime = this.runtimes[backend];
+        const endpoint = runtime.endpoint || `http://127.0.0.1:${this.getPort(backend)}`;
+        const worker = runtime.process;
+
+        runtime.endpoint = '';
+        runtime.process = null;
+
+        try {
+            await Promise.race([
+                requestUrl({ url: `${endpoint}/shutdown`, method: 'POST', throw: false }),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('shutdown timeout')), 500)),
+            ]);
+        } catch {
+            if (worker && !worker.killed) worker.kill();
+            return;
+        }
+
+        if (worker && !worker.killed) {
+            setTimeout(() => {
+                if (!worker.killed) worker.kill();
+            }, 1000);
         }
     }
 
-    private getPort(): number {
-        const port = Number(this.plugin.settings.llmCompanionWorkerPort || 18743);
-        return Number.isFinite(port) && port > 0 && port <= 65535 ? Math.floor(port) : 18743;
+    private getPort(backend: WorkerBackend): number {
+        const basePort = Number(this.plugin.settings.llmCompanionWorkerPort || 18743);
+        const port = Number.isFinite(basePort) && basePort > 0 && basePort <= 65534 ? Math.floor(basePort) : 18743;
+        return backend === 'rust' ? port : port + 1;
     }
 
     private async isWorkerReady(endpoint: string, timeoutMs: number): Promise<boolean> {
