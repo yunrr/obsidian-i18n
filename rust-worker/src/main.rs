@@ -1633,15 +1633,9 @@ fn replace_ast_items_swc(code: &str, translations: &[Value]) -> Result<String> {
 }
 
 fn is_default_regex_patterns(patterns: &[String]) -> bool {
-    if patterns.len() != 2 {
-        return false;
-    }
-    let legacy_call = patterns[0] == "(Notice|log|error|setText|setButtonText|setName|setDesc|setPlaceholder|setTooltip|appendText|setTitle|addHeading|renderMarkdown)\\(\\s*(['\"`])((?:[^\\\\2\\\\\\\\]|\\\\\\\\.)*?)\\2\\s*\\)"
-        || patterns[0] == "(Notice|log|error|setText|setButtonText|setName|setDesc|setPlaceholder|setTooltip|appendText|setTitle|addHeading|renderMarkdown)\\(\\s*(['\"`])(.*?)\\2\\s*\\)";
-    let legacy_field = patterns[1] == "(textContent|innerText|name|description|selection|annotation|link|text|search|speech|page|settings)\\s*[:=]\\s*(['\"`])((?:[^\\\\2\\\\\\\\]|\\\\\\\\.)*?)\\2"
-        || patterns[1] == "(textContent|innerText|name|description|selection|annotation|link|text|search|speech|page|settings)\\s*[:=]\\s*(['\"`])(.*?)\\2";
-    (legacy_call && legacy_field)
-        || (patterns[0] == DEFAULT_REGEX_PATTERNS[0] && patterns[1] == DEFAULT_REGEX_PATTERNS[1])
+    patterns.len() == 2
+        && patterns[0] == "(Notice|log|error|setText|setButtonText|setName|setDesc|setPlaceholder|setTooltip|appendText|setTitle|addHeading|renderMarkdown)\\(\\s*(['\"`])((?:[^\\\\2\\\\\\\\]|\\\\\\\\.)*?)\\2\\s*\\)"
+        && patterns[1] == "(textContent|innerText|name|description|selection|annotation|link|text|search|speech|page|settings)\\s*[:=]\\s*(['\"`])((?:[^\\\\2\\\\\\\\]|\\\\\\\\.)*?)\\2"
 }
 
 fn extract_regex_items(code: &str, settings: &ExtractionSettings) -> Vec<Value> {
@@ -1736,8 +1730,8 @@ const DEFAULT_VALID_PATTERNS: &[&str] = &[
 ];
 
 const DEFAULT_REGEX_PATTERNS: &[&str] = &[
-    r#"(?:Notice|log|error|setText|setButtonText|setName|setDesc|setPlaceholder|setTooltip|appendText|setTitle|addHeading|renderMarkdown)\(\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|`((?:[^`\\]|\\.)*)`)\s*\)"#,
-    r#"(?:textContent|innerText|name|description|selection|annotation|link|text|search|speech|page|settings)\s*[:=]\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|`((?:[^`\\]|\\.)*)`)"#,
+    r#"(Notice|log|error|setText|setButtonText|setName|setDesc|setPlaceholder|setTooltip|appendText|setTitle|addHeading|renderMarkdown)\(\s*(['"`])((?:[^\\]|\\.)*?)\2\s*\)"#,
+    r#"(textContent|innerText|name|description|selection|annotation|link|text|search|speech|page|settings)\s*[:=]\s*(['"`])((?:[^\\]|\\.)*?)\2"#,
 ];
 
 async fn proxy_route(
