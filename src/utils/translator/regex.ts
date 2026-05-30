@@ -86,10 +86,9 @@ export class RegexTranslator {
 
         for (const regex of this.patterns) {
             regex.lastIndex = 0;
-            const matches = code.match(regex);
-            if (!matches) continue;
 
-            for (const item of matches) {
+            for (const match of code.matchAll(regex)) {
+                const item = match.slice(1).filter((value): value is string => value !== undefined).pop() ?? match[0];
                 if (!this.isValidText(item)) continue;
                 if (seenSources.has(item)) continue;
                 seenSources.add(item);
