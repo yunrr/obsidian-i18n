@@ -11,8 +11,6 @@ import { PluginTranslationV1, BatchTaskFailureRecord } from 'src/types';
 import { formatTimestamp } from '../../utils/data/format';
 import { isValidPluginTranslationV1Format } from '../../utils/data/validation';
 import { loadTranslationFile } from '../../manager/io-manager';
-import { generatePlugin } from '../../utils/translator/base';
-import { getPluginTranslationSources, hasBoundedChineseRuns, hasExtractedTranslationContent, hasChineseText } from '../../utils/translator/light';
 import { useGlobalStoreInstance } from '~/utils/store/global';
 import { normalizeOpenAIUrl } from '~/utils/ai/url-helper';
 import { LLM_PROVIDERS } from '~/ai/constants';
@@ -25,6 +23,8 @@ import {
     generateThemeSystemPrompt,
 } from '~/ai/prompts';
 import type {
+    CompanionExtractionSettings,
+    CompanionPluginBatchExtractPayload,
     CompanionPluginBatchTranslatePayload,
     CompanionPluginFailureRetryPayload,
     CompanionTaskProgress,
@@ -130,6 +130,22 @@ const getCompanionTranslationConfig = (settings: I18N['settings']): CompanionTra
         },
     };
 };
+
+const getCompanionExtractionSettings = (settings: I18N['settings']): CompanionExtractionSettings => ({
+    author: settings.author,
+    reFlags: settings.reFlags,
+    reLength: settings.reLength,
+    reDatas: settings.reDatas,
+    reRejectRe: settings.reRejectRe,
+    reValidRe: settings.reValidRe,
+    chineseSkipMode: settings.chineseSkipMode || 'source',
+    astAssignments: settings.astAssignments,
+    astFunctions: settings.astFunctions,
+    astKeys: settings.astKeys,
+    astMaxLength: settings.astMaxLength ?? 300,
+    astRejectRe: settings.astRejectRe,
+    astValidRe: settings.astValidRe,
+});
 
 const formatFailureTime = (failedAt: number) => failedAt ? new Date(failedAt).toLocaleString() : '';
 
@@ -656,37 +672,22 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         });
 
         try {
-            let successCount = 0;
-            let failedCount = 0;
-            let skippedCount = 0;
-            let processedResources = displayedCompletedResources;
-            for (const resource of workerResources) {
-                setBatchTask(prev => ({ ...prev, currentLabel: resource.label }));
-                try {
-                    const [mainStr, manifestJSON] = await Promise.all([
-                        fs.readFile(resource.mainDoc, 'utf8'),
-                        fs.readJson(resource.manifestDoc),
-                    ]);
-                    if (hasChineseText(`${manifestJSON.name || resource.pluginName}\n${manifestJSON.description || ''}`) || hasBoundedChineseRuns(mainStr)) {
-                        skippedCount++;
-                    } else {
-                        const translationJson = generatePlugin(resource.pluginVersion, manifestJSON, mainStr, settings.language, i18n.settings);
-                        if (hasExtractedTranslationContent(getPluginTranslationSources(translationJson))) {
-                            await i18n.sourceManager.extractAndSaveSource(resource.resourceId, translationJson, { title: resource.pluginName });
-                            successCount++;
-                        } else {
-                            skippedCount++;
-                        }
-                    }
-                } catch (error) {
-                    failedCount++;
-                    console.error(`[i18n] Failed to batch extract plugin ${resource.resourceId}:`, error);
-                }
-                processedResources++;
-                setBatchTask(prev => ({ ...prev, processedResources, successCount, failedCount, skippedCount }));
+            const payload: CompanionPluginBatchExtractPayload = {
+                persistence: { basePath: i18n.sourceManager.getBasePath() },
+                resources: workerResources,
+                language: settings.language,
+                settings: getCompanionExtractionSettings(i18n.settings),
+                concurrency: getPositiveInt(i18n.settings.batchExtractConcurrency, 3),
+                checkpointKey: PLUGIN_EXTRACT_CHECKPOINT_KEY,
+                completedResources: displayedCompletedResources,
+                totalResources: displayedTotalResources,
+            };
+            const progress = await runWorkerTask('plugin-batch-extract', payload);
+            if (progress.status === 'cancelled') {
+                new Notice(t('Common.Notices.TaskStopped'));
+                return;
             }
-            useGlobalStoreInstance.getState().triggerSourceUpdate();
-            new Notice(t('Manager.Plugins.Notices.BatchExtractComplete', { success: successCount, fail: failedCount, skip: skippedCount, defaultValue: `批量提取完成：成功 ${successCount}，失败 ${failedCount}，跳过 ${skippedCount}` }));
+            new Notice(t('Manager.Plugins.Notices.BatchExtractComplete', { success: progress.successCount, fail: progress.failedCount, skip: progress.skippedCount, defaultValue: `批量提取完成：成功 ${progress.successCount}，失败 ${progress.failedCount}，跳过 ${progress.skippedCount}` }));
         } catch (error) {
             console.error('[i18n] Batch plugin extraction failed:', error);
             new Notice(t('Common.Notices.TranslateFail', { message: String(error) }));
@@ -694,7 +695,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             taskIdRef.current = null;
             setBatchTask(prev => ({ ...prev, isRunning: false, currentLabel: '' }));
         }
-    }, [allPluginStates, batchTask.isRunning, extractablePlugins, i18n, plugins, pluginExtractCheckpoint, settings.language, t]);
+    }, [allPluginStates, batchTask.isRunning, extractablePlugins, i18n, plugins, pluginExtractCheckpoint, runWorkerTask, settings.language, t]);
 
     const handleBatchExtract = useCallback(() => startPluginBatchExtract(false), [startPluginBatchExtract]);
     const handleResumeExtract = useCallback(() => startPluginBatchExtract(true), [startPluginBatchExtract]);

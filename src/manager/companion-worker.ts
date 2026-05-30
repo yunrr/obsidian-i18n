@@ -12,6 +12,8 @@ import type { BatchTaskCheckpoint, BatchTaskFailureRecord, BatchTaskRecordMeta, 
 import type {
     CompanionProxyRequest,
     CompanionProxyResponse,
+    CompanionCodeExtractRequest,
+    CompanionCodeExtractResponse,
     CompanionPluginExtractPayload,
     CompanionPluginExtractResult,
     CompanionThemeExtractPayload,
@@ -36,6 +38,8 @@ import type {
     CompanionThemeTranslatePayload,
     CompanionThemeTranslateResult,
 } from './companion-worker-types';
+import { AstTranslator } from '../utils/translator/core-ast-translator';
+import { RegexTranslator } from '../utils/translator/core-regex-translator';
 
 const port = Number(process.argv[2]) || 18743;
 const host = '127.0.0.1';
@@ -420,6 +424,27 @@ async function handleThemeExtract(payload: CompanionThemeExtractPayload): Promis
             status: 'failed',
             resourceId: payload.resourceId,
             label: payload.label,
+            error: error instanceof Error ? error.message : String(error),
+        };
+    }
+}
+
+async function handleCodeExtract(payload: CompanionCodeExtractRequest): Promise<CompanionCodeExtractResponse> {
+    try {
+        const astTranslator = new AstTranslator(payload.settings as any);
+        const ast = astTranslator.loadCode(payload.code);
+        const regexTranslator = new RegexTranslator(payload.settings as any);
+
+        return {
+            state: true,
+            ast: ast ? astTranslator.extract(ast) : [],
+            regex: regexTranslator.loadCode(payload.code) || [],
+        };
+    } catch (error) {
+        return {
+            state: false,
+            ast: [],
+            regex: [],
             error: error instanceof Error ? error.message : String(error),
         };
     }
@@ -1376,6 +1401,7 @@ function getTask(taskId: string): CompanionTaskRuntime {
 async function handleTask(type: string, payload: any) {
     if (type === 'plugin-extract') return handlePluginExtract(payload);
     if (type === 'theme-extract') return handleThemeExtract(payload);
+    if (type === 'code-extract') return handleCodeExtract(payload);
     if (type === 'plugin-translate') return handlePluginTranslate(payload);
     if (type === 'theme-translate') return handleThemeTranslate(payload);
     if (type === 'plugin-retry') return handlePluginRetry(payload);
@@ -1416,6 +1442,17 @@ if (process.argv[2] === 'stdio-task') {
         try {
             if (req.method === 'GET' && req.url === '/health') {
                 send(res, 200, { ok: true });
+                return;
+            }
+
+            if (req.method === 'GET' && req.url === '/identity') {
+                send(res, 200, { ok: true, pluginDir: process.cwd() });
+                return;
+            }
+
+            if (req.method === 'POST' && req.url === '/shutdown') {
+                send(res, 200, { ok: true });
+                setTimeout(shutdown, 0);
                 return;
             }
 
