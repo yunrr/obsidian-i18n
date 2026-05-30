@@ -277,6 +277,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         const allSources = i18n.sourceManager?.getAllSources() || [];
 
         for (const source of allSources) {
+            if (source.type !== 'plugin') continue;
             if (!byPlugin[source.plugin]) {
                 byPlugin[source.plugin] = [];
             }
@@ -351,12 +352,12 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             const pluginDir = path.join(basePath, plugin.dir || '');
             const activeSourceId = sourceIndex.activeByPlugin[plugin.id] || null;
             const langDoc = activeSourceId ? i18n.sourceManager.getSourceFilePath(activeSourceId) : '';
-            const isLangDoc = !!langDoc && fs.pathExistsSync(langDoc);
+            const sources = sourceIndex.byPlugin[plugin.id] || [];
+            const isLangDoc = sources.some(source => fs.pathExistsSync(i18n.sourceManager.getSourceFilePath(source.id)));
             const manifestDoc = path.join(pluginDir, 'manifest.json');
             const mainDoc = path.join(pluginDir, 'main.js');
 
             const state = i18n.stateManager.getPluginState(plugin.id);
-            const sources = sourceIndex.byPlugin[plugin.id] || [];
             const hasFailedBatches = !!activeSourceId && failedSourceIds.has(activeSourceId);
 
             let localJson: PluginTranslationV1 | undefined;
@@ -482,6 +483,8 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         return displayPlugins.filter(plugin => !allPluginStates[plugin.id]?.isLangDoc);
     }, [displayPlugins, allPluginStates]);
 
+    const batchExtractPlugins = useMemo(() => extractablePlugins, [extractablePlugins]);
+
     const translatablePlugins = useMemo(() => {
         return displayPlugins.filter(plugin => {
             const data = allPluginStates[plugin.id];
@@ -502,12 +505,12 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
 
     const resumablePluginExtractResources = useMemo<PluginBatchResource[]>(() => {
         return (pluginExtractCheckpoint?.resources || [])
+            .filter(resource => !allPluginStates[resource.resourceId]?.isLangDoc)
             .map(resource => ({
                 resourceId: resource.resourceId,
                 label: resource.label,
                 sourceId: resource.sourceId,
-            }))
-            .filter(resource => !allPluginStates[resource.resourceId]?.isLangDoc);
+            }));
     }, [allPluginStates, pluginExtractCheckpoint]);
 
     const resumablePluginTranslateResources = useMemo<PluginBatchResource[]>(() => {
@@ -651,7 +654,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
     const startPluginBatchExtract = useCallback(async (resume: boolean) => {
         const resources: PluginBatchResource[] = resume && resumablePluginExtractResources.length
             ? resumablePluginExtractResources
-            : extractablePlugins.map(plugin => ({ resourceId: plugin.id, label: plugin.name }));
+            : batchExtractPlugins.map(plugin => ({ resourceId: plugin.id, label: plugin.name }));
 
         const completedResources = resume ? pluginExtractCheckpoint?.completedResources || 0 : 0;
         const totalResources = resume ? pluginExtractCheckpoint?.totalResources || resources.length : resources.length;
@@ -719,7 +722,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             taskIdRef.current = null;
             setBatchTask(prev => ({ ...prev, isRunning: false, currentLabel: '' }));
         }
-    }, [allPluginStates, batchTask.isRunning, extractablePlugins, i18n, plugins, pluginExtractCheckpoint, resumablePluginExtractResources, runWorkerTask, settings.language, t]);
+    }, [allPluginStates, batchExtractPlugins, batchTask.isRunning, i18n, plugins, pluginExtractCheckpoint, resumablePluginExtractResources, runWorkerTask, settings.language, t]);
 
     const handleBatchExtract = useCallback(() => startPluginBatchExtract(false), [startPluginBatchExtract]);
     const handleResumeExtract = useCallback(() => startPluginBatchExtract(true), [startPluginBatchExtract]);
@@ -796,7 +799,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                 .then(({ progress }) => syncWorkerProgress(progress))
                 .catch(error => console.warn('[i18n] Failed to cancel companion task:', error));
         }
-        setBatchTask(prev => ({ ...prev, currentLabel: t('Manager.Common.Status.Stopping', '正在停止') }));
+        setBatchTask(prev => ({ ...prev, isRunning: false, currentLabel: t('Manager.Common.Status.Stopping', '正在停止') }));
     }, [i18n, syncWorkerProgress, t]);
 
     const handleRetryPluginFailures = useCallback(async () => {
@@ -965,11 +968,11 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                             size="sm"
                             className="h-9 rounded-none gap-1.5 text-[13px]"
                             onClick={handleBatchExtract}
-                            disabled={batchTask.isRunning || extractablePlugins.length === 0}
+                            disabled={batchTask.isRunning || batchExtractPlugins.length === 0}
                         >
                             {batchTask.isRunning && batchTask.mode === 'extract' ? <Loader2 className="w-4 h-4 animate-spin" /> : <FileOutput className="w-4 h-4" />}
                             {t('Manager.Common.Actions.BatchExtract', '批量提取')}
-                            <span className="text-muted-foreground">{extractablePlugins.length}</span>
+                            <span className="text-muted-foreground">{batchExtractPlugins.length}</span>
                         </Button>
                         <Button
                             variant="default"

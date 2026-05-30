@@ -186,6 +186,10 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
     const handleExtract = async () => {
         setExtracting(true);
         try {
+            if (isLangDoc) {
+                i18n.notice.result(false, '已存在提取文件，已跳过提取');
+                return;
+            }
             if (!await fs.pathExists(mainDoc)) {
                 i18n.notice.error(t('Manager.Plugins.Errors.MainNotFound'));
                 return;

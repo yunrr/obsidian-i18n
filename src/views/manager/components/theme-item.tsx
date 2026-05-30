@@ -169,6 +169,10 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
     const handleExtract = async () => {
         setExtracting(true);
         try {
+            if (hasTranslation) {
+                i18n.notice.result(false, '已存在提取文件，已跳过提取');
+                return;
+            }
             if (!fs.existsSync(themeCssPath)) {
                 i18n.notice.error(t('Manager.Themes.Errors.ThemeCssNotFound'));
                 return;

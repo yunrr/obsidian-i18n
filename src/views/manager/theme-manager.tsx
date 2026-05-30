@@ -324,6 +324,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
         const allSources = i18n.sourceManager?.getAllSources() || [];
 
         for (const source of allSources) {
+            if (source.type !== 'theme') continue;
             if (!byTheme[source.plugin]) {
                 byTheme[source.plugin] = [];
             }
@@ -385,7 +386,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             const sources = sourceIndex.byTheme[theme.name] || [];
             const activeSourceId = sourceIndex.activeByTheme[theme.name] || null;
             const translationPath = activeSourceId ? i18n.sourceManager.getSourceFilePath(activeSourceId) : '';
-            const hasTranslation = !!translationPath && fs.existsSync(translationPath);
+            const hasTranslation = sources.some(source => fs.existsSync(i18n.sourceManager.getSourceFilePath(source.id)));
             const state = i18n.stateManager.getThemeState(theme.name);
 
             let isTranslated = false;
@@ -497,6 +498,8 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
         return displayThemes.filter(theme => !allThemeStates[theme.name]?.hasTranslation);
     }, [displayThemes, allThemeStates]);
 
+    const batchExtractThemes = useMemo(() => extractableThemes, [extractableThemes]);
+
     const translatableThemes = useMemo(() => {
         return displayThemes.filter(theme => {
             const data = allThemeStates[theme.name];
@@ -517,12 +520,12 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
 
     const resumableThemeExtractResources = useMemo<ThemeBatchResource[]>(() => {
         return (themeExtractCheckpoint?.resources || [])
+            .filter(resource => !allThemeStates[resource.resourceId]?.hasTranslation)
             .map(resource => ({
                 resourceId: resource.resourceId,
                 label: resource.label,
                 sourceId: resource.sourceId,
-            }))
-            .filter(resource => !allThemeStates[resource.resourceId]?.hasTranslation);
+            }));
     }, [allThemeStates, themeExtractCheckpoint]);
 
     const resumableThemeTranslateResources = useMemo<ThemeBatchResource[]>(() => {
@@ -603,7 +606,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
     const startThemeBatchExtract = useCallback(async (resume: boolean) => {
         const resources: ThemeBatchResource[] = resume && resumableThemeExtractResources.length
             ? resumableThemeExtractResources
-            : extractableThemes.map(theme => ({ resourceId: theme.name, label: theme.name }));
+            : batchExtractThemes.map(theme => ({ resourceId: theme.name, label: theme.name }));
 
         const completedResources = resume ? themeExtractCheckpoint?.completedResources || 0 : 0;
         const totalResources = resume ? themeExtractCheckpoint?.totalResources || resources.length : resources.length;
@@ -669,7 +672,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             taskIdRef.current = null;
             setBatchTask(prev => ({ ...prev, isRunning: false, currentLabel: '' }));
         }
-    }, [allThemeStates, batchTask.isRunning, extractableThemes, i18n, resumableThemeExtractResources, runWorkerTask, t, themeExtractCheckpoint, themes]);
+    }, [allThemeStates, batchExtractThemes, batchTask.isRunning, i18n, resumableThemeExtractResources, runWorkerTask, t, themeExtractCheckpoint, themes]);
 
     const handleBatchExtract = useCallback(() => startThemeBatchExtract(false), [startThemeBatchExtract]);
     const handleResumeExtract = useCallback(() => startThemeBatchExtract(true), [startThemeBatchExtract]);
@@ -746,7 +749,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                 .then(({ progress }) => syncWorkerProgress(progress))
                 .catch(error => console.warn('[i18n] Failed to cancel companion task:', error));
         }
-        setBatchTask(prev => ({ ...prev, currentLabel: t('Manager.Common.Status.Stopping', '正在停止') }));
+        setBatchTask(prev => ({ ...prev, isRunning: false, currentLabel: t('Manager.Common.Status.Stopping', '正在停止') }));
     }, [i18n, syncWorkerProgress, t]);
 
     const handleRetryThemeFailures = useCallback(async () => {
@@ -952,11 +955,11 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                             size="sm"
                             className="h-9 rounded-none gap-1.5 text-[13px]"
                             onClick={handleBatchExtract}
-                            disabled={batchTask.isRunning || extractableThemes.length === 0}
+                            disabled={batchTask.isRunning || batchExtractThemes.length === 0}
                         >
                             {batchTask.isRunning && batchTask.mode === 'extract' ? <Loader2 className="w-4 h-4 animate-spin" /> : <FileOutput className="w-4 h-4" />}
                             {t('Manager.Common.Actions.BatchExtract', '批量提取')}
-                            <span className="text-muted-foreground">{extractableThemes.length}</span>
+                            <span className="text-muted-foreground">{batchExtractThemes.length}</span>
                         </Button>
                         <Button
                             variant="default"

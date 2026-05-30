@@ -3,12 +3,14 @@ import * as https from 'https';
 import * as zlib from 'zlib';
 import * as fs from 'fs-extra';
 import * as path from 'path';
+import * as os from 'os';
+import { Worker } from 'worker_threads';
 import { nanoid } from 'nanoid';
-import { generatePlugin, generateTheme, getPluginTranslationSources, getThemeTranslationSources, hasBoundedChineseRuns, hasChineseText, hasExtractedTranslationContent, calculateChecksum } from '../utils/translator/translation';
+import { calculateChecksum } from '../utils/translator/translation';
 import { parseTranslationResponse } from '../utils/ai/response-parser';
 import type { AstItem, RegexItem } from '../views/plugin_editor/types';
 import type { ThemeTranslationItem } from '../views/theme_editor/types';
-import type { BatchTaskCheckpoint, BatchTaskFailureRecord, BatchTaskRecordMeta, BatchTaskScope, TranslationSource, TranslationSourceMeta, PluginTranslationV1, ThemeTranslationV1, OBThemeManifest } from '../types';
+import type { BatchTaskCheckpoint, BatchTaskFailureRecord, BatchTaskRecordMeta, BatchTaskScope, TranslationSource, TranslationSourceMeta, PluginTranslationV1, ThemeTranslationV1 } from '../types';
 import type {
     CompanionProxyRequest,
     CompanionProxyResponse,
@@ -44,10 +46,13 @@ import type {
 } from './companion-worker-types';
 import { AstTranslator } from '../utils/translator/core-ast-translator';
 import { RegexTranslator } from '../utils/translator/core-regex-translator';
+import { handlePluginExtractCore, handleThemeExtractCore } from './companion-extract-core';
 
 const port = Number(process.argv[2]) || 18743;
 const host = '127.0.0.1';
 const maxBodyBytes = 100 * 1024 * 1024;
+const maxExtractThreadConcurrency = 20;
+const extractThreadScript = path.join(__dirname, 'i18n-companion-extract-thread.cjs');
 
 type JsonRecord = Record<string, any>;
 
@@ -351,87 +356,8 @@ function shouldTranslateText(target?: string, source?: string, overwriteExisting
     return overwriteExisting || !target || target.trim() === '' || target === source;
 }
 
-async function handlePluginExtract(payload: CompanionPluginExtractPayload): Promise<CompanionPluginExtractResult> {
-    try {
-        if (!await fs.pathExists(payload.mainDoc)) {
-            throw new Error('main.js 不存在');
-        }
-
-        const [mainStr, manifestJSON] = await Promise.all([
-            fs.readFile(payload.mainDoc, 'utf8'),
-            fs.readJson(payload.manifestDoc),
-        ]);
-
-        if (hasChineseText(`${manifestJSON.name || payload.pluginName}\n${manifestJSON.description || ''}`) || hasBoundedChineseRuns(mainStr)) {
-            return { status: 'skipped', resourceId: payload.resourceId, label: payload.label, reason: 'chinese' };
-        }
-
-        const translationJson = generatePlugin(payload.pluginVersion, manifestJSON, mainStr, payload.language, payload.settings);
-        const extractedSources = getPluginTranslationSources(translationJson);
-        if (!hasExtractedTranslationContent(extractedSources)) {
-            return { status: 'skipped', resourceId: payload.resourceId, label: payload.label, reason: 'empty' };
-        }
-
-        return {
-            status: 'success',
-            resourceId: payload.resourceId,
-            label: payload.label,
-            pluginId: payload.resourceId,
-            content: translationJson,
-            options: { title: payload.pluginName },
-        };
-    } catch (error) {
-        return {
-            status: 'failed',
-            resourceId: payload.resourceId,
-            label: payload.label,
-            error: error instanceof Error ? error.message : String(error),
-        };
-    }
-}
-
-async function handleThemeExtract(payload: CompanionThemeExtractPayload): Promise<CompanionThemeExtractResult> {
-    try {
-        if (!await fs.pathExists(payload.themeCssPath)) {
-            throw new Error('theme.css 不存在');
-        }
-
-        const cssStr = await fs.readFile(payload.themeCssPath, 'utf8');
-        const manifestPath = path.join(payload.themeDir, 'manifest.json');
-        let manifest: OBThemeManifest = { name: payload.themeName, version: '0.0.0', minAppVersion: '', author: '', authorUrl: '' };
-        if (await fs.pathExists(manifestPath)) {
-            try {
-                manifest = await fs.readJson(manifestPath);
-            } catch { }
-        }
-
-        if (hasChineseText(manifest.name || payload.themeName) || hasBoundedChineseRuns(cssStr)) {
-            return { status: 'skipped', resourceId: payload.resourceId, label: payload.label, reason: 'chinese' };
-        }
-
-        const translationJson = generateTheme(manifest, cssStr, payload.settings);
-        const extractedSources = getThemeTranslationSources(translationJson);
-        if (!hasExtractedTranslationContent(extractedSources)) {
-            return { status: 'skipped', resourceId: payload.resourceId, label: payload.label, reason: 'empty' };
-        }
-
-        return {
-            status: 'success',
-            resourceId: payload.resourceId,
-            label: payload.label,
-            pluginId: payload.themeName,
-            content: translationJson,
-            options: { title: payload.themeName, type: 'theme' },
-        };
-    } catch (error) {
-        return {
-            status: 'failed',
-            resourceId: payload.resourceId,
-            label: payload.label,
-            error: error instanceof Error ? error.message : String(error),
-        };
-    }
-}
+const handlePluginExtract = handlePluginExtractCore;
+const handleThemeExtract = handleThemeExtractCore;
 
 async function handleCodeExtract(payload: CompanionCodeExtractRequest): Promise<CompanionCodeExtractResponse> {
     try {
@@ -931,6 +857,7 @@ type CompanionTaskRuntime = {
     cancelRequested: boolean;
     promise: Promise<void> | null;
     aiQueue: Promise<unknown>;
+    extractCleanup?: (() => Promise<void>) | null;
 };
 
 const tasks = new Map<string, CompanionTaskRuntime>();
@@ -1056,9 +983,23 @@ async function readTranslationFile<T>(paths: WorkerPersistencePaths, sourceId: s
     }
 }
 
+async function hasExistingExtractedSource(paths: WorkerPersistencePaths, pluginId: string, type: 'plugin' | 'theme'): Promise<boolean> {
+    const meta = await loadMeta(paths);
+    for (const source of Object.values(meta.sources)) {
+        if (source.plugin !== pluginId || source.type !== type) continue;
+        if (await fs.pathExists(path.join(paths.sourcesDir, `${source.id}.json`))) return true;
+    }
+    return false;
+}
+
 async function saveExtractedSource(paths: WorkerPersistencePaths, pluginId: string, content: PluginTranslationV1 | ThemeTranslationV1, options: { title: string; type?: 'theme' }) {
     await withPersistenceLock(async () => {
         const meta = await loadMeta(paths);
+        const type = options.type || 'plugin';
+        for (const source of Object.values(meta.sources)) {
+            if (source.plugin !== pluginId || source.type !== type) continue;
+            if (await fs.pathExists(path.join(paths.sourcesDir, `${source.id}.json`))) return;
+        }
         const now = Date.now();
         const sourceId = nanoid(32);
         for (const source of Object.values(meta.sources)) {
@@ -1068,7 +1009,7 @@ async function saveExtractedSource(paths: WorkerPersistencePaths, pluginId: stri
             id: sourceId,
             plugin: pluginId,
             title: options.title || 'Local extraction',
-            type: options.type || 'plugin',
+            type,
             origin: 'local',
             isActive: true,
             checksum: calculateChecksum(content),
@@ -1163,6 +1104,13 @@ function isTaskActive(task: CompanionTaskRuntime) {
     return !task.cancelRequested && task.progress.status !== 'cancelled' && task.progress.status !== 'failed';
 }
 
+async function requestTaskCancel(task: CompanionTaskRuntime) {
+    task.cancelRequested = true;
+    const cleanup = task.extractCleanup;
+    task.extractCleanup = null;
+    if (cleanup) void cleanup().catch(error => console.warn('[i18n] Failed to cleanup extract workers:', error));
+}
+
 async function runConcurrentCancellable<T>(items: T[], limit: number, task: CompanionTaskRuntime, worker: (item: T, index: number) => Promise<void>) {
     let nextIndex = 0;
     const workers = Array.from({ length: Math.min(Math.max(1, limit), items.length) }, async () => {
@@ -1173,6 +1121,201 @@ async function runConcurrentCancellable<T>(items: T[], limit: number, task: Comp
         }
     });
     await Promise.all(workers);
+}
+
+function getExtractThreadLimit(limit: number, total: number) {
+    const cpuCount = os.cpus()?.length || 1;
+    return Math.min(Math.max(1, Math.floor(limit || 1)), Math.max(1, total), Math.max(1, cpuCount), maxExtractThreadConcurrency);
+}
+
+type ExtractThreadRequest =
+    | { type: 'plugin'; payload: CompanionPluginExtractPayload }
+    | { type: 'theme'; payload: CompanionThemeExtractPayload };
+
+type ExtractThreadResult = CompanionPluginExtractResult | CompanionThemeExtractResult;
+
+type WeightedExtractThreadRequest = ExtractThreadRequest & {
+    index: number;
+    weight: number;
+};
+
+async function getExtractRequestSize(request: ExtractThreadRequest) {
+    const targetPath = request.type === 'plugin' ? request.payload.mainDoc : request.payload.themeCssPath;
+    try {
+        return (await fs.stat(targetPath)).size;
+    } catch {
+        return 0;
+    }
+}
+
+function getExtractRequestWeight(size: number) {
+    const mb = size / (1024 * 1024);
+    if (mb >= 25) return 8;
+    if (mb >= 10) return 4;
+    if (mb >= 5) return 2;
+    return 1;
+}
+
+async function buildWeightedExtractRequests(requests: ExtractThreadRequest[]) {
+    const weighted = await Promise.all(requests.map(async (request, index) => ({
+        ...request,
+        index,
+        weight: getExtractRequestWeight(await getExtractRequestSize(request)),
+    })));
+    return weighted.sort((left, right) => right.weight - left.weight);
+}
+
+async function runExtractThreadPool(
+    requests: ExtractThreadRequest[],
+    limit: number,
+    task: CompanionTaskRuntime,
+    onComplete: (result: ExtractThreadResult, index: number) => Promise<void>,
+) {
+    if (requests.length === 0) return;
+
+    if (!await fs.pathExists(extractThreadScript)) {
+        throw new Error(`CJS extract thread worker not found: ${extractThreadScript}`);
+    }
+
+    let nextMessageId = 1;
+    const workerCount = getExtractThreadLimit(limit, requests.length);
+    const weightedRequests = await buildWeightedExtractRequests(requests);
+    const runningWorkers = new Set<Worker>();
+    let nextIndex = 0;
+    let activeWeight = 0;
+    let activeCount = 0;
+    let completedCount = 0;
+
+    const cleanupWorkers = async () => {
+        const workers = Array.from(runningWorkers);
+        runningWorkers.clear();
+        await Promise.all(workers.map(worker => worker.terminate().catch(() => undefined)));
+    };
+
+    task.extractCleanup = cleanupWorkers;
+
+    const runRequestInWorker = async (request: WeightedExtractThreadRequest) => {
+        const worker = new Worker(extractThreadScript);
+        runningWorkers.add(worker);
+        const pending = new Map<number, {
+            resolve: (result: ExtractThreadResult) => void;
+            reject: (error: Error) => void;
+        }>();
+
+        const cleanup = async () => {
+            pending.forEach(({ reject }) => reject(new Error('CJS extract thread stopped')));
+            pending.clear();
+            runningWorkers.delete(worker);
+            await worker.terminate().catch(() => undefined);
+        };
+
+        worker.on('message', message => {
+            const pendingRequest = pending.get(message?.id);
+            if (!pendingRequest) return;
+            pending.delete(message.id);
+            if (message.ok) {
+                pendingRequest.resolve(message.result);
+            } else {
+                pendingRequest.reject(new Error(message.error || 'CJS extract thread failed'));
+            }
+        });
+
+        worker.on('error', error => {
+            pending.forEach(({ reject }) => reject(error));
+            pending.clear();
+        });
+
+        worker.on('exit', code => {
+            if (code === 0 || pending.size === 0) return;
+            const error = new Error(`CJS extract thread exited with code ${code}`);
+            pending.forEach(({ reject }) => reject(error));
+            pending.clear();
+        });
+
+        const runRequest = (request: ExtractThreadRequest) => new Promise<ExtractThreadResult>((resolve, reject) => {
+            const id = nextMessageId++;
+            pending.set(id, { resolve, reject });
+            worker.postMessage({ id, ...request });
+        });
+
+        try {
+            if (!isTaskActive(task)) return;
+            touchProgress(task, { currentLabel: request.payload.label });
+            const result = await runRequest(request);
+            await onComplete(result, request.index);
+        } finally {
+            await cleanup();
+        }
+    };
+
+    await new Promise<void>((resolve, reject) => {
+        let settled = false;
+
+        const settleReject = (error: unknown) => {
+            if (settled) return;
+            settled = true;
+            cleanupWorkers().finally(() => reject(error));
+        };
+
+        const schedule = () => {
+            if (settled) return;
+            if (!isTaskActive(task)) {
+                settled = true;
+                cleanupWorkers().then(resolve, reject);
+                return;
+            }
+
+            while (
+                nextIndex < weightedRequests.length &&
+                activeCount < workerCount &&
+                activeWeight + weightedRequests[nextIndex].weight <= workerCount
+            ) {
+                const request = weightedRequests[nextIndex++];
+                activeCount++;
+                activeWeight += request.weight;
+                runRequestInWorker(request)
+                    .then(() => {
+                        activeCount--;
+                        activeWeight -= request.weight;
+                        completedCount++;
+                        if (completedCount >= weightedRequests.length) {
+                            settled = true;
+                            task.extractCleanup = null;
+                            cleanupWorkers().then(resolve, reject);
+                            return;
+                        }
+                        schedule();
+                    })
+                    .catch(error => {
+                        activeCount--;
+                        activeWeight -= request.weight;
+                        settleReject(error);
+                    });
+            }
+
+            if (activeCount === 0 && nextIndex < weightedRequests.length) {
+                const request = weightedRequests[nextIndex++];
+                activeCount++;
+                activeWeight += request.weight;
+                runRequestInWorker(request)
+                    .then(() => {
+                        activeCount--;
+                        activeWeight -= request.weight;
+                        completedCount++;
+                        schedule();
+                    })
+                    .catch(error => {
+                        activeCount--;
+                        activeWeight -= request.weight;
+                        settleReject(error);
+                    });
+            }
+        };
+
+        schedule();
+    }).finally(() => {
+        task.extractCleanup = null;
+    });
 }
 
 function countPendingPluginItems(json: PluginTranslationV1, overwriteExisting = false): number {
@@ -1208,10 +1351,29 @@ function createCheckpoint<T extends CompanionBatchResource>(scope: BatchTaskScop
 async function handlePluginBatchExtract(task: CompanionTaskRuntime, payload: CompanionPluginBatchExtractPayload) {
     const paths = getPersistencePaths(payload.persistence.basePath);
     const completedIndexes = new Set<number>();
-    await runConcurrentCancellable(payload.resources, payload.concurrency, task, async (resource, index) => {
+    const requests: ExtractThreadRequest[] = [];
+    const requestIndexes: number[] = [];
+    for (const [index, resource] of payload.resources.entries()) {
+        if (await hasExistingExtractedSource(paths, resource.resourceId, 'plugin')) {
+            completedIndexes.add(index);
+            task.progress.processedResources++;
+            task.progress.skippedCount++;
+            if (task.progress.processedResources === task.progress.totalResources) touchProgress(task, { currentLabel: '' });
+            touchProgress(task);
+            await saveCheckpoint(paths, payload.checkpointKey, createCheckpoint('plugin', 'extract', payload.resources, completedIndexes, task.progress));
+            bumpRecordRevision(task);
+            continue;
+        }
+        requests.push({
+            type: 'plugin',
+            payload: { ...resource, language: payload.language, settings: payload.settings },
+        });
+        requestIndexes.push(index);
+    }
+
+    await runExtractThreadPool(requests, payload.concurrency, task, async (result, requestIndex) => {
         if (!isTaskActive(task)) return;
-        touchProgress(task, { currentLabel: resource.label });
-        const result = await handlePluginExtract({ ...resource, language: payload.language, settings: payload.settings });
+        const index = requestIndexes[requestIndex];
         if (result.status === 'success') {
             await saveExtractedSource(paths, result.pluginId, result.content, result.options);
             bumpSourceRevision(task);
@@ -1220,10 +1382,11 @@ async function handlePluginBatchExtract(task: CompanionTaskRuntime, payload: Com
             task.progress.skippedCount++;
         } else {
             task.progress.failedCount++;
-            console.error(`[i18n] Failed to batch extract plugin ${resource.resourceId}:`, result.error);
+            console.error(`[i18n] Failed to batch extract plugin ${result.resourceId}:`, result.error);
         }
         completedIndexes.add(index);
         task.progress.processedResources++;
+        if (task.progress.processedResources === task.progress.totalResources) touchProgress(task, { currentLabel: '' });
         touchProgress(task);
         await saveCheckpoint(paths, payload.checkpointKey, createCheckpoint('plugin', 'extract', payload.resources, completedIndexes, task.progress));
         bumpRecordRevision(task);
@@ -1237,10 +1400,29 @@ async function handlePluginBatchExtract(task: CompanionTaskRuntime, payload: Com
 async function handleThemeBatchExtract(task: CompanionTaskRuntime, payload: CompanionThemeBatchExtractPayload) {
     const paths = getPersistencePaths(payload.persistence.basePath);
     const completedIndexes = new Set<number>();
-    await runConcurrentCancellable(payload.resources, payload.concurrency, task, async (resource, index) => {
+    const requests: ExtractThreadRequest[] = [];
+    const requestIndexes: number[] = [];
+    for (const [index, resource] of payload.resources.entries()) {
+        if (await hasExistingExtractedSource(paths, resource.resourceId, 'theme')) {
+            completedIndexes.add(index);
+            task.progress.processedResources++;
+            task.progress.skippedCount++;
+            if (task.progress.processedResources === task.progress.totalResources) touchProgress(task, { currentLabel: '' });
+            touchProgress(task);
+            await saveCheckpoint(paths, payload.checkpointKey, createCheckpoint('theme', 'extract', payload.resources, completedIndexes, task.progress));
+            bumpRecordRevision(task);
+            continue;
+        }
+        requests.push({
+            type: 'theme',
+            payload: { ...resource, settings: payload.settings },
+        });
+        requestIndexes.push(index);
+    }
+
+    await runExtractThreadPool(requests, payload.concurrency, task, async (result, requestIndex) => {
         if (!isTaskActive(task)) return;
-        touchProgress(task, { currentLabel: resource.label });
-        const result = await handleThemeExtract({ ...resource, settings: payload.settings });
+        const index = requestIndexes[requestIndex];
         if (result.status === 'success') {
             await saveExtractedSource(paths, result.pluginId, result.content, { title: result.options.title, type: 'theme' });
             bumpSourceRevision(task);
@@ -1249,10 +1431,11 @@ async function handleThemeBatchExtract(task: CompanionTaskRuntime, payload: Comp
             task.progress.skippedCount++;
         } else {
             task.progress.failedCount++;
-            console.error(`[i18n] Failed to batch extract theme ${resource.resourceId}:`, result.error);
+            console.error(`[i18n] Failed to batch extract theme ${result.resourceId}:`, result.error);
         }
         completedIndexes.add(index);
         task.progress.processedResources++;
+        if (task.progress.processedResources === task.progress.totalResources) touchProgress(task, { currentLabel: '' });
         touchProgress(task);
         await saveCheckpoint(paths, payload.checkpointKey, createCheckpoint('theme', 'extract', payload.resources, completedIndexes, task.progress));
         bumpRecordRevision(task);
@@ -1512,10 +1695,14 @@ async function runAsyncTask(task: CompanionTaskRuntime, type: CompanionAsyncTask
     } catch (error) {
         const normalizedError = error instanceof Error ? error : new Error(String(error));
         touchProgress(task, {
-            status: isManualStopError(normalizedError) ? 'cancelled' : 'failed',
+            status: task.cancelRequested || isManualStopError(normalizedError) ? 'cancelled' : 'failed',
             currentLabel: '',
             error: normalizedError.message,
         });
+    } finally {
+        const cleanup = task.extractCleanup;
+        task.extractCleanup = null;
+        if (cleanup) await cleanup().catch(error => console.warn('[i18n] Failed to cleanup extract workers:', error));
     }
 }
 
@@ -1528,7 +1715,14 @@ function startAsyncTask(type: CompanionAsyncTaskType, payload: any) {
         aiQueue: Promise.resolve(),
     };
     tasks.set(taskId, task);
-    task.promise = runAsyncTask(task, type, payload);
+    task.promise = runAsyncTask(task, type, payload).finally(() => {
+        setTimeout(() => {
+            const current = tasks.get(taskId);
+            if (current === task && ['completed', 'cancelled', 'failed'].includes(task.progress.status)) {
+                tasks.delete(taskId);
+            }
+        }, 5 * 60 * 1000).unref?.();
+    });
     return task;
 }
 
@@ -1627,8 +1821,8 @@ if (process.argv[2] === 'stdio-task') {
                 const body = await readBody(req);
                 const payload = JSON.parse(body || '{}');
                 const task = getTask(payload.taskId || '');
-                task.cancelRequested = true;
-                touchProgress(task, { currentLabel: '' });
+                void requestTaskCancel(task);
+                touchProgress(task, { status: 'cancelled', currentLabel: '' });
                 send(res, 200, { ok: true, progress: task.progress });
                 return;
             }
