@@ -5,9 +5,10 @@ import { useTranslation } from 'react-i18next';
 import { FolderOpen, FileOutput, XCircle, Loader2, MoreHorizontal, Pen, CloudDownload, Cloud } from 'lucide-react';
 import I18N from 'src/main';
 import { OBThemeManifest, ThemeTranslationV1 } from 'src/types';
-import { i18nOpen, getThemeTranslationSources, hasBoundedChineseRuns, hasChineseText, hasExtractedTranslationContent } from '../../../utils';
+import { i18nOpen } from '../../../utils/common/general';
+import { getThemeTranslationSources, hasExtractedTranslationContent, calculateChecksum } from '../../../utils/translator/light';
 import { loadTranslationFile } from '../../../manager/io-manager';
-import { useGlobalStoreInstance } from '~/utils';
+import { useGlobalStoreInstance } from '~/utils/store/global';
 import { THEME_EDITOR_VIEW_TYPE } from '../../theme_editor/editor';
 import {
     Button,
@@ -50,6 +51,7 @@ export interface ThemeItemData {
     isApplied: boolean;
     isTranslated: boolean;
     pendingTranslationCount?: number;
+    totalTranslationCount?: number;
     translationVersion?: string;
     description?: string;
     supportedVersion?: string;
@@ -80,6 +82,33 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
     const sourceManager = i18n.sourceManager;
     const [downloadingCloudId, setDownloadingCloudId] = useState<string | null>(null);
 
+    const setActiveSource = async (sourceId: string) => {
+        try {
+            await i18n.companionWorkerManager.setActiveSource({
+                persistence: { basePath: sourceManager.getBasePath() },
+                sourceId,
+                active: true,
+            });
+            sourceManager.reloadFromDisk();
+            refreshParent();
+        } catch (error) {
+            i18n.notice.error(`${error}`);
+        }
+    };
+
+    const removeSource = async (sourceId: string) => {
+        try {
+            await i18n.companionWorkerManager.removeSources({
+                persistence: { basePath: sourceManager.getBasePath() },
+                sourceIds: [sourceId],
+            });
+            sourceManager.reloadFromDisk();
+            refreshParent();
+        } catch (error) {
+            i18n.notice.error(`${error}`);
+        }
+    };
+
     const handleCloudDownload = async (entry: any) => {
         if (downloadingCloudId) return;
         setDownloadingCloudId(entry.id);
@@ -99,7 +128,6 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
             }
 
             const content = typeof fileRes.data === 'string' ? JSON.parse(fileRes.data) : fileRes.data;
-            const { calculateChecksum } = await import('../../../utils');
 
             const existingSource = sourceManager?.getAllSources().find(s => s.id === entry.id);
             if (existingSource) {
@@ -146,20 +174,37 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
                 return;
             }
 
-            const cssStr = fs.readFileSync(themeCssPath).toString();
-            const manifestPath = path.join(themeDir, 'manifest.json');
-            let manifest: OBThemeManifest = { name: theme.name, version: '0.0.0', minAppVersion: '', author: '', authorUrl: '' };
-            if (fs.existsSync(manifestPath)) {
-                try { manifest = fs.readJsonSync(manifestPath); } catch (e) { /* use default */ }
-            }
-
-            if (hasChineseText(manifest.name || theme.name) || hasBoundedChineseRuns(cssStr)) {
-                i18n.notice.result(false, '检测到主题已包含中文内容，已跳过提取');
+            const result = await i18n.companionWorkerManager.runTask<any>('theme-extract', {
+                resourceId: theme.name,
+                label: theme.name,
+                themeName: theme.name,
+                themeDir,
+                themeCssPath,
+                settings: {
+                    author: i18n.settings.author,
+                    reFlags: i18n.settings.reFlags,
+                    reLength: i18n.settings.reLength,
+                    reDatas: i18n.settings.reDatas,
+                    reRejectRe: i18n.settings.reRejectRe,
+                    reValidRe: i18n.settings.reValidRe,
+                    chineseSkipMode: i18n.settings.chineseSkipMode || 'source',
+                    astAssignments: i18n.settings.astAssignments,
+                    astFunctions: i18n.settings.astFunctions,
+                    astKeys: i18n.settings.astKeys,
+                    astMaxLength: i18n.settings.astMaxLength ?? 300,
+                    astRejectRe: i18n.settings.astRejectRe,
+                    astValidRe: i18n.settings.astValidRe,
+                },
+            });
+            if (result.status === 'skipped') {
+                i18n.notice.result(false, result.reason === 'chinese' ? '检测到主题已包含中文内容，已跳过提取' : '未提取到可翻译内容，已跳过提取');
                 return;
             }
+            if (result.status !== 'success' || !result.content) {
+                throw new Error(result.error || 'Extract failed');
+            }
 
-            const { generateTheme } = await import('../../../utils');
-            const themeTranslation = generateTheme(manifest, cssStr, i18n.settings);
+            const themeTranslation = result.content;
             const extractedSources = getThemeTranslationSources(themeTranslation);
 
             if (!hasExtractedTranslationContent(extractedSources)) {
@@ -262,8 +307,7 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
                                 <Select
                                     value={activeSourceId ?? undefined}
                                     onValueChange={(val) => {
-                                        sourceManager?.setActive(val, true);
-                                        refreshParent();
+                                        void setActiveSource(val);
                                     }}
                                 >
                                     <SelectTrigger className="w-[110px] text-[10px] px-2 h-7 bg-muted/40 border-none shadow-none hover:bg-muted/60 transition-all rounded-none" size="sm">
@@ -362,8 +406,7 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
                                         </DropdownMenuItem>
                                         {activeSourceId && (
                                             <DropdownMenuItem onClick={() => {
-                                                sourceManager?.removeSource(activeSourceId);
-                                                refreshParent();
+                                                void removeSource(activeSourceId);
                                             }} className="text-[12px] py-2 text-destructive focus:text-destructive focus:bg-destructive/5">
                                                 <XCircle className="w-3.5 h-3.5 mr-2.5 opacity-70" />
                                                 <span>{t('Manager.Common.Actions.Delete')}</span>
@@ -526,8 +569,7 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
                                 </DropdownMenuItem>
                                 {activeSourceId && (
                                     <DropdownMenuItem onClick={() => {
-                                        sourceManager?.removeSource(activeSourceId);
-                                        refreshParent();
+                                        void removeSource(activeSourceId);
                                     }} className="text-[12px] py-2 text-destructive focus:text-destructive focus:bg-destructive/5">
                                         <XCircle className="w-3.5 h-3.5 mr-2.5 opacity-70" />
                                         <span>{t('Manager.Common.Actions.Delete')}</span>

@@ -1,4 +1,4 @@
-import { pageRule } from '../utils';
+import type { pageRule } from '../utils/ui/immersive';
 import { DEFAULT_AST_PROMPT_TEMPLATE, DEFAULT_REGEX_PROMPT_TEMPLATE, DEFAULT_THEME_PROMPT_TEMPLATE } from '../ai/prompts';
 import { LLM_PROVIDERS } from '../ai/constants';
 import { AST_DEFAULT_CONFIG, REGEX_DEFAULT_CONFIG } from '../utils/translator/config';
@@ -49,6 +49,7 @@ export interface I18nSettings {
     llmLanguage: string;            // LLM 翻译的目标语言
     llmStyle: string;               // LLM 翻译的风格类型
     llmBatchSize: number;           // LLM 批量翻译每批文本条数
+    llmOverwriteExistingTranslations: boolean; // 批量翻译是否覆盖现有译文
     llmConcurrencyLimit: number;    // LLM 并发请求限制数
     batchExtractConcurrency: number; // 管理器批量提取资源并发数
     batchTranslateConcurrency: number; // 管理器批量翻译资源并发数
@@ -271,6 +272,7 @@ export const DEFAULT_SETTINGS: I18nSettings = {
     llmLanguage: '简体中文',        // LLM 的默认生成语言
     llmStyle: '无',                 // LLM 的默认生成风格
     llmBatchSize: 10,               // 默认每批 10 条
+    llmOverwriteExistingTranslations: false, // 默认不覆盖已有译文
     llmConcurrencyLimit: 3,         // 默认 LLM 请求并发限制为 3
     batchExtractConcurrency: 3,     // 默认批量提取资源并发为 3
     batchTranslateConcurrency: 2,   // 默认批量翻译资源并发为 2

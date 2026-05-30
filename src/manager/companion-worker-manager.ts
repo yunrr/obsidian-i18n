@@ -6,32 +6,46 @@ import type { ChildProcess } from 'child_process';
 import type I18N from '../main';
 import type {
     CompanionAsyncTaskType,
+    CompanionApplyTranslationResponse,
+    CompanionAstReplaceRequest,
+    CompanionAstReplaceResponse,
     CompanionAutoMatchRequest,
     CompanionAutoMatchResponse,
     CompanionBatchTaskType,
     CompanionCloudResponse,
     CompanionCloudTaskType,
+    CompanionCodeExtractRequest,
+    CompanionCodeExtractResponse,
     CompanionDiscoveredPlugin,
     CompanionDiscoveredTheme,
     CompanionGithubReadRequest,
     CompanionGithubReadResponse,
     CompanionGithubWriteRequest,
     CompanionGithubWriteResponse,
+    CompanionPluginApplyTranslationRequest,
     CompanionProxyRequest,
     CompanionProxyResponse,
+    CompanionSourceManagerRequest,
+    CompanionSourceManagerResponse,
     CompanionTaskCancelResponse,
     CompanionTaskProgress,
     CompanionTaskStartResponse,
     CompanionTaskStatusResponse,
+    CompanionThemeApplyTranslationRequest,
 } from './companion-worker-types';
 
 export type {
     CompanionAsyncTaskType,
+    CompanionApplyTranslationResponse,
+    CompanionAstReplaceRequest,
+    CompanionAstReplaceResponse,
     CompanionAutoMatchRequest,
     CompanionAutoMatchResponse,
     CompanionBatchFailure,
     CompanionCloudResponse,
     CompanionCloudTaskType,
+    CompanionCodeExtractRequest,
+    CompanionCodeExtractResponse,
     CompanionBatchResource,
     CompanionBatchTaskType,
     CompanionDiscoveredPlugin,
@@ -42,6 +56,7 @@ export type {
     CompanionGithubWriteRequest,
     CompanionGithubWriteResponse,
     CompanionExtractResult,
+    CompanionPluginApplyTranslationRequest,
     CompanionPluginBatchExtractPayload,
     CompanionPluginBatchTranslatePayload,
     CompanionPluginExtractPayload,
@@ -56,11 +71,14 @@ export type {
     CompanionPluginFailureRetryPayload,
     CompanionProxyRequest,
     CompanionProxyResponse,
+    CompanionSourceManagerRequest,
+    CompanionSourceManagerResponse,
     CompanionTaskCancelResponse,
     CompanionTaskProgress,
     CompanionTaskStartResponse,
     CompanionTaskStatus,
     CompanionTaskStatusResponse,
+    CompanionThemeApplyTranslationRequest,
     CompanionThemeBatchExtractPayload,
     CompanionThemeBatchTranslatePayload,
     CompanionThemeExtractPayload,
@@ -161,6 +179,38 @@ export class CompanionWorkerManager {
     public async autoMatch(request: CompanionAutoMatchRequest): Promise<CompanionAutoMatchResponse> {
         const response = await this.postWorker<{ result: CompanionAutoMatchResponse }>('/automation/match', request);
         return response.result;
+    }
+
+    public async astReplace(request: CompanionAstReplaceRequest): Promise<CompanionAstReplaceResponse> {
+        return this.runTask<CompanionAstReplaceResponse>('ast-replace', request);
+    }
+
+    public async codeExtract(request: CompanionCodeExtractRequest): Promise<CompanionCodeExtractResponse> {
+        return this.runTask<CompanionCodeExtractResponse>('code-extract', request);
+    }
+
+    public async applyPluginTranslation(request: CompanionPluginApplyTranslationRequest): Promise<CompanionApplyTranslationResponse> {
+        return this.runTask<CompanionApplyTranslationResponse>('plugin-apply-translation', request);
+    }
+
+    public async applyThemeTranslation(request: CompanionThemeApplyTranslationRequest): Promise<CompanionApplyTranslationResponse> {
+        return this.runTask<CompanionApplyTranslationResponse>('theme-apply-translation', request);
+    }
+
+    public async exportSources(request: CompanionSourceManagerRequest): Promise<CompanionSourceManagerResponse> {
+        return this.runTask<CompanionSourceManagerResponse>('source-export', request);
+    }
+
+    public async importSources(request: CompanionSourceManagerRequest): Promise<CompanionSourceManagerResponse> {
+        return this.runTask<CompanionSourceManagerResponse>('source-import', request);
+    }
+
+    public async removeSources(request: CompanionSourceManagerRequest): Promise<CompanionSourceManagerResponse> {
+        return this.runTask<CompanionSourceManagerResponse>('source-remove', request);
+    }
+
+    public async setActiveSource(request: CompanionSourceManagerRequest): Promise<CompanionSourceManagerResponse> {
+        return this.runTask<CompanionSourceManagerResponse>('source-set-active', request);
     }
 
     public async runCloudTask(type: CompanionCloudTaskType, payload: unknown): Promise<CompanionCloudResponse> {

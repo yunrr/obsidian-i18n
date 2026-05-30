@@ -8,7 +8,7 @@ import { Progress } from '@/src/shadcn/ui/progress';
 import { ScrollArea } from '@/src/shadcn/ui/scroll-area';
 import { Upload, Download, CheckCircle2, Cloud, HardDrive, ArrowRight, Package, ArrowLeft, RotateCcw } from 'lucide-react';
 import { useCloudStore } from '../cloud-store';
-import { useGlobalStoreInstance } from '~/utils';
+import { useGlobalStoreInstance } from '~/utils/store/global';
 import { t } from '@/src/locales/index';
 import { ManifestEntry } from '../types';
 import { cn } from '@/src/shadcn/lib/utils';

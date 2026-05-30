@@ -3,7 +3,7 @@ import { PluginManifest } from 'obsidian';
 import { OBThemeManifest, ITheme, PluginTranslationV1, PluginTranslationSchemaVersion, PluginTranslationV1Ast, PluginTranslationV1Regex } from '~/types';
 import { AstTranslator } from '~/utils/translator/core-ast-translator';
 import { RegexTranslator } from '~/utils/translator/core-regex-translator';
-import { useGlobalStoreInstance } from '~/utils';
+import { useGlobalStoreInstance } from '~/utils/store/global';
 
 /**
  * 生成插件的翻译 JSON 对象。

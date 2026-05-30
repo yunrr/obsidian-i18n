@@ -8,7 +8,7 @@ import { Button, Input, Label, Select, SelectContent, SelectItem, SelectTrigger,
 import { Trash2, FolderOpen, AlertCircle, Loader2, Edit3, Layers, Clock, Tag, RefreshCw, Search, Globe, Download, Star, Github, FileText, Save, Users, History, Cloud, HardDrive, Upload, Palette, Plus, CheckCircle2, Cpu, Zap, CircleCheckBig, MessageSquareWarning } from 'lucide-react';
 import { MarkdownViewer } from './markdown-viewer';
 import { useCloudStore } from '../cloud-store';
-import { useGlobalStoreInstance } from '~/utils';
+import { useGlobalStoreInstance } from '~/utils/store/global';
 import { t } from '@/src/locales/index';
 
 import { ScrollArea } from '@/src/shadcn/ui/scroll-area';
@@ -16,7 +16,7 @@ import { SUPPORTED_LANGUAGES } from '@/src/constants/languages';
 import { Badge } from '@/src/shadcn/ui/badge';
 import { ManifestEntry, getCloudFilePath } from '../types';
 import { cn } from '@/src/shadcn/lib/utils';
-import { calculateChecksum } from '@/src/utils/translator/translation';
+import { calculateChecksum } from '@/src/utils/translator/light';
 import { TranslationSource } from '@/src/types';
 import * as fs from 'fs-extra';
 import { LoginRequired } from './login-required';

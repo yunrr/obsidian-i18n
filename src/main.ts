@@ -8,18 +8,18 @@ import { LLM_PROVIDERS } from './ai/constants';
 import { I18nSettingTab } from './settings';
 import { t } from './locales';
 
-import { icons } from '~/utils';
+import { icons } from '~/utils/ui/icon';
 import commands from './command';
 
 import { APIManager, ViewManager, NoticeManager, StateManager, BackupManager, SourceManager, InjectorManager, CoreManager, ExtractManager, AutoManager, CompanionWorkerManager } from './manager';
-import { info } from './utils';
+import { info } from './utils/common/general';
 import { OBThemeManifest, Contributor, NameTranslationJSON } from '~/types';
 
 import { LoggerManager } from './manager/logger';
 
 import { EditorView, EDITOR_VIEW_TYPE } from './views/plugin_editor/editor';
 import { ThemeEditorView, THEME_EDITOR_VIEW_TYPE } from './views/theme_editor/editor';
-import { useGlobalStoreInstance } from './utils';
+import { useGlobalStoreInstance } from './utils/store/global';
 import { AgreementView, AGREEMENT_VIEW_TYPE } from './views/agreement';
 import { ManagerView, MANAGER_VIEW_TYPE } from './views/manager/manager-view';
 import { CloudView, CLOUD_VIEW_TYPE } from './views/cloud/cloud-view';

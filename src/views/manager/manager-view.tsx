@@ -4,7 +4,7 @@ import { Root, createRoot } from 'react-dom/client';
 import I18N from '../../main';
 import { ManagerLayout } from './manager-layout';
 import { t } from '../../locales';
-import { mountReactView } from '~/utils';
+import { mountReactView } from '~/utils/core/react';
 
 export const MANAGER_VIEW_TYPE = 'i18n-manager-view';
 

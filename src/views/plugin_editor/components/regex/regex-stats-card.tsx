@@ -3,7 +3,6 @@ import { Badge, Card, CardContent, CardHeader, CardTitle } from '~/shadcn';
 import { TemplateCard } from '../common/template-card';
 import { ChartPie, Zap } from 'lucide-react';
 import { useRegexStore } from '../..';
-import { validationJavaScriptCode } from '~/utils';
 import { useTranslation } from 'react-i18next';
 
 interface Props {

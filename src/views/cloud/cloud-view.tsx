@@ -8,7 +8,7 @@ import { Root, createRoot } from 'react-dom/client';
 import I18N from '@/src/main';
 import { Button, Tabs, TabsContent, TabsList, TabsTrigger, Card } from '~/shadcn';
 import { Cloud, Download, Upload, FolderOpen, RefreshCw, User, UserCheck, LogOut, ChevronDown, Users } from 'lucide-react';
-import { useGlobalStoreInstance } from '~/utils';
+import { useGlobalStoreInstance } from '~/utils/store/global';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/src/shadcn/ui/dropdown-menu';
 
 import { useTranslation } from 'react-i18next';
@@ -21,7 +21,7 @@ import { ManageTab } from './components/manage-tab';
 import { CommunityTab } from './components/community-tab';
 import { HistoryTab } from './components/history-dialog';
 import { BackupSyncTab } from './components/backup-sync-dialog';
-import { mountReactView } from '~/utils';
+import { mountReactView } from '~/utils/core/react';
 
 // 视图类型
 export const CLOUD_VIEW_TYPE = 'i18n-cloud-view';

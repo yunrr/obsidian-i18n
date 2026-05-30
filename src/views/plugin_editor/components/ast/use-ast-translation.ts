@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { useRegexStore } from '../../store';
-import { useGlobalStore } from '~/utils';
+import { useGlobalStore } from '~/utils/store/global';
 import { createTranslationProvider } from '~/ai/provider-factory';
 import { toast } from "sonner";
 import { t } from "@/src/locales";

@@ -6,9 +6,10 @@ import { useTranslation } from 'react-i18next';
 import { Settings, FolderOpen, Pen, FileOutput, XCircle, Loader2, MoreHorizontal, CloudDownload, Cloud } from 'lucide-react';
 import I18N from 'src/main';
 import { PluginTranslationV1 } from 'src/types';
-import { i18nOpen, AstTranslator, RegexTranslator, isValidPluginTranslationV1Format, getPluginTranslationSources, hasBoundedChineseRuns, hasChineseText, hasExtractedTranslationContent } from '../../../utils';
+import { i18nOpen } from '../../../utils/common/general';
+import { getPluginTranslationSources, hasExtractedTranslationContent, calculateChecksum } from '../../../utils/translator/light';
 import { loadTranslationFile } from '../../../manager/io-manager';
-import { useGlobalStoreInstance } from '~/utils';
+import { useGlobalStoreInstance } from '~/utils/store/global';
 import { EDITOR_VIEW_TYPE } from '../../../views';
 import {
     Button,
@@ -54,6 +55,7 @@ export interface PluginItemData {
     isApplied: boolean;
     isTranslated: boolean;
     pendingTranslationCount?: number;
+    totalTranslationCount?: number;
     translationVersion?: string;
     supportedVersion?: string;
     cloudEntries?: any[];
@@ -87,6 +89,43 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
     const sourceManager = i18n.sourceManager;
     const [downloadingCloudId, setDownloadingCloudId] = useState<string | null>(null);
 
+    const setActiveSource = async (sourceId: string) => {
+        if (i18n.settings.llmCompanionWorkerEnabled) {
+            try {
+                await i18n.companionWorkerManager.setActiveSource({
+                    persistence: { basePath: sourceManager.getBasePath() },
+                    sourceId,
+                    active: true,
+                });
+                sourceManager.reloadFromDisk();
+                refreshParent();
+                return;
+            } catch (error) {
+                console.warn('[I18N Companion] Source set-active fallback:', error);
+            }
+        }
+        sourceManager?.setActive(sourceId, true);
+        refreshParent();
+    };
+
+    const removeSource = async (sourceId: string) => {
+        if (i18n.settings.llmCompanionWorkerEnabled) {
+            try {
+                await i18n.companionWorkerManager.removeSources({
+                    persistence: { basePath: sourceManager.getBasePath() },
+                    sourceIds: [sourceId],
+                });
+                sourceManager.reloadFromDisk();
+                refreshParent();
+                return;
+            } catch (error) {
+                console.warn('[I18N Companion] Source remove fallback:', error);
+            }
+        }
+        sourceManager?.removeSource(sourceId);
+        refreshParent();
+    };
+
     const handleCloudDownload = async (entry: any) => {
         if (downloadingCloudId) return;
         setDownloadingCloudId(entry.id);
@@ -106,7 +145,6 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
             }
 
             const content = typeof fileRes.data === 'string' ? JSON.parse(fileRes.data) : fileRes.data;
-            const { calculateChecksum } = await import('../../../utils');
 
             const existingSource = sourceManager?.getAllSources().find(s => s.id === entry.id);
             if (existingSource) {
@@ -152,19 +190,40 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
                 i18n.notice.error(t('Manager.Plugins.Errors.MainNotFound'));
                 return;
             }
-            const mainBuffer = await fs.readFile(mainDoc);
-            const mainStr = mainBuffer.toString();
-            const manifestJSON = await fs.readJson(manifestDoc);
+            const result = await i18n.companionWorkerManager.runTask<any>('plugin-extract', {
+                resourceId: plugin.id,
+                label: plugin.name,
+                pluginName: plugin.name,
+                pluginVersion: plugin.version,
+                mainDoc,
+                manifestDoc,
+                language: settings.language,
+                settings: {
+                    author: i18n.settings.author,
+                    reFlags: i18n.settings.reFlags,
+                    reLength: i18n.settings.reLength,
+                    reDatas: i18n.settings.reDatas,
+                    reRejectRe: i18n.settings.reRejectRe,
+                    reValidRe: i18n.settings.reValidRe,
+                    chineseSkipMode: i18n.settings.chineseSkipMode || 'source',
+                    astAssignments: i18n.settings.astAssignments,
+                    astFunctions: i18n.settings.astFunctions,
+                    astKeys: i18n.settings.astKeys,
+                    astMaxLength: i18n.settings.astMaxLength ?? 300,
+                    astRejectRe: i18n.settings.astRejectRe,
+                    astValidRe: i18n.settings.astValidRe,
+                },
+            });
 
-            if (hasChineseText(`${manifestJSON.name || plugin.name}\n${manifestJSON.description || ''}`) || hasBoundedChineseRuns(mainStr)) {
-                i18n.notice.result(false, '检测到插件已包含中文内容，已跳过提取');
+            if (result.status === 'skipped') {
+                i18n.notice.result(false, result.reason === 'chinese' ? '检测到插件已包含中文内容，已跳过提取' : '未提取到可翻译内容，已跳过提取');
                 return;
             }
+            if (result.status !== 'success' || !result.content) {
+                throw new Error(result.error || 'Extract failed');
+            }
 
-            // 延时一下避免 UI 冻结感
-            await new Promise(resolve => setTimeout(resolve, 0));
-            const { generatePlugin } = await import('../../../utils');
-            const translationJson = generatePlugin(plugin.version, manifestJSON, mainStr, settings.language, i18n.settings);
+            const translationJson = result.content;
             const extractedSources = getPluginTranslationSources(translationJson);
             if (!hasExtractedTranslationContent(extractedSources)) {
                 i18n.notice.result(false, '未提取到可翻译内容，已跳过提取');
@@ -193,43 +252,15 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
         try {
             const translationJson: PluginTranslationV1 = loadTranslationFile(langDoc);
             if (translationJson.dict) {
-                const files = Object.keys(translationJson.dict);
-                await i18n.backupManager.createBackup(plugin.id, pluginDir, files);
-
-                const newContents: Record<string, string> = {};
-
-                for (const [file, dict] of Object.entries(translationJson.dict as Record<string, any>)) {
-                    const targetFilePath = path.join(pluginDir, file);
-                    if (!fs.existsSync(targetFilePath)) continue;
-
-                    let fileString = fs.readFileSync(targetFilePath).toString();
-
-                    if (dict.ast && dict.ast.length > 0) {
-                        const astTranslator = new AstTranslator(i18n.settings);
-                        const ast = astTranslator.loadCode(fileString);
-                        if (ast) {
-                            fileString = astTranslator.translate(ast, dict.ast);
-                        }
-                    }
-
-                    if (dict.regex && dict.regex.length > 0) {
-                        const regexTranslator = new RegexTranslator(i18n.settings);
-                        fileString = regexTranslator.translate(fileString, dict.regex);
-                    }
-
-                    if (targetFilePath.endsWith('.js')) {
-                        const checkTranslator = new AstTranslator(i18n.settings);
-                        if (!checkTranslator.loadCode(fileString)) {
-                            throw new Error(t('Manager.Plugins.Errors.SyntaxError', { file }));
-                        }
-                    }
-
-                    newContents[targetFilePath] = fileString;
-                }
-
-                for (const [targetFilePath, content] of Object.entries(newContents)) {
-                    fs.writeFileSync(targetFilePath, content);
-                }
+                // @ts-ignore
+                const backupBasePath = path.join(path.normalize(i18n.app.vault.adapter.getBasePath()), i18n.manifest.dir || '');
+                const result = await i18n.companionWorkerManager.applyPluginTranslation({
+                    pluginId: plugin.id,
+                    pluginDir,
+                    backupBasePath,
+                    translationJson,
+                });
+                if (!result.state) throw new Error(result.error || t('Manager.Common.Errors.ErrorDesc'));
             }
             i18n.stateManager.setPluginState(plugin.id, {
                 id: plugin.id,
@@ -356,8 +387,7 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
                                 <Select
                                     value={activeSourceId ?? undefined}
                                     onValueChange={(val) => {
-                                        sourceManager?.setActive(val, true);
-                                        refreshParent();
+                                        void setActiveSource(val);
                                     }}
                                 >
                                     <SelectTrigger className="w-[110px] text-[10px] px-2 h-7 bg-muted/40 border-none shadow-none hover:bg-muted/60 transition-all rounded-none" size="sm">
@@ -453,8 +483,7 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
                                         </DropdownMenuItem>
                                         {activeSourceId && (
                                             <DropdownMenuItem onClick={() => {
-                                                sourceManager?.removeSource(activeSourceId);
-                                                refreshParent();
+                                                void removeSource(activeSourceId);
                                             }} className="text-[12px] py-2 text-destructive focus:text-destructive focus:bg-destructive/5">
                                                 <XCircle className="w-3.5 h-3.5 mr-2.5 opacity-70" />
                                                 <span>{t('Manager.Common.Actions.Delete')}</span>
@@ -619,8 +648,7 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
                                 </DropdownMenuItem>
                                 {activeSourceId && (
                                     <DropdownMenuItem onClick={() => {
-                                        sourceManager?.removeSource(activeSourceId);
-                                        refreshParent();
+                                        void removeSource(activeSourceId);
                                     }} className="text-[12px] py-2 text-destructive focus:text-destructive focus:bg-destructive/5">
                                         <XCircle className="w-3.5 h-3.5 mr-2.5 opacity-70" />
                                         <span>{t('Manager.Common.Actions.Delete')}</span>

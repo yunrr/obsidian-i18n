@@ -5,10 +5,9 @@
 
 import exp from 'constants';
 
-// AST 翻译器核心实现
-export * from '~/utils/translator/core-ast-translator';
-// 正则表达式翻译器核心实现
-export * from '~/utils/translator/core-regex-translator';
+// Heavy AST/Regex translator implementations live in Rust worker now.
+// Do not re-export frontend Babel translators from this barrel; otherwise every
+// `~/utils` import pulls them back into main.js.
 // 通用翻译相关类型/工具（基础翻译逻辑、接口定义等）
 export * from '~/utils/translator/translation';
 

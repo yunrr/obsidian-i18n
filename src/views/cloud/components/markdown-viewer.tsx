@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useMemo } from 'react';
 import { MarkdownRenderer, Component } from 'obsidian';
-import { useGlobalStoreInstance } from '~/utils';
+import { useGlobalStoreInstance } from '~/utils/store/global';
 import { cn } from '~/shadcn/lib/utils';
 
 interface MarkdownViewerProps {

@@ -11,9 +11,9 @@ import I18N from 'src/main';
 import { TranslationSource } from 'src/types';
 import { Notice } from 'obsidian';
 import * as fs from 'fs-extra';
-import * as zlib from 'zlib';
 import * as path from 'path';
-import { useGlobalStoreInstance, i18nOpen } from '~/utils';
+import { useGlobalStoreInstance } from '~/utils/store/global';
+import { i18nOpen } from '~/utils/common/general';
 import { loadTranslationFile } from '../../../manager/io-manager';
 import { EDITOR_VIEW_TYPE } from '../../../views';
 
@@ -109,21 +109,14 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
         if (selectedIds.size === 0) return;
 
         try {
-            const exportData: Record<string, any> = {};
-            for (const id of selectedIds) {
-                const source = sourceManager.getSource(id);
-                if (source) {
-                    const content = sourceManager.readSourceFile(id);
-                    exportData[id] = {
-                        meta: source,
-                        content: content
-                    };
-                }
-            }
+            const result = await i18n.companionWorkerManager.exportSources({
+                persistence: { basePath: sourceManager.getBasePath() },
+                sourceIds: Array.from(selectedIds),
+            });
+            if (!result.state || !result.contentBase64) throw new Error(result.error || 'Export failed');
 
-            const jsonString = JSON.stringify(exportData);
-            const compressed = zlib.gzipSync(Buffer.from(jsonString, 'utf-8'));
-            const blob = new Blob([new Uint8Array(compressed)], { type: 'application/gzip' });
+            const bytes = Buffer.from(result.contentBase64, 'base64');
+            const blob = new Blob([new Uint8Array(bytes)], { type: 'application/gzip' });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
@@ -152,51 +145,20 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
                 reader.onload = async (event) => {
                     try {
                         const buffer = event.target?.result as ArrayBuffer;
-                        let content: string;
+                        const result = await i18n.companionWorkerManager.importSources({
+                            persistence: { basePath: sourceManager.getBasePath() },
+                            fileName: file.name,
+                            contentBase64: Buffer.from(buffer).toString('base64'),
+                        });
 
-                        // 根据后缀或内容尝试解压
-                        if (file.name.endsWith('.gz') || file.name.endsWith('.i18n.gz')) {
-                            const decompressed = zlib.gunzipSync(Buffer.from(buffer));
-                            content = decompressed.toString('utf-8');
-                        } else {
-                            // 兼容旧的 JSON 格式
-                            content = new TextDecoder().decode(buffer);
-                        }
-
-                        const data = JSON.parse(content);
-                        let addedCount = 0;
-                        let updatedCount = 0;
-                        let skippedCount = 0;
-
-                        if (data && typeof data === 'object') {
-                            for (const key in data) {
-                                const item = data[key];
-                                if (item.meta && item.content) {
-                                    const existing = sourceManager.getSource(item.meta.id);
-                                    if (existing) {
-                                        if (existing.checksum === item.meta.checksum) {
-                                            skippedCount++;
-                                            continue;
-                                        } else {
-                                            updatedCount++;
-                                        }
-                                    } else {
-                                        addedCount++;
-                                    }
-
-                                    sourceManager.saveSource(item.meta);
-                                    sourceManager.saveSourceFile(item.meta.id, item.content);
-                                }
-                            }
-                        }
-
+                        sourceManager.reloadFromDisk();
+                        const { addedCount, updatedCount, skippedCount } = result;
                         if (addedCount > 0 || updatedCount > 0) {
                             let msg = '';
                             if (addedCount > 0) msg += `新增 ${addedCount} `;
                             if (updatedCount > 0) msg += `更新 ${updatedCount} `;
                             if (skippedCount > 0) msg += `(跳过 ${skippedCount} 项重复)`;
                             new Notice(msg.trim() || t('Manager.Sources.Actions.ImportSuccess', { count: addedCount + updatedCount }));
-                            // 刷新列表
                             useGlobalStoreInstance.getState().triggerSourceUpdate();
                         } else if (skippedCount > 0) {
                             new Notice(`全部 ${skippedCount} 项已存在且内容一致，无需导入`);
@@ -224,12 +186,13 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
         if (!confirmed) return;
 
         try {
-            for (const id of selectedIds) {
-                sourceManager.removeSource(id);
-            }
+            await i18n.companionWorkerManager.removeSources({
+                persistence: { basePath: sourceManager.getBasePath() },
+                sourceIds: Array.from(selectedIds),
+            });
+            sourceManager.reloadFromDisk();
             setSelectedIds(new Set());
             new Notice(t('Common.Notices.DeleteSuccess'));
-            // 刷新列表
             useGlobalStoreInstance.getState().triggerSourceUpdate();
         } catch (error) {
             new Notice(t('Manager.Common.Errors.Error'));
@@ -442,8 +405,12 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
                                                             {t('Manager.Common.Actions.OpenFolder')}
                                                         </DropdownMenuItem>
                                                         <div className="h-px bg-border/40 my-1 mx-1" />
-                                                        <DropdownMenuItem className="text-[12px] text-destructive focus:text-destructive focus:bg-destructive/10 rounded-none cursor-pointer py-2" onClick={() => {
-                                                            sourceManager.removeSource(source.id);
+                                                        <DropdownMenuItem className="text-[12px] text-destructive focus:text-destructive focus:bg-destructive/10 rounded-none cursor-pointer py-2" onClick={async () => {
+                                                            await i18n.companionWorkerManager.removeSources({
+                                                                persistence: { basePath: sourceManager.getBasePath() },
+                                                                sourceIds: [source.id],
+                                                            });
+                                                            sourceManager.reloadFromDisk();
                                                             new Notice(t('Common.Notices.DeleteSuccess'));
                                                             useGlobalStoreInstance.getState().triggerSourceUpdate();
                                                         }}>

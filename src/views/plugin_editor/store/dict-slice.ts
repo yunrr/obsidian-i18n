@@ -22,7 +22,7 @@ export const createDictSlice: StateCreator<
             const newData = { ...dictData };
 
             // 1. 保存当前进度到原文件
-            if (currentFile && newData[currentFile]) {
+            if (currentFile && currentFile !== file && newData[currentFile]) {
                 newData[currentFile] = {
                     ast: astItems.map(item => ({ type: item.type, name: item.name, source: item.source, target: item.target })),
                     regex: regexItems.map(item => ({ source: item.source, target: item.target }))

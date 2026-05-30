@@ -3,7 +3,7 @@
  */
 import { create } from 'zustand';
 import { CloudTabType, SearchParams, UploadFormData, LocalTranslationFile, ManifestEntry, RegistryItem, CommunityStatsData, OutdatedSource, BackupProgress, GithubUserInfo, GithubRepoInfo, ContributorEntry } from './types';
-import { createSelectors } from '@/src/utils';
+import { createSelectors } from '@/src/utils/store/zustand';
 
 // Store 状态接口
 interface CloudState {

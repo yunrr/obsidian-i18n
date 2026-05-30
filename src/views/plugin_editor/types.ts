@@ -1,5 +1,5 @@
 import I18N from "@/main";
-import { ReactView } from "~/utils";
+import { ReactView } from "~/utils/core/react";
 import { PluginTranslationV1, PluginTranslationV1Regex, PluginTranslationV1Metadata, PluginTranslationV1Ast } from "@/src/types";
 
 // 基础类型定义 ====================================================================================================

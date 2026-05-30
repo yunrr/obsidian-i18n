@@ -14,9 +14,10 @@ import { useRegexStore } from './store';
 import { EditorProps, DiagnoseError } from './types';
 import { RegexEditor, AstEditor } from '.';
 
-import { useGlobalStoreInstance } from '~/utils';
-import { AstTranslator, RegexTranslator, mergeAstItems, mergeRegexItems, mountReactView, StringPicker } from '~/utils';
-import { calculateChecksum } from '@/src/utils/translator/translation';
+import { useGlobalStoreInstance } from '~/utils/store/global';
+import { mountReactView } from '~/utils/core/react';
+import { StringPicker } from '~/utils/ui/string-picker';
+import { calculateChecksum, mergeAstItems, mergeRegexItems } from '@/src/utils/translator/light';
 import { saveTranslationFile } from '@/src/manager/io-manager';
 import { createTranslationProvider } from '~/ai/provider-factory';
 
@@ -131,8 +132,52 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
     const [isAddPathDialogOpen, setIsAddPathDialogOpen] = useState(false);
     const [newPathInput, setNewPathInput] = useState('');
 
-    const astTranslator = useMemo(() => new AstTranslator(i18n.settings), [i18n.settings]);
-    const regexTranslator = useMemo(() => new RegexTranslator(i18n.settings), [i18n.settings]);
+    const getExtractionSettings = React.useCallback(() => ({
+        author: i18n.settings.author,
+        reFlags: i18n.settings.reFlags,
+        reLength: i18n.settings.reLength,
+        reDatas: i18n.settings.reDatas,
+        reRejectRe: i18n.settings.reRejectRe,
+        reValidRe: i18n.settings.reValidRe,
+        chineseSkipMode: i18n.settings.chineseSkipMode || 'source',
+        astAssignments: i18n.settings.astAssignments,
+        astFunctions: i18n.settings.astFunctions,
+        astKeys: i18n.settings.astKeys,
+        astMaxLength: i18n.settings.astMaxLength ?? 300,
+        astRejectRe: i18n.settings.astRejectRe,
+        astValidRe: i18n.settings.astValidRe,
+    }), [i18n.settings]);
+
+    const applyRegexItems = React.useCallback((code: string, items: any[]) => {
+        let result = code;
+        for (const item of items) {
+            if (item.source && item.target && item.source !== item.target) {
+                result = result.split(item.source).join(item.target);
+            }
+        }
+        return result;
+    }, []);
+
+    const validateTargetSyntax = React.useCallback((target: string) => {
+        if (!target.includes('${') && !target.includes('`')) return true;
+        try {
+            // eslint-disable-next-line no-new-func
+            new Function(`return \`${target.replace(/`/g, '\\`')}\`;`);
+            return true;
+        } catch {
+            return false;
+        }
+    }, []);
+
+    const validateSecurityText = React.useCallback((target: string) => {
+        const issues: { severity: 'critical' | 'warning'; message: string }[] = [];
+        if (!target) return issues;
+        const critical = [/\beval\s*\(/i, /\bFunction\s*\(/i, /\bsetTimeout\s*\(\s*['"`]/i, /\bsetInterval\s*\(\s*['"`]/i, /<script/i, /\bjavascript:/i];
+        const warning = [/\bfetch\s*\(/i, /\bXMLHttpRequest\b/i, /\bWebSocket\b/i, /\brequire\s*\(/i, /\bprocess\./i, /\belectron\./i, /\blocalStorage\b/i, /\bdocument\.cookie\b/i];
+        for (const regex of critical) if (regex.test(target)) issues.push({ severity: 'critical', message: `发现危险的执行指令: ${regex}` });
+        for (const regex of warning) if (regex.test(target)) issues.push({ severity: 'warning', message: `发现可疑的代码模式: ${regex}` });
+        return issues;
+    }, []);
 
 
     useEffect(() => {
@@ -251,24 +296,20 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
             }
 
             const mainStr = fs.readFileSync(fileDoc).toString();
-            const astTranslator = new AstTranslator(i18n.settings);
-            const ast = astTranslator.loadCode(mainStr);
+            const extracted = await i18n.companionWorkerManager.codeExtract({
+                code: mainStr,
+                settings: getExtractionSettings(),
+            });
+            const newAstItems = extracted.ast || [];
+            const currentAstItems = useRegexStore.getState().astItems;
 
-            if (ast) {
-                const newAstItems = astTranslator.extract(ast);
-                const currentAstItems = useRegexStore.getState().astItems;
-
-                // 合并新旧数据
-                const merged = mergeAstItems(currentAstItems, newAstItems);
-
-                // 更新 store (重新分配 ID 以保证唯一性和连续性)
-                setAstItems(merged.map((item, index) => ({ ...item, id: index })));
-                notice.success(t('Editor.Notices.SuccessIncrementalExtract'));
-            }
+            const merged = mergeAstItems(currentAstItems, newAstItems as any);
+            setAstItems(merged.map((item, index) => ({ ...item, id: index })));
+            notice.success(t('Editor.Notices.SuccessIncrementalExtract'));
         } catch (e) {
             notice.error(t('Editor.Errors.SyntaxErrorAst') + ': ' + e);
         }
-    }, [i18n, notice, t, setAstItems]);
+    }, [i18n, notice, t, setAstItems, getExtractionSettings]);
 
     const incrementalExtractRegex = React.useCallback(async () => {
         try {
@@ -298,9 +339,11 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
             }
 
             const mainStr = fs.readFileSync(fileDoc).toString();
-
-            const regexTranslator = new RegexTranslator(i18n.settings);
-            const newRegexItems = regexTranslator.extractTranslationsByRegex(mainStr);
+            const extracted = await i18n.companionWorkerManager.codeExtract({
+                code: mainStr,
+                settings: getExtractionSettings(),
+            });
+            const newRegexItems = extracted.regex || [];
             const currentRegexItems = useRegexStore.getState().regexItems;
 
             // 合并新旧数据
@@ -312,7 +355,7 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
         } catch (e) {
             notice.error(t('Editor.Errors.SyntaxErrorRegex') + ': ' + e);
         }
-    }, [i18n, notice, t, setRegexItems]);
+    }, [i18n, notice, t, setRegexItems, getExtractionSettings]);
 
     // ================================================== Open File ==================================================
     const handleOpenFile = React.useCallback(async () => {
@@ -418,13 +461,6 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
                 const targetFilePath = path.join(pluginDir, currentFile);
 
                 try {
-                    // 解析基准 AST 并缓存，避免后续重复解析
-                    const baseAst = astTranslator.loadCode(originalCode);
-                    if (!baseAst) {
-                        notice.error(t('Editor.Errors.SourceError'));
-                        return;
-                    }
-
                     // 准备要测试的项
                     const activeAstItems = astItems.filter(item => item.target && item.target !== item.source);
                     const activeRegexItems = regexItems.filter(item => item.target && item.target !== item.source);
@@ -440,7 +476,7 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
                     for (const item of activeAstItems) {
                         const source = item.source || '';
                         const target = item.target || '';
-                        if (!astTranslator.validateTargetSyntax(target)) {
+                        if (!validateTargetSyntax(target)) {
                             results.push({ type: 'ast', id: item.id, source: (t('Editor.Errors.SyntaxError') || '语法错误') + ': ' + target, severity: 'error' });
                         } else if (!validateBracketBalance(target)) {
                             results.push({ type: 'ast', id: item.id, source: (t('Editor.Errors.BracketMismatch') || '括号不匹配') + ': ' + target, severity: 'error' });
@@ -468,12 +504,19 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
                     // 环境联调测试函数 (将代码写入文件并在真实中拉起插件)
                     const checkItemsDeep = async (checkAstItems: typeof activeAstItems, checkRegexItems: typeof activeRegexItems): Promise<boolean> => {
                         try {
-                            const testAst = astTranslator.cloneAst(baseAst);
-                            const astCode = astTranslator.translate(testAst, checkAstItems);
-                            const finalCode = regexTranslator.translate(astCode, checkRegexItems);
+                            const astResult = await i18n.companionWorkerManager.astReplace({
+                                code: originalCode,
+                                translations: checkAstItems,
+                            });
+                            const finalCode = applyRegexItems(astResult.code, checkRegexItems);
 
-                            // 第一步：快速 AST 检查把关
-                            if (!astTranslator.loadCode(finalCode)) return false;
+                            // 第一步：快速语法检查把关
+                            try {
+                                // eslint-disable-next-line no-new-func
+                                new Function(finalCode);
+                            } catch {
+                                return false;
+                            }
 
                             // 第二步：真实写入并沙箱重启验证
                             fs.writeFileSync(targetFilePath, finalCode);
@@ -508,7 +551,7 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
 
                             if (items.length === 1) {
                                 const err = items[0];
-                                if (err.type === 'ast' && !astTranslator.validateTargetSyntax(err.data.target)) {
+                                if (err.type === 'ast' && !validateTargetSyntax(err.data.target)) {
                                     results.push({ type: 'ast', id: err.data.id, source: err.data.source });
                                 } else {
                                     results.push({ type: err.type, id: err.data.id, source: err.data.source });
@@ -564,7 +607,7 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
         } finally {
             setIsDiagnosing(false);
         }
-    }, [i18n, notice, t, isDiagnosing]);
+    }, [i18n, notice, t, isDiagnosing, applyRegexItems, validateTargetSyntax]);
 
     const handleSecurityDiagnose = React.useCallback(async () => {
         if (isDiagnosing) return;
@@ -581,7 +624,7 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
             // 1. 扫描 AST 条目
             for (const item of astItems) {
                 const target = item.target || '';
-                const issues = astTranslator.validateSecurity(target);
+                const issues = validateSecurityText(target);
                 for (const issue of issues) {
                     results.push({
                         type: 'ast',
@@ -597,7 +640,7 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
             for (const item of regexItems) {
                 const source = item.source || '';
                 const target = item.target || '';
-                const issues = regexTranslator.validateSecurity(target, source);
+                const issues = validateSecurityText(target);
                 for (const issue of issues) {
                     results.push({
                         type: 'regex',
@@ -620,7 +663,7 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
         } finally {
             setIsDiagnosing(false);
         }
-    }, [notice, t, isDiagnosing]);
+    }, [notice, t, isDiagnosing, validateSecurityText]);
 
     const handleUnusedDiagnose = React.useCallback(async () => {
         if (isDiagnosing) return;
@@ -678,35 +721,31 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
             }
 
             const results: DiagnoseError[] = [];
-            const astTranslator = new AstTranslator(i18n.settings);
-            const regexTranslator = new RegexTranslator(i18n.settings);
+            const extracted = await i18n.companionWorkerManager.codeExtract({
+                code: originalCode,
+                settings: getExtractionSettings(),
+            });
+            const hitAst = new Set((extracted.ast || []).flatMap(item => [
+                `${item.type}:${item.name || ''}:${item.source}`,
+                item.source,
+            ]));
+            const hitRegex = new Set((extracted.regex || []).map(item => item.source));
 
-            // 1. AST 冗余诊断
-            const baseAst = astTranslator.loadCode(originalCode);
-            if (baseAst) {
-                const hitFingerprints = astTranslator.traceUsage(baseAst, astItems);
+            astItems.forEach(item => {
+                const fingerprint = `${item.type}:${item.name || ''}:${item.source}`;
+                const isHit = hitAst.has(fingerprint) || hitAst.has(item.source) || originalCode.includes(item.source);
+                if (!isHit) {
+                    results.push({
+                        type: 'ast',
+                        id: item.id,
+                        source: item.source,
+                        isUnused: true
+                    });
+                }
+            });
 
-                // 为了精确匹配，我们需要再次遍历 astItems
-                astItems.forEach(item => {
-                    // 获取指纹 (严格模式)
-                    const fingerprint = `${item.type}:${item.name}:${item.source}`;
-                    const isHit = hitFingerprints.has(fingerprint) || hitFingerprints.has(item.source);
-
-                    if (!isHit) {
-                        results.push({
-                            type: 'ast',
-                            id: item.id,
-                            source: item.source,
-                            isUnused: true
-                        });
-                    }
-                });
-            }
-
-            // 2. Regex 冗余诊断
-            const hitSources = regexTranslator.traceUsage(originalCode, regexItems);
             regexItems.forEach(item => {
-                if (!hitSources.has(item.source)) {
+                if (!hitRegex.has(item.source) && !originalCode.includes(item.source)) {
                     results.push({
                         type: 'regex',
                         id: item.id,
@@ -727,7 +766,7 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
         } finally {
             setIsDiagnosing(false);
         }
-    }, [i18n, notice, t, isDiagnosing]);
+    }, [i18n, notice, t, isDiagnosing, getExtractionSettings]);
 
     const handleClearDiagnose = React.useCallback(() => {
         setErrorItems([]);

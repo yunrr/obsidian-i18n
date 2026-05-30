@@ -179,7 +179,7 @@ export class ImmersiveTranslate {
                 const urlStr = typeof url === 'string' ? url : url.url;
                 const method = options.method || 'GET';
                 const headers: Record<string, string> = { ...options.headers };
-                let body = undefined;
+                let body: string | undefined = undefined;
 
                 if (options.body && method.toUpperCase() !== 'GET' && method.toUpperCase() !== 'HEAD') {
                     if (typeof options.body === 'string') {

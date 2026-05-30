@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { createSelectors } from '.';
+import { createSelectors } from '~/utils/store/zustand';
 import { RegexStore } from './types';
 import { createRegexSlice } from './store/regex-slice';
 import { createAstSlice } from './store/ast-slice';

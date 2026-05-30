@@ -9,7 +9,7 @@ import { Search, RefreshCw, Download, ExternalLink, Package, Globe, Github, X, C
 import { Notice } from 'obsidian';
 import { useTranslation } from 'react-i18next';
 import { useCloudStore } from '../cloud-store';
-import { useGlobalStoreInstance } from '~/utils';
+import { useGlobalStoreInstance } from '~/utils/store/global';
 import { t } from '@/src/locales/index';
 import { ManifestEntry, getCloudFilePath } from '../types';
 import { SUPPORTED_LANGUAGES } from '~/constants/languages';

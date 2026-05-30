@@ -11,7 +11,7 @@
 import { requestUrl } from "obsidian";
 import { RegexItem, AstItem } from "../views/plugin_editor/types";
 import { ThemeTranslationItem } from "../views/theme_editor/types";
-import { useGlobalStoreInstance } from "~/utils";
+import { useGlobalStoreInstance } from "~/utils/store/global";
 import { BaseProvider } from "./base-provider";
 
 /** Ollama 默认端点 */

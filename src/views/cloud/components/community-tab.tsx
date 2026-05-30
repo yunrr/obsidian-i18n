@@ -8,7 +8,7 @@ import { Input, Button, Select, SelectContent, SelectItem, SelectTrigger, Select
 import { Search, RefreshCw, Globe, Star, Layers, Github, ExternalLink, Users, ArrowRight, Trophy, ChevronDown, TrendingUp, Palette, Library, Plus, Zap, CircleCheckBig, FileText, ShieldCheck } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useCloudStore } from '../cloud-store';
-import { useGlobalStoreInstance } from '~/utils';
+import { useGlobalStoreInstance } from '~/utils/store/global';
 import { t } from '@/src/locales/index';
 import { ManifestEntry, RegistryItem, CommunityRepoStats, LeaderboardAuthorEntry, getCloudFilePath } from '../types';
 import { SUPPORTED_LANGUAGES } from '@/src/constants/languages';

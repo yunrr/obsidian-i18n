@@ -5,7 +5,7 @@ import { Palette, Hash, Layers, Globe, User, Type, AlignLeft, Cloud, HardDrive }
 import { useThemeEditorStore } from '../store';
 import { TemplateCard } from '../../plugin_editor/components/common/template-card';
 import { useTranslation } from 'react-i18next';
-import { useGlobalStoreInstance } from '~/utils';
+import { useGlobalStoreInstance } from '~/utils/store/global';
 import { TranslationSource } from '~/types';
 
 /**

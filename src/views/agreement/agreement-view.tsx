@@ -2,7 +2,7 @@ import { ItemView, WorkspaceLeaf } from 'obsidian';
 import { Root } from 'react-dom/client';
 import I18N from '~/main';
 import { Agreement } from './agreement';
-import { mountReactView } from '~/utils';
+import { mountReactView } from '~/utils/core/react';
 
 import { t } from '~/locales';
 

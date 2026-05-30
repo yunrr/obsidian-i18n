@@ -5,9 +5,9 @@
 import * as fs from 'fs-extra';
 import * as path from 'path';
 import { TranslationSourceMeta, TranslationSource, EMPTY_META, EMPTY_BATCH_TASK_RECORD, BatchTaskRecordMeta, BatchTaskCheckpoint, BatchTaskFailureRecord } from '../types';
-import { calculateChecksum } from '../utils/translator/translation';
+import { calculateChecksum } from '../utils/translator/light';
 import { nanoid } from 'nanoid';
-import { useGlobalStoreInstance } from '~/utils';
+import { useGlobalStoreInstance } from '~/utils/store/global';
 import { t } from '../locales'; // Correct import path
 import { loadTranslationFile, saveTranslationFile, TRANSLATION_FILE_EXTENSION } from './io-manager';
 

@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { createSelectors } from '~/utils';
+import { createSelectors } from '~/utils/store/zustand';
 import { ThemeEditorStore } from './types';
 
 // ======================== Zustand Store 定义 ========================
