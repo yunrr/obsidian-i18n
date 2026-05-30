@@ -1169,11 +1169,11 @@ fn builtin_regex_extract(code: &str, settings: &ExtractionSettings, reject: &[Re
             break;
         };
         let quote_index = index + relative;
-        let Some((_raw, end_index)) = capture_js_string(code, quote_index) else {
+        let Some((raw, end_index)) = capture_js_string(code, quote_index) else {
             index = quote_index + 1;
             continue;
         };
-        let source = &code[quote_index..end_index];
+        let source = unescape_simple_js_string(&raw);
         let mut matched_context = false;
         if let Some((name, _)) = call_name_before(code, quote_index) {
             matched_context = watched_calls.contains(&name.as_str());
@@ -1184,8 +1184,8 @@ fn builtin_regex_extract(code: &str, settings: &ExtractionSettings, reject: &[Re
             }
         }
         if matched_context
-            && is_valid_regex_text(source, settings.re_length, reject, valid)
-            && seen.insert(source.to_string())
+            && is_valid_regex_text(&source, settings.re_length, reject, valid)
+            && seen.insert(source.clone())
         {
             items.push(json!({ "source": source, "target": source }));
         }
@@ -1663,12 +1663,22 @@ fn extract_regex_items(code: &str, settings: &ExtractionSettings) -> Vec<Value> 
         let Ok(regex) = Regex::new(&compiled) else {
             continue;
         };
-        for matched in regex.find_iter(code) {
-            let source = matched.as_str();
-            if !is_valid_regex_text(source, settings.re_length, &reject, &valid) || seen.contains(source) {
+        for captures in regex.captures_iter(code) {
+            let Some(source) = captures
+                .iter()
+                .skip(1)
+                .flatten()
+                .last()
+                .or_else(|| captures.get(0))
+                .map(|matched| matched.as_str())
+            else {
+                continue;
+            };
+            let source = unescape_simple_js_string(source);
+            if !is_valid_regex_text(&source, settings.re_length, &reject, &valid) || seen.contains(&source) {
                 continue;
             }
-            seen.insert(source.to_string());
+            seen.insert(source.clone());
             items.push(json!({ "source": source, "target": source }));
         }
     }
