@@ -212,6 +212,8 @@ export default {
         StylePlaceholder: "例：专业、简洁、自然",
         BatchSizeTitle: "每批数量",
         BatchSizeDesc: "编辑器与批量管理器共用的单次 LLM 请求条目数。",
+        OverwriteExistingTranslationsTitle: "覆盖现有译文",
+        OverwriteExistingTranslationsDesc: "开启后，管理器批量翻译会重新翻译所有条目，不论是否已有译文；编辑器内批量翻译仍使用编辑器自己的覆盖开关。",
         TimeoutTitle: "请求超时 (ms)",
         TimeoutDesc: "编辑器与批量管理器共用的单次 LLM 请求超时时间，单位毫秒。",
         CompanionHeader: "本地伴生进程",

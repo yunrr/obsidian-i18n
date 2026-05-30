@@ -339,8 +339,8 @@ async function translateBatches<T extends { id: number; source: string; target: 
     });
 }
 
-function shouldTranslateText(target?: string, source?: string) {
-    return !target || target.trim() === '' || target === source;
+function shouldTranslateText(target?: string, source?: string, overwriteExisting = false) {
+    return overwriteExisting || !target || target.trim() === '' || target === source;
 }
 
 async function handlePluginExtract(payload: CompanionPluginExtractPayload): Promise<CompanionPluginExtractResult> {
@@ -438,14 +438,14 @@ async function handlePluginTranslate(payload: CompanionPluginTranslatePayload, t
 
     for (const [file, dict] of Object.entries(translationJson.dict || {})) {
         dict.ast.forEach((item, index) => {
-            if (!shouldTranslateText(item.target, item.source)) return;
+            if (!shouldTranslateText(item.target, item.source, payload.config.overwriteExistingTranslations)) return;
             const id = nextId++;
             astItems.push({ id, type: item.type, name: item.name, source: item.source, target: item.target });
             astMappings.set(id, { file, index });
         });
 
         dict.regex.forEach((item, index) => {
-            if (!shouldTranslateText(item.target, item.source)) return;
+            if (!shouldTranslateText(item.target, item.source, payload.config.overwriteExistingTranslations)) return;
             const id = nextId++;
             regexItems.push({ id, source: item.source, target: item.target });
             regexMappings.set(id, { file, index });
@@ -534,7 +534,7 @@ async function handleThemeTranslate(payload: CompanionThemeTranslatePayload, tas
 
     const items: ThemeTranslationItem[] = translationJson.dict
         .map((item, index) => ({ id: index, type: item.type, source: item.source, target: item.target }))
-        .filter(item => shouldTranslateText(item.target, item.source)) as ThemeTranslationItem[];
+        .filter(item => shouldTranslateText(item.target, item.source, payload.config.overwriteExistingTranslations)) as ThemeTranslationItem[];
 
     await translateBatches<ThemeTranslationItem & { id: number }>(
         items as Array<ThemeTranslationItem & { id: number }>,
@@ -1010,17 +1010,17 @@ async function runConcurrentCancellable<T>(items: T[], limit: number, task: Comp
     await Promise.all(workers);
 }
 
-function countPendingPluginItems(json: PluginTranslationV1): number {
+function countPendingPluginItems(json: PluginTranslationV1, overwriteExisting = false): number {
     let count = 0;
     for (const dict of Object.values(json?.dict || {})) {
-        count += dict.ast.filter(item => shouldTranslateText(item.target, item.source)).length;
-        count += dict.regex.filter(item => shouldTranslateText(item.target, item.source)).length;
+        count += dict.ast.filter(item => shouldTranslateText(item.target, item.source, overwriteExisting)).length;
+        count += dict.regex.filter(item => shouldTranslateText(item.target, item.source, overwriteExisting)).length;
     }
     return count;
 }
 
-function countPendingThemeItems(json: ThemeTranslationV1): number {
-    return (json?.dict || []).filter(item => shouldTranslateText(item.target, item.source)).length;
+function countPendingThemeItems(json: ThemeTranslationV1, overwriteExisting = false): number {
+    return (json?.dict || []).filter(item => shouldTranslateText(item.target, item.source, overwriteExisting)).length;
 }
 
 function createCheckpoint<T extends CompanionBatchResource>(scope: BatchTaskScope, mode: 'extract' | 'translate', resources: T[], completedIndexes: Set<number>, progress: CompanionTaskProgress): BatchTaskCheckpoint {
@@ -1109,7 +1109,7 @@ async function handlePluginBatchTranslate(task: CompanionTaskRuntime, payload: C
             task.progress.skippedCount++;
         } else {
             const translationJson = await readTranslationFile<PluginTranslationV1>(paths, sourceId);
-            const pendingCount = translationJson ? countPendingPluginItems(translationJson) : 0;
+            const pendingCount = translationJson ? countPendingPluginItems(translationJson, payload.config.overwriteExistingTranslations) : 0;
             if (!translationJson || pendingCount === 0) {
                 task.progress.skippedCount++;
             } else {
@@ -1158,7 +1158,7 @@ async function handleThemeBatchTranslate(task: CompanionTaskRuntime, payload: Co
             task.progress.skippedCount++;
         } else {
             const translationJson = await readTranslationFile<ThemeTranslationV1>(paths, sourceId);
-            const pendingCount = translationJson ? countPendingThemeItems(translationJson) : 0;
+            const pendingCount = translationJson ? countPendingThemeItems(translationJson, payload.config.overwriteExistingTranslations) : 0;
             if (!translationJson || pendingCount === 0) {
                 task.progress.skippedCount++;
             } else {

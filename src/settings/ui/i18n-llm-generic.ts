@@ -323,6 +323,17 @@ export default class I18nLLMGeneric extends BaseSetting {
             });
 
         new Setting(this.containerEl)
+            .setName(t('Settings.Ai.OverwriteExistingTranslationsTitle'))
+            .setDesc(t('Settings.Ai.OverwriteExistingTranslationsDesc'))
+            .addToggle(toggle => {
+                toggle.setValue(this.settings.llmOverwriteExistingTranslations === true)
+                    .onChange(async (value) => {
+                        this.settings.llmOverwriteExistingTranslations = value;
+                        await this.i18n.saveSettings();
+                    });
+            });
+
+        new Setting(this.containerEl)
             .setName(t('Settings.Ai.TimeoutTitle'))
             .setDesc(t('Settings.Ai.TimeoutDesc'))
             .addText(text => {

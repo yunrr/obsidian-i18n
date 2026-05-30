@@ -8,9 +8,10 @@ import { Search, LayoutGrid, List, FileOutput, Languages, Loader2, RotateCcw, Sq
 
 import I18N from 'src/main';
 import { PluginTranslationV1, BatchTaskFailureRecord } from 'src/types';
-import { formatTimestamp, isValidPluginTranslationV1Format } from '../../utils';
+import { formatTimestamp } from '../../utils/data/format';
+import { isValidPluginTranslationV1Format } from '../../utils/data/validation';
 import { loadTranslationFile } from '../../manager/io-manager';
-import { useGlobalStoreInstance } from '~/utils';
+import { useGlobalStoreInstance } from '~/utils/store/global';
 import { normalizeOpenAIUrl } from '~/utils/ai/url-helper';
 import { LLM_PROVIDERS } from '~/ai/constants';
 import {
@@ -120,6 +121,7 @@ const getCompanionTranslationConfig = (settings: I18N['settings']): CompanionTra
         timeoutMs: settings.llmTimeout || 60000,
         responseFormat: settings.llmResponseFormat,
         batchSize: getPositiveInt(settings.llmBatchSize, 1),
+        overwriteExistingTranslations: settings.llmOverwriteExistingTranslations === true,
         concurrency: getPositiveInt(settings.llmConcurrencyLimit, 3),
         prompts: {
             ast: generateAstSystemPrompt(settings.llmAstPrompt || DEFAULT_AST_PROMPT_TEMPLATE, settings.llmLanguage, settings.llmStyle),
@@ -316,6 +318,17 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         return count;
     }, []);
 
+    const countTranslationItems = useCallback((json: PluginTranslationV1) => {
+        if (!json?.dict) return 0;
+
+        let count = 0;
+        for (const fileData of Object.values(json.dict)) {
+            count += fileData.ast.length;
+            count += fileData.regex.length;
+        }
+        return count;
+    }, []);
+
     const pluginFailureRecords = useMemo(() => {
         return i18n.sourceManager.getBatchTaskFailures('plugin');
     }, [i18n, sourceTick]);
@@ -350,12 +363,14 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             let translationFormatMark = true;
             let isTranslated = false;
             let pendingTranslationCount = 0;
+            let totalTranslationCount = 0;
             if (isLangDoc) {
                 try {
                     localJson = loadTranslationFile(langDoc);
                     translationFormatMark = isValidPluginTranslationV1Format(localJson);
                     if (translationFormatMark && localJson) {
                         pendingTranslationCount = countPendingTranslationItems(localJson);
+                        totalTranslationCount = countTranslationItems(localJson);
                         isTranslated = checkIsTranslated(localJson, activeSourceId);
                     }
                 } catch (e) {
@@ -414,13 +429,14 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                 isApplied: !!(state && state.isApplied),
                 isTranslated,
                 pendingTranslationCount,
+                totalTranslationCount,
                 translationVersion,
                 supportedVersion,
                 cloudEntries: cloudEntriesByPlugin[plugin.id] || []
             };
         }
         return stats;
-    }, [plugins, i18n, refreshKey, sourceIndex, t, checkIsTranslated, countPendingTranslationItems, cloudEntriesByPlugin, failedSourceIds]);
+    }, [plugins, i18n, refreshKey, sourceIndex, t, checkIsTranslated, countPendingTranslationItems, countTranslationItems, cloudEntriesByPlugin, failedSourceIds]);
 
     const displayPlugins = useMemo(() => {
         let result = [...plugins];
@@ -469,9 +485,12 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
     const translatablePlugins = useMemo(() => {
         return displayPlugins.filter(plugin => {
             const data = allPluginStates[plugin.id];
-            return !!data?.translationFormatMark && (data?.pendingTranslationCount || 0) > 0;
+            if (!data?.translationFormatMark) return false;
+            return settings.llmOverwriteExistingTranslations === true
+                ? (data?.totalTranslationCount || 0) > 0
+                : (data?.pendingTranslationCount || 0) > 0;
         });
-    }, [displayPlugins, allPluginStates]);
+    }, [displayPlugins, allPluginStates, settings.llmOverwriteExistingTranslations]);
 
     const pluginExtractCheckpoint = useMemo(() => {
         return i18n.sourceManager.loadBatchTaskCheckpoint(PLUGIN_EXTRACT_CHECKPOINT_KEY);
@@ -700,9 +719,11 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         const totalResources = resume ? pluginTranslateCheckpoint?.totalResources || resources.length : resources.length;
         const processedItems = resume ? pluginTranslateCheckpoint?.processedItems || 0 : 0;
         const totalItems = resume ? pluginTranslateCheckpoint?.totalItems || resources.reduce((sum, resource) => {
-            return sum + (allPluginStates[resource.resourceId]?.pendingTranslationCount || 0);
+            const data = allPluginStates[resource.resourceId];
+            return sum + (settings.llmOverwriteExistingTranslations === true ? data?.totalTranslationCount || 0 : data?.pendingTranslationCount || 0);
         }, 0) : resources.reduce((sum, resource) => {
-            return sum + (allPluginStates[resource.resourceId]?.pendingTranslationCount || 0);
+            const data = allPluginStates[resource.resourceId];
+            return sum + (settings.llmOverwriteExistingTranslations === true ? data?.totalTranslationCount || 0 : data?.pendingTranslationCount || 0);
         }, 0);
 
         setBatchTask({
@@ -743,7 +764,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             taskIdRef.current = null;
             setBatchTask(prev => ({ ...prev, isRunning: false, currentLabel: '' }));
         }
-    }, [allPluginStates, batchTask.isRunning, i18n, pluginTranslateCheckpoint, runWorkerTask, t, translatablePlugins]);
+    }, [allPluginStates, batchTask.isRunning, i18n, pluginTranslateCheckpoint, runWorkerTask, settings.llmOverwriteExistingTranslations, t, translatablePlugins]);
 
     const handleBatchTranslate = useCallback(() => startPluginBatchTranslate(false), [startPluginBatchTranslate]);
     const handleResumeTranslate = useCallback(() => startPluginBatchTranslate(true), [startPluginBatchTranslate]);

@@ -5,7 +5,7 @@
  * 消费方（编辑器 Hook）统一通过此工厂获取 Provider，无需关心具体实现。
  */
 
-import { useGlobalStoreInstance } from '~/utils';
+import { useGlobalStoreInstance } from '~/utils/store/global';
 import { ITranslationProvider } from './provider-types';
 import { OpenAITranslationService } from './openai-translation-service';
 import { GeminiTranslationService } from './gemini-translation-service';

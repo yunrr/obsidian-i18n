@@ -7,7 +7,7 @@ import {
     CircleDot, ChevronDown, Sparkles, Loader2
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { cn } from "~/utils";
+import { cn } from "~/shadcn/lib/utils";
 import { DiagnoseError } from '../../types';
 
 interface DiagnoseCardProps {

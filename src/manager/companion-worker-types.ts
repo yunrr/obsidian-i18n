@@ -116,6 +116,70 @@ export interface CompanionAutoMatchResponse {
     };
 }
 
+export interface CompanionAstReplaceRequest {
+    code: string;
+    translations: { type?: string; name?: string; source: string; target: string }[];
+}
+
+export interface CompanionAstReplaceResponse {
+    state: boolean;
+    code: string;
+    error?: string;
+}
+
+export interface CompanionCodeExtractRequest {
+    code: string;
+    settings: CompanionExtractionSettings;
+}
+
+export interface CompanionCodeExtractResponse {
+    state: boolean;
+    ast: { type?: string; name?: string; source: string; target: string }[];
+    regex: { source: string; target: string }[];
+    error?: string;
+}
+
+export interface CompanionPluginApplyTranslationRequest {
+    pluginId: string;
+    pluginDir: string;
+    backupBasePath: string;
+    translationJson: PluginTranslationV1;
+}
+
+export interface CompanionThemeApplyTranslationRequest {
+    themeId: string;
+    themeDir: string;
+    themeCssPath: string;
+    backupBasePath: string;
+    translationJson: ThemeTranslationV1;
+}
+
+export interface CompanionApplyTranslationResponse {
+    state: boolean;
+    processedFiles: number;
+    translationVersion: string;
+    error?: string;
+}
+
+export interface CompanionSourceManagerRequest {
+    persistence: CompanionWorkerPersistenceConfig;
+    sourceId?: string;
+    sourceIds?: string[];
+    active?: boolean;
+    contentBase64?: string;
+    fileName?: string;
+}
+
+export interface CompanionSourceManagerResponse {
+    state: boolean;
+    contentBase64?: string;
+    addedCount: number;
+    updatedCount: number;
+    skippedCount: number;
+    deletedCount: number;
+    error?: string;
+}
+
 export type CompanionCloudTaskType = 'cloud-publish-source' | 'cloud-download-source' | 'cloud-update-sources' | 'cloud-prepare-backup' | 'cloud-restore-all' | 'cloud-backup-all';
 
 export interface CompanionCloudResponse {
@@ -206,6 +270,7 @@ export interface CompanionTranslationConfig {
     timeoutMs: number;
     responseFormat: string;
     batchSize: number;
+    overwriteExistingTranslations: boolean;
     concurrency: number;
     prompts: {
         ast: string;
@@ -393,4 +458,4 @@ export interface CompanionThemeFailureRetryPayload {
 
 export type CompanionAsyncTaskType = 'plugin-batch-extract' | 'theme-batch-extract' | 'plugin-batch-translate' | 'theme-batch-translate' | 'plugin-failure-retry' | 'theme-failure-retry' | 'cloud-backup-all';
 
-export type CompanionBatchTaskType = 'plugin-extract' | 'theme-extract' | 'plugin-translate' | 'theme-translate' | 'plugin-retry' | 'theme-retry' | CompanionCloudTaskType;
+export type CompanionBatchTaskType = 'plugin-extract' | 'theme-extract' | 'plugin-translate' | 'theme-translate' | 'plugin-retry' | 'theme-retry' | 'ast-replace' | 'code-extract' | 'plugin-apply-translation' | 'theme-apply-translation' | 'source-export' | 'source-import' | 'source-remove' | 'source-set-active' | CompanionCloudTaskType;

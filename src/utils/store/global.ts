@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { createSelectors } from '~/utils'
+import { createSelectors } from '~/utils/store/zustand'
 import { PluginTranslationV1, ThemeTranslationV1, ValidationOptions } from "src/types";
 import I18n from '@/main';
 

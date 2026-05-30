@@ -1,7 +1,6 @@
 export * from './editor';
 export * from './types';
 export * from './store';
-export * from '~/utils';
 
 export * from './components/ast/ast-sidebar';
 export * from './components/ast/ast-table';

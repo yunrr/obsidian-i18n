@@ -2,7 +2,7 @@ import { App, Notice, PluginManifest } from 'obsidian';
 import * as path from 'path';
 import * as fs from 'fs-extra';
 import I18N from '../main';
-import { AstTranslator, RegexTranslator, StringPicker } from '../utils';
+import { StringPicker } from '../utils/ui/string-picker';
 import { createRoot, Root } from 'react-dom/client';
 import React from 'react';
 import { ExtractWidget } from '../views/extract_assistant/extract-widget';
@@ -130,25 +130,12 @@ export class ExtractManager {
                 if (fs.existsSync(filePath)) {
                     try {
                         const code = await fs.readFile(filePath, 'utf8');
-
-                        // Regex Search (Fast)
-                        const regexTranslator = new RegexTranslator(this.i18n.settings);
-                        const regexMatches = regexTranslator.findString(text, code);
-                        regexMatches.forEach(m => {
-                            allMatches.push({ ...m, method: 'Regex', file, pluginId: manifest.id });
-                        });
-
-                        // AST Search (Only if file is reasonably small to avoid extreme slow-down)
-                        if (code.length < 1000000) { // Limit to 1MB for AST
-                            const astTranslator = new AstTranslator(this.i18n.settings);
-                            const ast = astTranslator.loadCode(code);
-                            if (ast) {
-                                const astMatches = astTranslator.findString(text, ast);
-                                astMatches.forEach(m => {
-                                    allMatches.push({ ...m, method: 'AST', file, pluginId: manifest.id });
-                                });
+                        const lines = code.split('\n');
+                        lines.forEach((line, index) => {
+                            if (line.includes(text)) {
+                                allMatches.push({ line: index + 1, source: line.trim(), method: 'Text', file, pluginId: manifest.id });
                             }
-                        }
+                        });
                     } catch (e) {
                         console.warn(`Failed to search in ${manifest.id}:`, e);
                     }

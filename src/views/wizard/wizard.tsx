@@ -1,6 +1,6 @@
 import React, { useMemo, useCallback } from 'react';
 import { Card, CardHeader, CardTitle, CardDescription } from '@/src/shadcn';
-import { useGlobalStore } from '~/utils';
+import { useGlobalStore } from '~/utils/store/global';
 import { getWizardConfig } from './wizard-config-service';
 import { useTranslation } from 'react-i18next';
 import {

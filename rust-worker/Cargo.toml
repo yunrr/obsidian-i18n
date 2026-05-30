@@ -17,6 +17,12 @@ reqwest = { version = "0.12", default-features = false, features = ["brotli", "g
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 sha2 = "0.10"
+swc_atoms = "9.0.3"
+swc_common = "23.0.0"
+swc_ecma_ast = "25.0.0"
+swc_ecma_codegen = "28.0.0"
+swc_ecma_parser = "41.0.0"
+swc_ecma_visit = "25.0.0"
 tokio = { version = "1.43", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors"] }
 url = "2.5"

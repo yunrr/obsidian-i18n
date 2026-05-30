@@ -8,6 +8,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use chrono::DateTime;
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use nanoid::nanoid;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -16,11 +17,17 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
+    io::{Read as IoRead, Write as IoWrite},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use swc_common::{sync::Lrc, FileName, SourceMap};
+use swc_ecma_ast::*;
+use swc_ecma_codegen::{text_writer::JsWriter, Emitter};
+use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax, TsSyntax};
+use swc_ecma_visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 use tokio::{
     io::AsyncReadExt,
     sync::{oneshot, Mutex, Semaphore},
@@ -65,6 +72,75 @@ struct CompanionProxyResponse {
     status_text: String,
     headers: HashMap<String, String>,
     body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AstReplacePayload {
+    code: String,
+    translations: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodeExtractPayload {
+    code: String,
+    settings: ExtractionSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginApplyTranslationPayload {
+    plugin_id: String,
+    plugin_dir: String,
+    backup_base_path: String,
+    translation_json: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThemeApplyTranslationPayload {
+    theme_id: String,
+    theme_dir: String,
+    theme_css_path: String,
+    backup_base_path: String,
+    translation_json: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplyTranslationResponse {
+    state: bool,
+    processed_files: usize,
+    translation_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceManagerPayload {
+    persistence: PersistenceConfig,
+    #[serde(default)]
+    source_id: Option<String>,
+    #[serde(default)]
+    source_ids: Vec<String>,
+    #[serde(default)]
+    active: Option<bool>,
+    #[serde(default)]
+    content_base64: Option<String>,
+    #[serde(default)]
+    file_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceImportExportResponse {
+    state: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_base64: Option<String>,
+    added_count: usize,
+    updated_count: usize,
+    skipped_count: usize,
+    deleted_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +276,8 @@ struct CompanionTranslationConfig {
     timeout_ms: u64,
     response_format: String,
     batch_size: usize,
+    #[serde(default)]
+    overwrite_existing_translations: bool,
     concurrency: usize,
     prompts: PromptConfig,
 }
@@ -364,6 +442,46 @@ struct AstMatch {
     node_type: String,
     name: String,
     source: String,
+}
+
+struct SwcAstConfig {
+    assignments: HashSet<String>,
+    functions: HashSet<String>,
+    keys: HashSet<String>,
+    reject: Vec<Regex>,
+    valid: Vec<Regex>,
+    max_length: usize,
+}
+
+impl SwcAstConfig {
+    fn from_settings(settings: &ExtractionSettings) -> Self {
+        let assignments = if settings.ast_assignments.is_empty() {
+            vec!["overwriteName", "innerHTML", "outerHTML", "title", "alt", "placeholder", "textContent", "innerText", "ariaLabel", "nodeValue", "buttonText", "confirmText", "cancelText", "labelText"]
+                .into_iter().map(str::to_string).collect()
+        } else {
+            settings.ast_assignments.clone()
+        };
+        let functions = if settings.ast_functions.is_empty() {
+            vec!["Notice", "setTitle", "setContent", "setName", "setDesc", "setButtonText", "setPlaceholder", "setTooltip", "addOption", "addOptions", "addHeading", "addText", "setHint", "setWarning", "setText", "appendText", "createEl", "createDiv", "createSpan", "addCommand", "insertText", "replaceRange", "replaceSelection", "log", "error", "warn", "info", "alert", "confirm", "prompt", "renderMarkdown", "setLabel", "setConfirmText", "setCancelText"]
+                .into_iter().map(str::to_string).collect()
+        } else {
+            settings.ast_functions.clone()
+        };
+        let keys = if settings.ast_keys.is_empty() {
+            vec!["name", "description", "text", "placeholder", "label", "tooltip", "title", "header", "desc", "message", "buttontext", "aria-label", "heading", "content", "tab", "caption", "subtitle", "summary", "info", "warning", "error", "success", "hint", "instructions", "link", "selection", "annotation", "search", "speech", "page", "empty", "detail", "body", "option", "notice", "confirmText", "cancelText", "ariaLabel", "buttonText"]
+                .into_iter().map(str::to_string).collect()
+        } else {
+            settings.ast_keys.clone()
+        };
+        Self {
+            assignments: assignments.into_iter().collect(),
+            functions: functions.into_iter().collect(),
+            keys: keys.into_iter().collect(),
+            reject: regex_list(&settings.ast_reject_re, DEFAULT_REJECT_PATTERNS),
+            valid: regex_list(&settings.ast_valid_re, DEFAULT_VALID_PATTERNS),
+            max_length: settings.ast_max_length,
+        }
+    }
 }
 
 fn default_re_flags() -> String {
@@ -1076,7 +1194,219 @@ fn builtin_regex_extract(code: &str, settings: &ExtractionSettings, reject: &[Re
     items
 }
 
-fn extract_ast_items(code: &str, settings: &ExtractionSettings) -> Vec<Value> {
+fn parse_swc_module(code: &str) -> Result<(Lrc<SourceMap>, Module)> {
+    let cm: Lrc<SourceMap> = Default::default();
+    let fm = cm.new_source_file(FileName::Anon.into(), code.to_string());
+    let lexer = Lexer::new(
+        Syntax::Typescript(TsSyntax {
+            tsx: true,
+            decorators: true,
+            dts: false,
+            no_early_errors: true,
+            disallow_ambiguous_jsx_like: false,
+        }),
+        EsVersion::Es2022,
+        StringInput::from(&*fm),
+        None,
+    );
+    let mut parser = Parser::new_from(lexer);
+    parser
+        .parse_module()
+        .map_err(|error| anyhow!("SWC AST Parse Error: {error:?}"))
+        .map(|module| (cm, module))
+}
+
+fn swc_atom_text(value: &swc_atoms::Wtf8Atom) -> String {
+    value.to_string_lossy().to_string()
+}
+
+fn swc_string_source(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Lit(Lit::Str(value)) => Some(swc_atom_text(&value.value)),
+        Expr::Tpl(tpl) if tpl.exprs.is_empty() && tpl.quasis.len() == 1 => {
+            tpl.quasis.first().map(|item| item.raw.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn swc_prop_name(prop: &PropName) -> Option<String> {
+    match prop {
+        PropName::Ident(ident) => Some(ident.sym.to_string()),
+        PropName::Str(value) => Some(swc_atom_text(&value.value)),
+        PropName::Num(value) => Some(value.value.to_string()),
+        _ => None,
+    }
+}
+
+fn swc_member_prop_name(prop: &MemberProp) -> Option<String> {
+    match prop {
+        MemberProp::Ident(ident) => Some(ident.sym.to_string()),
+        MemberProp::Computed(computed) => match &*computed.expr {
+            Expr::Lit(Lit::Str(value)) => Some(swc_atom_text(&value.value)),
+            _ => None,
+        },
+        MemberProp::PrivateName(private_name) => Some(private_name.name.to_string()),
+    }
+}
+
+fn swc_assign_name(target: &AssignTarget) -> Option<String> {
+    match target {
+        AssignTarget::Simple(simple) => match simple {
+            SimpleAssignTarget::Ident(binding) => Some(binding.id.sym.to_string()),
+            SimpleAssignTarget::Member(member) => swc_member_prop_name(&member.prop),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn swc_callee_name(callee: &Callee) -> Option<String> {
+    match callee {
+        Callee::Expr(expr) => swc_expr_name(expr),
+        Callee::Super(_) => Some("super".to_string()),
+        Callee::Import(_) => Some("import".to_string()),
+    }
+}
+
+fn swc_expr_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Ident(ident) => Some(ident.sym.to_string()),
+        Expr::Member(member) => swc_member_prop_name(&member.prop),
+        Expr::OptChain(chain) => match &*chain.base {
+            OptChainBase::Member(member) => swc_member_prop_name(&member.prop),
+            OptChainBase::Call(call) => swc_expr_name(&call.callee),
+        },
+        _ => None,
+    }
+}
+
+fn push_swc_match(matches: &mut Vec<AstMatch>, config: &SwcAstConfig, node_type: &str, name: &str, expr: &Expr) {
+    let Some(source) = swc_string_source(expr) else {
+        return;
+    };
+    if is_valid_ast_text(&source, config.max_length, &config.reject, &config.valid) {
+        matches.push(AstMatch {
+            node_type: node_type.to_string(),
+            name: name.to_string(),
+            source,
+        });
+    }
+}
+
+fn visit_object_arg_properties(matches: &mut Vec<AstMatch>, config: &SwcAstConfig, object: &ObjectLit) {
+    for prop in &object.props {
+        if let PropOrSpread::Prop(prop) = prop {
+            if let Prop::KeyValue(key_value) = &**prop {
+                if let Some(name) = swc_prop_name(&key_value.key) {
+                    if let Expr::Lit(_) | Expr::Tpl(_) = &*key_value.value {
+                        push_swc_match(matches, config, "ObjectProperty", &name, &key_value.value);
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct SwcExtractVisitor<'a> {
+    config: &'a SwcAstConfig,
+    matches: Vec<AstMatch>,
+}
+
+impl Visit for SwcExtractVisitor<'_> {
+    fn visit_var_declarator(&mut self, node: &VarDeclarator) {
+        if let Pat::Ident(ident) = &node.name {
+            let name = ident.id.sym.to_string();
+            if self.config.assignments.contains(&name) {
+                if let Some(init) = node.init.as_deref() {
+                    push_swc_match(&mut self.matches, self.config, "VariableDeclarator", &name, init);
+                }
+            }
+        }
+        node.visit_children_with(self);
+    }
+
+    fn visit_assign_expr(&mut self, node: &AssignExpr) {
+        if let Some(name) = swc_assign_name(&node.left) {
+            if self.config.assignments.contains(&name) {
+                push_swc_match(&mut self.matches, self.config, "AssignmentExpression", &name, &node.right);
+            }
+        }
+        node.visit_children_with(self);
+    }
+
+    fn visit_prop(&mut self, node: &Prop) {
+        if let Prop::KeyValue(key_value) = node {
+            if let Some(name) = swc_prop_name(&key_value.key) {
+                if self.config.keys.contains(&name) {
+                    push_swc_match(&mut self.matches, self.config, "ObjectProperty", &name, &key_value.value);
+                }
+            }
+        }
+        node.visit_children_with(self);
+    }
+
+    fn visit_call_expr(&mut self, node: &CallExpr) {
+        if let Some(name) = swc_callee_name(&node.callee) {
+            if self.config.functions.contains(&name) {
+                for arg in &node.args {
+                    match &*arg.expr {
+                        Expr::Object(object) => visit_object_arg_properties(&mut self.matches, self.config, object),
+                        expr => push_swc_match(&mut self.matches, self.config, "CallExpression", &name, expr),
+                    }
+                }
+            }
+        }
+        node.visit_children_with(self);
+    }
+
+    fn visit_new_expr(&mut self, node: &NewExpr) {
+        if let Some(name) = swc_expr_name(&node.callee) {
+            if self.config.functions.contains(&name) {
+                for arg in node.args.iter().flatten() {
+                    match &*arg.expr {
+                        Expr::Object(object) => visit_object_arg_properties(&mut self.matches, self.config, object),
+                        expr => push_swc_match(&mut self.matches, self.config, "NewExpression", &name, expr),
+                    }
+                }
+            }
+        }
+        node.visit_children_with(self);
+    }
+}
+
+fn extract_ast_items_swc(code: &str, settings: &ExtractionSettings) -> Result<Vec<Value>> {
+    let (_, module) = parse_swc_module(code)?;
+    let config = SwcAstConfig::from_settings(settings);
+    let mut visitor = SwcExtractVisitor { config: &config, matches: Vec::new() };
+    module.visit_with(&mut visitor);
+    let mut seen = HashSet::new();
+    let mut matches = visitor
+        .matches
+        .into_iter()
+        .filter_map(|item| {
+            let key = format!("{}:{}:{}", item.node_type, item.name, item.source);
+            if seen.insert(key) {
+                Some(json!({
+                    "type": item.node_type,
+                    "name": item.name,
+                    "source": item.source,
+                    "target": item.source,
+                }))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        let left_key = format!("{}:{}", left.get("type").and_then(Value::as_str).unwrap_or_default(), left.get("name").and_then(Value::as_str).unwrap_or_default());
+        let right_key = format!("{}:{}", right.get("type").and_then(Value::as_str).unwrap_or_default(), right.get("name").and_then(Value::as_str).unwrap_or_default());
+        left_key.cmp(&right_key)
+    });
+    Ok(matches)
+}
+
+fn extract_ast_items_heuristic(code: &str, settings: &ExtractionSettings) -> Vec<Value> {
     let assignments = if settings.ast_assignments.is_empty() {
         vec!["overwriteName", "innerHTML", "outerHTML", "title", "alt", "placeholder", "textContent", "innerText", "ariaLabel", "nodeValue", "buttonText", "confirmText", "cancelText", "labelText"]
             .into_iter().map(str::to_string).collect()
@@ -1164,6 +1494,142 @@ fn extract_ast_items(code: &str, settings: &ExtractionSettings) -> Vec<Value> {
         left_key.cmp(&right_key)
     });
     matches
+}
+
+fn extract_ast_items(code: &str, settings: &ExtractionSettings) -> Vec<Value> {
+    match extract_ast_items_swc(code, settings) {
+        Ok(items) => items,
+        Err(error) => {
+            eprintln!("[i18n] SWC AST extraction fallback: {error}");
+            extract_ast_items_heuristic(code, settings)
+        }
+    }
+}
+
+fn swc_set_expr_string(expr: &mut Expr, target: &str) {
+    match expr {
+        Expr::Lit(Lit::Str(value)) => {
+            value.value = target.into();
+            value.raw = None;
+        }
+        Expr::Tpl(tpl) if tpl.exprs.is_empty() && tpl.quasis.len() == 1 => {
+            if let Some(first) = tpl.quasis.first_mut() {
+                first.raw = target.into();
+                first.cooked = Some(target.into());
+            }
+        }
+        _ => {}
+    }
+}
+
+fn lookup_ast_replacement(strict: &HashMap<String, String>, loose: &HashMap<String, String>, node_type: &str, name: &str, expr: &Expr) -> Option<String> {
+    let source = swc_string_source(expr)?;
+    strict
+        .get(&format!("{node_type}:{name}:{source}"))
+        .or_else(|| loose.get(&source))
+        .filter(|target| *target != &source)
+        .cloned()
+}
+
+fn replace_expr_if_matches(strict: &HashMap<String, String>, loose: &HashMap<String, String>, node_type: &str, name: &str, expr: &mut Box<Expr>) {
+    if let Some(target) = lookup_ast_replacement(strict, loose, node_type, name, expr) {
+        swc_set_expr_string(expr, &target);
+    }
+}
+
+fn replace_object_arg_properties(strict: &HashMap<String, String>, loose: &HashMap<String, String>, object: &mut ObjectLit) {
+    for prop in &mut object.props {
+        if let PropOrSpread::Prop(prop) = prop {
+            if let Prop::KeyValue(key_value) = &mut **prop {
+                let name = swc_prop_name(&key_value.key).unwrap_or_else(|| "prop".to_string());
+                replace_expr_if_matches(strict, loose, "ObjectProperty", &name, &mut key_value.value);
+            }
+        }
+    }
+}
+
+struct SwcReplaceVisitor<'a> {
+    strict: &'a HashMap<String, String>,
+    loose: &'a HashMap<String, String>,
+}
+
+impl VisitMut for SwcReplaceVisitor<'_> {
+    fn visit_mut_var_declarator(&mut self, node: &mut VarDeclarator) {
+        if let Pat::Ident(ident) = &node.name {
+            if let Some(init) = node.init.as_mut() {
+                replace_expr_if_matches(self.strict, self.loose, "VariableDeclarator", &ident.id.sym.to_string(), init);
+            }
+        }
+        node.visit_mut_children_with(self);
+    }
+
+    fn visit_mut_assign_expr(&mut self, node: &mut AssignExpr) {
+        if let Some(name) = swc_assign_name(&node.left) {
+            replace_expr_if_matches(self.strict, self.loose, "AssignmentExpression", &name, &mut node.right);
+        }
+        node.visit_mut_children_with(self);
+    }
+
+    fn visit_mut_prop(&mut self, node: &mut Prop) {
+        if let Prop::KeyValue(key_value) = node {
+            let name = swc_prop_name(&key_value.key).unwrap_or_else(|| "prop".to_string());
+            replace_expr_if_matches(self.strict, self.loose, "ObjectProperty", &name, &mut key_value.value);
+        }
+        node.visit_mut_children_with(self);
+    }
+
+    fn visit_mut_call_expr(&mut self, node: &mut CallExpr) {
+        let name = swc_callee_name(&node.callee).unwrap_or_else(|| "func".to_string());
+        for arg in &mut node.args {
+            match &mut *arg.expr {
+                Expr::Object(object) => replace_object_arg_properties(self.strict, self.loose, object),
+                _ => replace_expr_if_matches(self.strict, self.loose, "CallExpression", &name, &mut arg.expr),
+            }
+        }
+        node.visit_mut_children_with(self);
+    }
+
+    fn visit_mut_new_expr(&mut self, node: &mut NewExpr) {
+        let name = swc_expr_name(&node.callee).unwrap_or_else(|| "new".to_string());
+        for arg in node.args.iter_mut().flatten() {
+            match &mut *arg.expr {
+                Expr::Object(object) => replace_object_arg_properties(self.strict, self.loose, object),
+                _ => replace_expr_if_matches(self.strict, self.loose, "NewExpression", &name, &mut arg.expr),
+            }
+        }
+        node.visit_mut_children_with(self);
+    }
+}
+
+fn replace_ast_items_swc(code: &str, translations: &[Value]) -> Result<String> {
+    let (cm, mut module) = parse_swc_module(code)?;
+    let mut strict = HashMap::new();
+    let mut loose = HashMap::new();
+    for item in translations {
+        let source = item.get("source").and_then(Value::as_str).unwrap_or_default();
+        let target = item.get("target").and_then(Value::as_str).unwrap_or_default();
+        if source.is_empty() || target.is_empty() || source == target {
+            continue;
+        }
+        if let (Some(node_type), Some(name)) = (item.get("type").and_then(Value::as_str), item.get("name").and_then(Value::as_str)) {
+            strict.insert(format!("{node_type}:{name}:{source}"), target.to_string());
+        }
+        loose.insert(source.to_string(), target.to_string());
+    }
+    module.visit_mut_with(&mut SwcReplaceVisitor { strict: &strict, loose: &loose });
+
+    let mut output = Vec::new();
+    {
+        let writer = JsWriter::new(cm.clone(), "\n", &mut output, None);
+        let mut emitter = Emitter {
+            cfg: swc_ecma_codegen::Config::default().with_minify(true),
+            comments: None,
+            cm,
+            wr: Box::new(writer),
+        };
+        emitter.emit_module(&module)?;
+    }
+    Ok(String::from_utf8(output)?)
 }
 
 fn is_default_regex_patterns(patterns: &[String]) -> bool {
@@ -3093,6 +3559,11 @@ fn simple_hash(text: &str) -> String {
 
 async fn handle_sync_task(_state: &AppState, task_type: &str, payload: Value) -> Result<Value> {
     match task_type {
+        "ast-replace" => handle_ast_replace(payload).await,
+        "code-extract" => handle_code_extract(payload).await,
+        "plugin-apply-translation" => handle_plugin_apply_translation(payload).await,
+        "theme-apply-translation" => handle_theme_apply_translation(payload).await,
+        "source-export" | "source-import" | "source-remove" | "source-set-active" => handle_source_manager_task(task_type, payload).await,
         "plugin-extract" => Ok(serde_json::to_value(handle_plugin_extract(payload).await?)?),
         "theme-extract" => Ok(serde_json::to_value(handle_theme_extract(payload).await?)?),
         "plugin-translate" => {
@@ -3122,6 +3593,288 @@ async fn handle_sync_task(_state: &AppState, task_type: &str, payload: Value) ->
 
 async fn handle_plugin_extract(payload: Value) -> Result<CompanionExtractResult> {
     tokio::task::spawn_blocking(move || handle_plugin_extract_blocking(payload)).await?
+}
+
+async fn handle_ast_replace(payload: Value) -> Result<Value> {
+    tokio::task::spawn_blocking(move || {
+        let payload: AstReplacePayload = serde_json::from_value(payload)?;
+        let code = replace_ast_items_swc(&payload.code, &payload.translations)?;
+        Ok(json!({ "state": true, "code": code }))
+    })
+    .await?
+}
+
+async fn handle_code_extract(payload: Value) -> Result<Value> {
+    tokio::task::spawn_blocking(move || {
+        let payload: CodeExtractPayload = serde_json::from_value(payload)?;
+        let ast = extract_ast_items(&payload.code, &payload.settings);
+        let regex = extract_regex_items(&payload.code, &payload.settings);
+        Ok(json!({ "state": true, "ast": ast, "regex": regex }))
+    })
+    .await?
+}
+
+async fn handle_plugin_apply_translation(payload: Value) -> Result<Value> {
+    tokio::task::spawn_blocking(move || {
+        let payload: PluginApplyTranslationPayload = serde_json::from_value(payload)?;
+        let response = apply_plugin_translation_blocking(payload)?;
+        Ok(serde_json::to_value(response)?)
+    })
+    .await?
+}
+
+async fn handle_theme_apply_translation(payload: Value) -> Result<Value> {
+    tokio::task::spawn_blocking(move || {
+        let payload: ThemeApplyTranslationPayload = serde_json::from_value(payload)?;
+        let response = apply_theme_translation_blocking(payload)?;
+        Ok(serde_json::to_value(response)?)
+    })
+    .await?
+}
+
+async fn handle_source_manager_task(operation: &str, payload: Value) -> Result<Value> {
+    let operation = operation.to_string();
+    tokio::task::spawn_blocking(move || {
+        let payload: SourceManagerPayload = serde_json::from_value(payload)?;
+        let result = match operation.as_str() {
+            "source-export" => source_export_blocking(payload)?,
+            "source-import" => source_import_blocking(payload)?,
+            "source-remove" => source_remove_blocking(payload)?,
+            "source-set-active" => source_set_active_blocking(payload)?,
+            _ => bail!("未知源管理操作: {operation}"),
+        };
+        Ok(serde_json::to_value(result)?)
+    })
+    .await?
+}
+
+fn apply_plugin_translation_blocking(payload: PluginApplyTranslationPayload) -> Result<ApplyTranslationResponse> {
+    let dict = payload
+        .translation_json
+        .get("dict")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("translationJson.dict missing"))?;
+    let files = dict.keys().cloned().collect::<Vec<_>>();
+    create_plugin_backup(&payload.backup_base_path, &payload.plugin_id, &payload.plugin_dir, &files, false)?;
+
+    let mut processed_files = 0usize;
+    for (file, file_dict) in dict {
+        let target_file_path = safe_join(&payload.plugin_dir, file)?;
+        if !target_file_path.exists() {
+            continue;
+        }
+        let mut file_string = read_backup_content(&payload.backup_base_path, &payload.plugin_id, file)?
+            .unwrap_or_else(|| fs::read_to_string(&target_file_path).unwrap_or_default());
+
+        if let Some(ast) = file_dict.get("ast").and_then(Value::as_array) {
+            if !ast.is_empty() {
+                file_string = replace_ast_items_swc(&file_string, ast)?;
+            }
+        }
+        if let Some(regex) = file_dict.get("regex").and_then(Value::as_array) {
+            if !regex.is_empty() {
+                file_string = apply_regex_translations(&file_string, regex);
+            }
+        }
+        fs::write(&target_file_path, file_string)
+            .with_context(|| format!("failed to write {}", target_file_path.display()))?;
+        processed_files += 1;
+    }
+
+    Ok(ApplyTranslationResponse {
+        state: true,
+        processed_files,
+        translation_version: payload
+            .translation_json
+            .pointer("/metadata/version")
+            .and_then(Value::as_str)
+            .unwrap_or("0.0.0")
+            .to_string(),
+    })
+}
+
+fn apply_theme_translation_blocking(payload: ThemeApplyTranslationPayload) -> Result<ApplyTranslationResponse> {
+    let dict = payload
+        .translation_json
+        .get("dict")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("translationJson.dict missing"))?;
+    create_plugin_backup(&payload.backup_base_path, &payload.theme_id, &payload.theme_dir, &["theme.css".to_string()], false)?;
+    let theme_css_path = PathBuf::from(&payload.theme_css_path);
+    let mut css = fs::read_to_string(&theme_css_path)
+        .with_context(|| format!("failed to read {}", theme_css_path.display()))?;
+    css = apply_theme_settings_translations(&css, dict);
+    fs::write(&theme_css_path, css)
+        .with_context(|| format!("failed to write {}", theme_css_path.display()))?;
+    Ok(ApplyTranslationResponse {
+        state: true,
+        processed_files: 1,
+        translation_version: payload
+            .translation_json
+            .pointer("/metadata/version")
+            .and_then(Value::as_str)
+            .unwrap_or("1.0.0")
+            .to_string(),
+    })
+}
+
+fn safe_join(base: &str, relative: &str) -> Result<PathBuf> {
+    let relative_path = Path::new(relative);
+    if relative_path.is_absolute() || relative_path.components().any(|component| matches!(component, std::path::Component::ParentDir)) {
+        bail!("invalid relative path: {relative}");
+    }
+    Ok(PathBuf::from(base).join(relative_path))
+}
+
+fn backup_dir(backup_base_path: &str) -> PathBuf {
+    PathBuf::from(backup_base_path).join("backups")
+}
+
+fn plugin_backup_dir(backup_base_path: &str, plugin_id: &str) -> PathBuf {
+    backup_dir(backup_base_path).join(plugin_id)
+}
+
+fn create_plugin_backup(
+    backup_base_path: &str,
+    plugin_id: &str,
+    plugin_dir: &str,
+    files: &[String],
+    force: bool,
+) -> Result<()> {
+    let plugin_backup_dir = plugin_backup_dir(backup_base_path, plugin_id);
+    fs::create_dir_all(&plugin_backup_dir)?;
+    for file in files {
+        let original_path = safe_join(plugin_dir, file)?;
+        if !original_path.exists() {
+            continue;
+        }
+        let backup_path = plugin_backup_dir.join(format!("{file}.gz"));
+        if backup_path.exists() && !force {
+            continue;
+        }
+        if let Some(parent) = backup_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let content = fs::read(&original_path)
+            .with_context(|| format!("failed to read {}", original_path.display()))?;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&content)?;
+        fs::write(&backup_path, encoder.finish()?)
+            .with_context(|| format!("failed to write {}", backup_path.display()))?;
+    }
+    remove_legacy_backups(backup_base_path, plugin_id)?;
+    Ok(())
+}
+
+fn remove_legacy_backups(backup_base_path: &str, plugin_id: &str) -> Result<()> {
+    for path in [
+        backup_dir(backup_base_path).join(format!("{plugin_id}.js.gz")),
+        backup_dir(backup_base_path).join(format!("{plugin_id}.js")),
+    ] {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn read_backup_content(backup_base_path: &str, plugin_id: &str, file: &str) -> Result<Option<String>> {
+    let backup_path = plugin_backup_dir(backup_base_path, plugin_id).join(format!("{file}.gz"));
+    if backup_path.exists() {
+        let compressed = fs::read(&backup_path)?;
+        let mut decoder = GzDecoder::new(compressed.as_slice());
+        let mut output = String::new();
+        decoder.read_to_string(&mut output)?;
+        return Ok(Some(output));
+    }
+    if file == "main.js" {
+        let legacy_path = backup_dir(backup_base_path).join(format!("{plugin_id}.js.gz"));
+        if legacy_path.exists() {
+            let compressed = fs::read(&legacy_path)?;
+            let mut decoder = GzDecoder::new(compressed.as_slice());
+            let mut output = String::new();
+            decoder.read_to_string(&mut output)?;
+            return Ok(Some(output));
+        }
+    }
+    Ok(None)
+}
+
+fn apply_regex_translations(code: &str, translations: &[Value]) -> String {
+    let mut translated = code.to_string();
+    for item in translations {
+        let source = item.get("source").and_then(Value::as_str).unwrap_or_default();
+        let target = item.get("target").and_then(Value::as_str).unwrap_or_default();
+        if !source.is_empty() && !target.is_empty() && source != target {
+            translated = translated.replace(source, target);
+        }
+    }
+    translated
+}
+
+fn apply_theme_settings_translations(css: &str, translations: &[Value]) -> String {
+    let Ok(block_re) = Regex::new(r"(?s)/\* @settings(.*?)\*/") else {
+        return css.to_string();
+    };
+    block_re
+        .replace_all(css, |captures: &regex::Captures| {
+            let block_content = captures.get(1).map(|m| m.as_str()).unwrap_or_default();
+            let mut new_block_content = block_content.to_string();
+            for item in translations {
+                let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+                let source = item.get("source").and_then(Value::as_str).unwrap_or_default();
+                let target = item.get("target").and_then(Value::as_str).unwrap_or_default();
+                if item_type.is_empty() || source.is_empty() || target.is_empty() || source == target {
+                    continue;
+                }
+                new_block_content = replace_theme_setting_value(&new_block_content, item_type, source, target);
+            }
+            format!("/* @settings{new_block_content}*/")
+        })
+        .to_string()
+}
+
+fn replace_theme_setting_value(block: &str, item_type: &str, source: &str, target: &str) -> String {
+    let mut output = String::new();
+    for segment in block.split_inclusive('\n') {
+        let has_newline = segment.ends_with('\n');
+        let line = segment.trim_end_matches(['\r', '\n']);
+        if let Some(replaced) = replace_theme_setting_line(line, item_type, source, target) {
+            output.push_str(&replaced);
+            if has_newline {
+                output.push('\n');
+            }
+        } else {
+            output.push_str(segment);
+        }
+    }
+    if !block.ends_with('\n') {
+        return output;
+    }
+    output
+}
+
+fn replace_theme_setting_line(line: &str, item_type: &str, source: &str, target: &str) -> Option<String> {
+    let indent_len = line.len() - line.trim_start_matches([' ', '\t']).len();
+    let indent = &line[..indent_len];
+    let rest = &line[indent_len..];
+    let key_end = rest.find(':')?;
+    let key = rest[..key_end].trim();
+    if key != item_type {
+        return None;
+    }
+    let mut value = rest[key_end + 1..].trim();
+    let quote = value.chars().next().filter(|ch| *ch == '\'' || *ch == '"').unwrap_or('\0');
+    if quote != '\0' {
+        value = value.strip_prefix(quote)?.strip_suffix(quote)?;
+    }
+    if value != source {
+        return None;
+    }
+    let quote_text = if quote == '\0' { "" } else if quote == '\'' { "'" } else { "\"" };
+    Some(format!("{indent}{key}: {quote_text}{target}{quote_text}"))
 }
 
 fn handle_plugin_extract_blocking(payload: Value) -> Result<CompanionExtractResult> {
@@ -3392,6 +4145,168 @@ fn load_meta(paths: &PersistencePaths) -> Value {
     } else {
         json!({ "schemaVersion": 2, "sources": {} })
     }
+}
+
+fn source_export_blocking(payload: SourceManagerPayload) -> Result<SourceImportExportResponse> {
+    let paths = paths(&payload.persistence.base_path);
+    let meta = load_meta(&paths);
+    let mut export_data = serde_json::Map::new();
+    for source_id in payload.source_ids {
+        if let Some(source) = meta.pointer(&format!("/sources/{}", escape_pointer(&source_id))).cloned() {
+            if let Some(content) = read_translation(&paths, &source_id) {
+                export_data.insert(source_id, json!({ "meta": source, "content": content }));
+            }
+        }
+    }
+    let json_bytes = serde_json::to_vec(&Value::Object(export_data))?;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&json_bytes)?;
+    let compressed = encoder.finish()?;
+    Ok(SourceImportExportResponse {
+        state: true,
+        content_base64: Some(BASE64_STANDARD.encode(compressed)),
+        added_count: 0,
+        updated_count: 0,
+        skipped_count: 0,
+        deleted_count: 0,
+    })
+}
+
+fn source_import_blocking(payload: SourceManagerPayload) -> Result<SourceImportExportResponse> {
+    let paths = paths(&payload.persistence.base_path);
+    let encoded = payload.content_base64.ok_or_else(|| anyhow!("contentBase64 missing"))?;
+    let bytes = BASE64_STANDARD.decode(encoded)?;
+    let text = if payload.file_name.as_deref().is_some_and(|name| name.ends_with(".gz")) {
+        let mut decoder = GzDecoder::new(bytes.as_slice());
+        let mut output = String::new();
+        decoder.read_to_string(&mut output)?;
+        output
+    } else {
+        match String::from_utf8(bytes.clone()) {
+            Ok(text) => text,
+            Err(_) => {
+                let mut decoder = GzDecoder::new(bytes.as_slice());
+                let mut output = String::new();
+                decoder.read_to_string(&mut output)?;
+                output
+            }
+        }
+    };
+    let data: Value = serde_json::from_str(&text)?;
+    let mut meta = load_meta(&paths);
+    let sources = meta
+        .get_mut("sources")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| anyhow!("metadata sources missing"))?;
+    let mut added_count = 0usize;
+    let mut updated_count = 0usize;
+    let mut skipped_count = 0usize;
+
+    if let Some(entries) = data.as_object() {
+        for item in entries.values() {
+            let Some(mut source) = item.get("meta").cloned() else { continue; };
+            let Some(content) = item.get("content").cloned() else { continue; };
+            let Some(source_id) = source.get("id").and_then(Value::as_str).map(str::to_string) else { continue; };
+            let checksum = source.get("checksum").and_then(Value::as_str).unwrap_or_default().to_string();
+            if let Some(existing) = sources.get(&source_id) {
+                if existing.get("checksum").and_then(Value::as_str).unwrap_or_default() == checksum {
+                    skipped_count += 1;
+                    continue;
+                }
+                updated_count += 1;
+            } else {
+                added_count += 1;
+            }
+            let now = now_ms();
+            if source.get("createdAt").and_then(Value::as_u64).unwrap_or(0) == 0 {
+                source["createdAt"] = json!(now);
+            }
+            source["updatedAt"] = json!(now);
+            save_translation(&paths, &source_id, &content)?;
+            sources.insert(source_id, source);
+        }
+    }
+    write_json_pretty(&paths.meta_path, &meta)?;
+    Ok(SourceImportExportResponse {
+        state: true,
+        content_base64: None,
+        added_count,
+        updated_count,
+        skipped_count,
+        deleted_count: 0,
+    })
+}
+
+fn source_remove_blocking(payload: SourceManagerPayload) -> Result<SourceImportExportResponse> {
+    let paths = paths(&payload.persistence.base_path);
+    let mut meta = load_meta(&paths);
+    let mut deleted_count = 0usize;
+    if let Some(sources) = meta.get_mut("sources").and_then(Value::as_object_mut) {
+        for source_id in payload.source_ids {
+            if let Some(source) = sources.remove(&source_id) {
+                deleted_count += 1;
+                let was_active = source.get("isActive").and_then(Value::as_bool).unwrap_or(false);
+                let plugin_id = source.get("plugin").and_then(Value::as_str).unwrap_or_default().to_string();
+                if was_active {
+                    if let Some((_, replacement)) = sources
+                        .iter_mut()
+                        .find(|(_, item)| item.get("plugin").and_then(Value::as_str) == Some(plugin_id.as_str()))
+                    {
+                        replacement["isActive"] = json!(true);
+                    }
+                }
+                match fs::remove_file(paths.sources_dir.join(format!("{source_id}.json"))) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+    }
+    write_json_pretty(&paths.meta_path, &meta)?;
+    Ok(SourceImportExportResponse {
+        state: true,
+        content_base64: None,
+        added_count: 0,
+        updated_count: 0,
+        skipped_count: 0,
+        deleted_count,
+    })
+}
+
+fn source_set_active_blocking(payload: SourceManagerPayload) -> Result<SourceImportExportResponse> {
+    let paths = paths(&payload.persistence.base_path);
+    let source_id = payload.source_id.ok_or_else(|| anyhow!("sourceId missing"))?;
+    let active = payload.active.unwrap_or(true);
+    let mut meta = load_meta(&paths);
+    if let Some(sources) = meta.get_mut("sources").and_then(Value::as_object_mut) {
+        let plugin_id = sources
+            .get(&source_id)
+            .and_then(|source| source.get("plugin"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !plugin_id.is_empty() {
+            if active {
+                for source in sources.values_mut() {
+                    if source.get("plugin").and_then(Value::as_str) == Some(plugin_id.as_str()) {
+                        source["isActive"] = json!(source.get("id").and_then(Value::as_str) == Some(source_id.as_str()));
+                    }
+                }
+            } else if let Some(source) = sources.get_mut(&source_id) {
+                source["isActive"] = json!(false);
+            }
+        }
+    }
+    write_json_pretty(&paths.meta_path, &meta)?;
+    Ok(SourceImportExportResponse {
+        state: true,
+        content_base64: None,
+        added_count: 0,
+        updated_count: 0,
+        skipped_count: 0,
+        deleted_count: 0,
+    })
 }
 
 fn load_record(paths: &PersistencePaths) -> Value {
@@ -3872,9 +4787,9 @@ async fn handle_batch_translate(
             continue;
         };
         let pending = if is_plugin {
-            count_pending_plugin_items(&translation_json)
+            count_pending_plugin_items(&translation_json, batch.config.overwrite_existing_translations)
         } else {
-            count_pending_theme_items(&translation_json)
+            count_pending_theme_items(&translation_json, batch.config.overwrite_existing_translations)
         };
         if pending == 0 {
             mark_batch_translate_resource_completed(
@@ -3905,6 +4820,7 @@ async fn handle_batch_translate(
             collect_plugin_packed_items(
                 state_index,
                 &resource_state,
+                batch.config.overwrite_existing_translations,
                 &mut ast_id,
                 &mut regex_id,
                 &mut ast_items,
@@ -3914,6 +4830,7 @@ async fn handle_batch_translate(
             collect_theme_packed_items(
                 state_index,
                 &resource_state,
+                batch.config.overwrite_existing_translations,
                 &mut theme_id,
                 &mut theme_items,
             );
@@ -4056,6 +4973,7 @@ async fn mark_batch_translate_resource_completed(
 fn collect_plugin_packed_items(
     resource_state_index: usize,
     resource_state: &BatchResourceState,
+    overwrite_existing: bool,
     ast_id: &mut u64,
     regex_id: &mut u64,
     ast_items: &mut Vec<Value>,
@@ -4069,7 +4987,7 @@ fn collect_plugin_packed_items(
         for (file, file_dict) in dict {
             if let Some(ast) = file_dict.get("ast").and_then(Value::as_array) {
                 for (index, item) in ast.iter().enumerate() {
-                    if should_translate(item.get("target"), item.get("source")) {
+                    if should_translate(item.get("target"), item.get("source"), overwrite_existing) {
                         ast_items.push(json!({
                             "id": *ast_id,
                             "resourceStateIndex": resource_state_index,
@@ -4086,7 +5004,7 @@ fn collect_plugin_packed_items(
             }
             if let Some(regex) = file_dict.get("regex").and_then(Value::as_array) {
                 for (index, item) in regex.iter().enumerate() {
-                    if should_translate(item.get("target"), item.get("source")) {
+                    if should_translate(item.get("target"), item.get("source"), overwrite_existing) {
                         regex_items.push(json!({
                             "id": *regex_id,
                             "resourceStateIndex": resource_state_index,
@@ -4106,6 +5024,7 @@ fn collect_plugin_packed_items(
 fn collect_theme_packed_items(
     resource_state_index: usize,
     resource_state: &BatchResourceState,
+    overwrite_existing: bool,
     theme_id: &mut u64,
     theme_items: &mut Vec<Value>,
 ) {
@@ -4115,7 +5034,7 @@ fn collect_theme_packed_items(
         .and_then(Value::as_array)
     {
         for (index, item) in dict.iter().enumerate() {
-            if should_translate(item.get("target"), item.get("source")) {
+            if should_translate(item.get("target"), item.get("source"), overwrite_existing) {
                 theme_items.push(json!({
                     "id": *theme_id,
                     "resourceStateIndex": resource_state_index,
@@ -4350,11 +5269,12 @@ async fn handle_plugin_translate(
     let mut ast_items = Vec::<Value>::new();
     let mut regex_items = Vec::<Value>::new();
     let mut next_id = 0usize;
+    let overwrite_existing = config.overwrite_existing_translations;
     if let Some(dict) = translation_json.get("dict").and_then(Value::as_object) {
         for (file, file_dict) in dict {
             if let Some(ast) = file_dict.get("ast").and_then(Value::as_array) {
                 for (index, item) in ast.iter().enumerate() {
-                    if should_translate(item.get("target"), item.get("source")) {
+                    if should_translate(item.get("target"), item.get("source"), overwrite_existing) {
                         ast_items.push(json!({ "id": next_id, "file": file, "dictIndex": index, "type": item.get("type").and_then(Value::as_str).unwrap_or(""), "name": item.get("name").and_then(Value::as_str).unwrap_or(""), "source": item.get("source").and_then(Value::as_str).unwrap_or(""), "target": item.get("target").and_then(Value::as_str).unwrap_or("") }));
                         next_id += 1;
                     }
@@ -4362,7 +5282,7 @@ async fn handle_plugin_translate(
             }
             if let Some(regex) = file_dict.get("regex").and_then(Value::as_array) {
                 for (index, item) in regex.iter().enumerate() {
-                    if should_translate(item.get("target"), item.get("source")) {
+                    if should_translate(item.get("target"), item.get("source"), overwrite_existing) {
                         regex_items.push(json!({ "id": next_id, "file": file, "dictIndex": index, "source": item.get("source").and_then(Value::as_str).unwrap_or(""), "target": item.get("target").and_then(Value::as_str).unwrap_or("") }));
                         next_id += 1;
                     }
@@ -4481,9 +5401,10 @@ async fn handle_theme_translate(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let overwrite_existing = config.overwrite_existing_translations;
     let items: Vec<Value> = translation_json.get("dict").and_then(Value::as_array).map(|dict| {
         dict.iter().enumerate()
-            .filter(|(_, item)| should_translate(item.get("target"), item.get("source")))
+            .filter(|(_, item)| should_translate(item.get("target"), item.get("source"), overwrite_existing))
             .map(|(index, item)| json!({ "id": index, "dictIndex": index, "type": item.get("type").and_then(Value::as_str).unwrap_or(""), "source": item.get("source").and_then(Value::as_str).unwrap_or(""), "target": item.get("target").and_then(Value::as_str).unwrap_or("") }))
             .collect()
     }).unwrap_or_default();
@@ -4902,13 +5823,13 @@ fn extract_translation_array(value: &Value) -> Result<Vec<TranslationPair>> {
         .collect())
 }
 
-fn should_translate(target: Option<&Value>, source: Option<&Value>) -> bool {
+fn should_translate(target: Option<&Value>, source: Option<&Value>, overwrite_existing: bool) -> bool {
     let target = target.and_then(Value::as_str).unwrap_or_default();
     let source = source.and_then(Value::as_str).unwrap_or_default();
-    target.trim().is_empty() || target == source
+    overwrite_existing || target.trim().is_empty() || target == source
 }
 
-fn count_pending_plugin_items(json: &Value) -> usize {
+fn count_pending_plugin_items(json: &Value, overwrite_existing: bool) -> usize {
     json.get("dict")
         .and_then(Value::as_object)
         .map(|dict| {
@@ -4921,7 +5842,7 @@ fn count_pending_plugin_items(json: &Value) -> usize {
                             items
                                 .iter()
                                 .filter(|item| {
-                                    should_translate(item.get("target"), item.get("source"))
+                                    should_translate(item.get("target"), item.get("source"), overwrite_existing)
                                 })
                                 .count()
                         })
@@ -4933,7 +5854,7 @@ fn count_pending_plugin_items(json: &Value) -> usize {
                             items
                                 .iter()
                                 .filter(|item| {
-                                    should_translate(item.get("target"), item.get("source"))
+                                    should_translate(item.get("target"), item.get("source"), overwrite_existing)
                                 })
                                 .count()
                         })
@@ -4945,13 +5866,13 @@ fn count_pending_plugin_items(json: &Value) -> usize {
         .unwrap_or(0)
 }
 
-fn count_pending_theme_items(json: &Value) -> usize {
+fn count_pending_theme_items(json: &Value, overwrite_existing: bool) -> usize {
     json.get("dict")
         .and_then(Value::as_array)
         .map(|items| {
             items
                 .iter()
-                .filter(|item| should_translate(item.get("target"), item.get("source")))
+                .filter(|item| should_translate(item.get("target"), item.get("source"), overwrite_existing))
                 .count()
         })
         .unwrap_or(0)

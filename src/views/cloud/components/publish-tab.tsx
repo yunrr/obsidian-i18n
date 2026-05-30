@@ -9,7 +9,7 @@ import { Button, Input, Label, Select, SelectContent, SelectItem, SelectTrigger,
 import { Upload, FileCheck, FileX, Info, Package, Globe, Tag, MessageSquare, AlertCircle, Plus, CheckCircle2, Loader2, RefreshCcw, Send, FolderOpen, GitCompare, ArrowLeft, Palette, Captions, Languages, Rocket, History as HistoryIcon, FileType, ArrowUpCircle, CloudUpload } from 'lucide-react';
 import { ScrollArea } from '@/src/shadcn/ui/scroll-area';
 import { useCloudStore } from '../cloud-store';
-import { useGlobalStoreInstance } from '~/utils';
+import { useGlobalStoreInstance } from '~/utils/store/global';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/src/shadcn/ui/card';
 import { Badge } from '@/src/shadcn/ui/badge';
 import { cn } from '@/src/shadcn/lib/utils';

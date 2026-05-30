@@ -16,11 +16,10 @@ import { Save, Loader2, Search, Palette, Plus, Folder, Sparkles } from 'lucide-r
 import { TemplateCard } from '../plugin_editor/components/common/template-card';
 import { useThemeTranslation } from './components/use-theme-translation';
 
-import { useGlobalStoreInstance } from '~/utils';
-import { mountReactView } from '~/utils';
+import { useGlobalStoreInstance } from '~/utils/store/global';
+import { mountReactView } from '~/utils/core/react';
 import { saveTranslationFile } from '@/src/manager/io-manager';
 import { t as gt } from 'src/locales';
-import { generateTheme } from '@/src/utils';
 
 import { useThemeEditorStore } from './store';
 import { ThemeTranslationItem } from './types';
@@ -245,22 +244,37 @@ const ReactThemeEditor: React.FC = () => {
                 return;
             }
 
-            const cssStr = fs.readFileSync(themeCssPath).toString();
-            const manifestPath = path.join(themeDir, 'manifest.json');
-            let manifest = { name: themeName, version: '0.0.0', minAppVersion: '', author: '', authorUrl: '' };
-            if (fs.existsSync(manifestPath)) {
-                try { manifest = fs.readJsonSync(manifestPath); } catch (e) { /* use default */ }
-            }
-
-            const extracted = generateTheme(manifest, cssStr, i18n.settings);
+            const extracted = await i18n.companionWorkerManager.runTask<any>('theme-extract', {
+                resourceId: themeName,
+                label: themeName,
+                themeName,
+                themeDir,
+                themeCssPath,
+                settings: {
+                    author: i18n.settings.author,
+                    reFlags: i18n.settings.reFlags,
+                    reLength: i18n.settings.reLength,
+                    reDatas: i18n.settings.reDatas,
+                    reRejectRe: i18n.settings.reRejectRe,
+                    reValidRe: i18n.settings.reValidRe,
+                    chineseSkipMode: 'none',
+                    astAssignments: i18n.settings.astAssignments,
+                    astFunctions: i18n.settings.astFunctions,
+                    astKeys: i18n.settings.astKeys,
+                    astMaxLength: i18n.settings.astMaxLength ?? 300,
+                    astRejectRe: i18n.settings.astRejectRe,
+                    astValidRe: i18n.settings.astValidRe,
+                },
+            });
+            if (extracted.status !== 'success' || !extracted.content) throw new Error(extracted.error || 'Extract failed');
             const currentItems = useThemeEditorStore.getState().items;
             const existingSources = new Set(currentItems.map(item => item.source));
 
-            // 合并新条目 (extracted.dict 已经是结构化数组)
+            // 合并新条目 (extracted.content.dict 已经是结构化数组)
             let nextId = currentItems.length > 0 ? Math.max(...currentItems.map(i => i.id)) + 1 : 0;
             const newItems: ThemeTranslationItem[] = [];
 
-            for (const extractedItem of extracted.dict) {
+            for (const extractedItem of extracted.content.dict) {
                 if (!existingSources.has(extractedItem.source)) {
                     newItems.push({
                         id: nextId++,

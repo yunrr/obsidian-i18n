@@ -8,7 +8,7 @@
  * - Prompt 生成
  */
 
-import { useGlobalStoreInstance } from '~/utils';
+import { useGlobalStoreInstance } from '~/utils/store/global';
 import { ITranslationProvider, OnRegexBatchComplete, OnAstBatchComplete, OnThemeBatchComplete, OnRegexBatchError, OnAstBatchError, OnThemeBatchError } from './provider-types';
 import { RegexItem, AstItem } from '../views/plugin_editor/types';
 import { ThemeTranslationItem } from '../views/theme_editor/types';

@@ -2,7 +2,7 @@ import React from 'react';
 import { Button } from '@/src/shadcn';
 import { ShieldAlert, ArrowRight } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { useGlobalStoreInstance } from '~/utils';
+import { useGlobalStoreInstance } from '~/utils/store/global';
 
 interface LoginRequiredProps {
     title?: string;

@@ -4,7 +4,7 @@ import { ItemView, WorkspaceLeaf } from 'obsidian';
 import { Root, createRoot } from 'react-dom/client';
 import I18N from 'src/main';
 import { Wizard } from './wizard';
-import { mountReactView } from '~/utils';
+import { mountReactView } from '~/utils/core/react';
 import { t } from '../../locales';
 
 export const WIZARD_VIEW_TYPE = 'wizard-view';

@@ -9,11 +9,11 @@ import { Badge } from '@/src/shadcn/ui/badge';
 import { Card } from '@/src/shadcn';
 import { Loader2, RotateCcw, Eye, GitCommit, Clock, User, ChevronRight, AlertCircle, ArrowLeft } from 'lucide-react';
 import { useCloudStore } from '../cloud-store';
-import { useGlobalStoreInstance } from '~/utils';
+import { useGlobalStoreInstance } from '~/utils/store/global';
 import { t } from '@/src/locales/index';
 import { CommitEntry, ManifestEntry } from '../types';
 import { cn } from '@/src/shadcn/lib/utils';
-import { calculateChecksum } from '@/src/utils/translator/translation';
+import { calculateChecksum } from '@/src/utils/translator/light';
 import { TranslationSource } from '@/src/types';
 import { LoginRequired } from './login-required';
 

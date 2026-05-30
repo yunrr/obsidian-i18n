@@ -10,7 +10,7 @@ import { Badge } from '@/src/shadcn/ui/badge';
 import { Input } from '@/src/shadcn/ui/input';
 import { Loader2, GitCompare, Plus, Minus, RefreshCw, Search, Filter, ArrowRight } from 'lucide-react';
 import { useCloudStore } from '../cloud-store';
-import { useGlobalStoreInstance } from '~/utils';
+import { useGlobalStoreInstance } from '~/utils/store/global';
 import { t } from '@/src/locales/index';
 import { DiffEntry } from '../types';
 import { cn } from '@/src/shadcn/lib/utils';

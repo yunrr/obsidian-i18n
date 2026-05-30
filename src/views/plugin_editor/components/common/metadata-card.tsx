@@ -5,7 +5,7 @@ import { Tag, User, Hash, Globe, FileText, Package, Layers, Cloud, HardDrive, Wa
 import { Input, Textarea, Badge, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Button } from '@/src/shadcn';
 import { TemplateCard } from './template-card';
 import { useRegexStore } from '../../store';
-import { useGlobalStoreInstance } from '~/utils';
+import { useGlobalStoreInstance } from '~/utils/store/global';
 import { TranslationSource } from '~/types';
 
 import { SUPPORTED_LANGUAGES } from '~/constants/languages';
