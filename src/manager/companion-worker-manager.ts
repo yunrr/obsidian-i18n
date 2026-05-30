@@ -103,7 +103,7 @@ export class CompanionWorkerManager {
     private readonly normalizedPluginDir: string;
 
     constructor(private readonly plugin: I18N, private readonly pluginDir: string) {
-        this.rustWorkerPath = path.join(pluginDir, process.platform === 'win32' ? 'i18n-companion-worker.exe' : 'i18n-companion-worker');
+        this.rustWorkerPath = path.join(pluginDir, 'i18n-companion-worker.cjs');
         this.normalizedPluginDir = path.resolve(pluginDir);
     }
 
@@ -339,7 +339,8 @@ export class CompanionWorkerManager {
             if (!existsSync(this.rustWorkerPath)) {
                 throw new Error(`Rust 伴生 worker 不存在: ${this.rustWorkerPath}`);
             }
-            return this.spawnWorker(this.rustWorkerPath, [String(port)], port);
+            const nodePath = this.plugin.settings.llmCompanionNodePath?.trim() || 'node';
+            return this.spawnWorker(nodePath, [this.rustWorkerPath, String(port)], port);
         } catch (error) {
             console.warn('[I18N Companion] 启动失败', error);
             this.stop();
@@ -415,4 +416,3 @@ export class CompanionWorkerManager {
         return typeof pluginDir === 'string' && path.resolve(pluginDir) === this.normalizedPluginDir;
     }
 }
-
