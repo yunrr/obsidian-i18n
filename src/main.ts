@@ -118,6 +118,12 @@ export default class I18N extends Plugin {
     // [配置类] 加载
     public async loadSettings() {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+        let settingsModified = false;
+
+        if (this.settings.author === 'yun') {
+            this.settings.author = '';
+            settingsModified = true;
+        }
 
         // 旧版数字 ID 升级迁移
         if (typeof this.settings.llmApi === 'number') {
@@ -128,9 +134,10 @@ export default class I18N extends Plugin {
                 15: 'minimax', 16: 'stepfun'
             };
             this.settings.llmApi = legacyApiMap[this.settings.llmApi as number] || 'openai';
-            await this.saveSettings();
+            settingsModified = true;
         }
 
+        if (settingsModified) await this.saveSettings();
         await this.migrateLLMProfiles();
     }
     // [配置类] 保存
