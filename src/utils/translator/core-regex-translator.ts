@@ -215,11 +215,8 @@ export class RegexTranslator {
             // regex 是预编译的 stateful RegExp ('g' flag)，循环前需重置 lastIndex
             regex.lastIndex = 0;
 
-            const matches = code.match(regex);
-            if (!matches) continue; // 无匹配结果则跳过
-
-            // 遍历匹配结果，过滤并去重
-            for (const item of matches) {
+            for (const match of code.matchAll(regex)) {
+                const item = match.slice(1).filter((value): value is string => value !== undefined).pop() ?? match[0];
                 // 使用统一的过滤校验逻辑
                 if (!this.isValidText(item)) continue;
                 // 利用Set快速判断是否重复
