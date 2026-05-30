@@ -500,6 +500,34 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         return i18n.sourceManager.loadBatchTaskCheckpoint(PLUGIN_TRANSLATE_CHECKPOINT_KEY);
     }, [i18n, sourceTick]);
 
+    const resumablePluginExtractResources = useMemo<PluginBatchResource[]>(() => {
+        return (pluginExtractCheckpoint?.resources || [])
+            .map(resource => ({
+                resourceId: resource.resourceId,
+                label: resource.label,
+                sourceId: resource.sourceId,
+            }))
+            .filter(resource => !allPluginStates[resource.resourceId]?.isLangDoc);
+    }, [allPluginStates, pluginExtractCheckpoint]);
+
+    const resumablePluginTranslateResources = useMemo<PluginBatchResource[]>(() => {
+        return (pluginTranslateCheckpoint?.resources || [])
+            .flatMap(resource => {
+                const data = allPluginStates[resource.resourceId];
+                if (!data?.isLangDoc || !data.translationFormatMark || !data.activeSourceId) return [];
+                const itemCount = settings.llmOverwriteExistingTranslations === true
+                    ? data.totalTranslationCount
+                    : data.pendingTranslationCount;
+                const remainingCount = itemCount || 0;
+                if (remainingCount <= 0) return [];
+                return [{
+                    resourceId: resource.resourceId,
+                    label: resource.label,
+                    sourceId: data.activeSourceId,
+                }];
+            });
+    }, [allPluginStates, pluginTranslateCheckpoint, settings.llmOverwriteExistingTranslations]);
+
     const handleSearchChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         const val = e.target.value;
         setSearchTerm(val);
@@ -621,12 +649,8 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
     }, [i18n, syncSourceStateFromDisk, syncWorkerProgress]);
 
     const startPluginBatchExtract = useCallback(async (resume: boolean) => {
-        const resources: PluginBatchResource[] = resume && pluginExtractCheckpoint?.resources.length
-            ? pluginExtractCheckpoint.resources.map(resource => ({
-                resourceId: resource.resourceId,
-                label: resource.label,
-                sourceId: resource.sourceId,
-            }))
+        const resources: PluginBatchResource[] = resume && resumablePluginExtractResources.length
+            ? resumablePluginExtractResources
             : extractablePlugins.map(plugin => ({ resourceId: plugin.id, label: plugin.name }));
 
         const completedResources = resume ? pluginExtractCheckpoint?.completedResources || 0 : 0;
@@ -695,18 +719,14 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             taskIdRef.current = null;
             setBatchTask(prev => ({ ...prev, isRunning: false, currentLabel: '' }));
         }
-    }, [allPluginStates, batchTask.isRunning, extractablePlugins, i18n, plugins, pluginExtractCheckpoint, runWorkerTask, settings.language, t]);
+    }, [allPluginStates, batchTask.isRunning, extractablePlugins, i18n, plugins, pluginExtractCheckpoint, resumablePluginExtractResources, runWorkerTask, settings.language, t]);
 
     const handleBatchExtract = useCallback(() => startPluginBatchExtract(false), [startPluginBatchExtract]);
     const handleResumeExtract = useCallback(() => startPluginBatchExtract(true), [startPluginBatchExtract]);
 
     const startPluginBatchTranslate = useCallback(async (resume: boolean) => {
-        const resources: PluginBatchResource[] = resume && pluginTranslateCheckpoint?.resources.length
-            ? pluginTranslateCheckpoint.resources.map(resource => ({
-                resourceId: resource.resourceId,
-                label: resource.label,
-                sourceId: resource.sourceId,
-            }))
+        const resources: PluginBatchResource[] = resume && resumablePluginTranslateResources.length
+            ? resumablePluginTranslateResources
             : translatablePlugins.map(plugin => ({
                 resourceId: plugin.id,
                 label: plugin.name,
@@ -764,7 +784,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             taskIdRef.current = null;
             setBatchTask(prev => ({ ...prev, isRunning: false, currentLabel: '' }));
         }
-    }, [allPluginStates, batchTask.isRunning, i18n, pluginTranslateCheckpoint, runWorkerTask, settings.llmOverwriteExistingTranslations, t, translatablePlugins]);
+    }, [allPluginStates, batchTask.isRunning, i18n, pluginTranslateCheckpoint, resumablePluginTranslateResources, runWorkerTask, settings.llmOverwriteExistingTranslations, t, translatablePlugins]);
 
     const handleBatchTranslate = useCallback(() => startPluginBatchTranslate(false), [startPluginBatchTranslate]);
     const handleResumeTranslate = useCallback(() => startPluginBatchTranslate(true), [startPluginBatchTranslate]);
@@ -892,7 +912,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                                 {t('Manager.Common.Actions.StopTask', '停止任务')}
                             </Button>
                         )}
-                        {!batchTask.isRunning && (pluginExtractCheckpoint?.resources?.length ?? 0) > 0 && (
+                        {!batchTask.isRunning && resumablePluginExtractResources.length > 0 && (
                             <Button
                                 variant="outline"
                                 size="sm"
@@ -901,10 +921,10 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                             >
                                 <RotateCcw className="w-4 h-4" />
                                 {t('Manager.Common.Actions.ResumeExtract', '继续提取')}
-                                <span className="text-muted-foreground">{pluginExtractCheckpoint?.resources?.length ?? 0}</span>
+                                <span className="text-muted-foreground">{resumablePluginExtractResources.length}</span>
                             </Button>
                         )}
-                        {!batchTask.isRunning && (pluginTranslateCheckpoint?.resources?.length ?? 0) > 0 && (
+                        {!batchTask.isRunning && resumablePluginTranslateResources.length > 0 && (
                             <Button
                                 variant="outline"
                                 size="sm"
@@ -913,7 +933,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                             >
                                 <RotateCcw className="w-4 h-4" />
                                 {t('Manager.Common.Actions.ResumeTranslate', '继续翻译')}
-                                <span className="text-muted-foreground">{pluginTranslateCheckpoint?.resources?.length ?? 0}</span>
+                                <span className="text-muted-foreground">{resumablePluginTranslateResources.length}</span>
                             </Button>
                         )}
                         {!batchTask.isRunning && pluginFailureRecords.length > 0 && (

@@ -515,6 +515,34 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
         return i18n.sourceManager.loadBatchTaskCheckpoint(THEME_TRANSLATE_CHECKPOINT_KEY);
     }, [i18n, sourceTick]);
 
+    const resumableThemeExtractResources = useMemo<ThemeBatchResource[]>(() => {
+        return (themeExtractCheckpoint?.resources || [])
+            .map(resource => ({
+                resourceId: resource.resourceId,
+                label: resource.label,
+                sourceId: resource.sourceId,
+            }))
+            .filter(resource => !allThemeStates[resource.resourceId]?.hasTranslation);
+    }, [allThemeStates, themeExtractCheckpoint]);
+
+    const resumableThemeTranslateResources = useMemo<ThemeBatchResource[]>(() => {
+        return (themeTranslateCheckpoint?.resources || [])
+            .flatMap(resource => {
+                const data = allThemeStates[resource.resourceId];
+                if (!data?.hasTranslation || !data.activeSourceId) return [];
+                const itemCount = i18n.settings.llmOverwriteExistingTranslations === true
+                    ? data.totalTranslationCount
+                    : data.pendingTranslationCount;
+                const remainingCount = itemCount || 0;
+                if (remainingCount <= 0) return [];
+                return [{
+                    resourceId: resource.resourceId,
+                    label: resource.label,
+                    sourceId: data.activeSourceId,
+                }];
+            });
+    }, [allThemeStates, i18n.settings.llmOverwriteExistingTranslations, themeTranslateCheckpoint]);
+
     const handleRefresh = useCallback(() => {
         setRefreshKey(k => k + 1);
     }, []);
@@ -573,12 +601,8 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
     }, [i18n, syncSourceStateFromDisk, syncWorkerProgress]);
 
     const startThemeBatchExtract = useCallback(async (resume: boolean) => {
-        const resources: ThemeBatchResource[] = resume && themeExtractCheckpoint?.resources.length
-            ? themeExtractCheckpoint.resources.map(resource => ({
-                resourceId: resource.resourceId,
-                label: resource.label,
-                sourceId: resource.sourceId,
-            }))
+        const resources: ThemeBatchResource[] = resume && resumableThemeExtractResources.length
+            ? resumableThemeExtractResources
             : extractableThemes.map(theme => ({ resourceId: theme.name, label: theme.name }));
 
         const completedResources = resume ? themeExtractCheckpoint?.completedResources || 0 : 0;
@@ -645,18 +669,14 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             taskIdRef.current = null;
             setBatchTask(prev => ({ ...prev, isRunning: false, currentLabel: '' }));
         }
-    }, [allThemeStates, batchTask.isRunning, extractableThemes, i18n, runWorkerTask, t, themeExtractCheckpoint, themes]);
+    }, [allThemeStates, batchTask.isRunning, extractableThemes, i18n, resumableThemeExtractResources, runWorkerTask, t, themeExtractCheckpoint, themes]);
 
     const handleBatchExtract = useCallback(() => startThemeBatchExtract(false), [startThemeBatchExtract]);
     const handleResumeExtract = useCallback(() => startThemeBatchExtract(true), [startThemeBatchExtract]);
 
     const startThemeBatchTranslate = useCallback(async (resume: boolean) => {
-        const resources: ThemeBatchResource[] = resume && themeTranslateCheckpoint?.resources.length
-            ? themeTranslateCheckpoint.resources.map(resource => ({
-                resourceId: resource.resourceId,
-                label: resource.label,
-                sourceId: resource.sourceId,
-            }))
+        const resources: ThemeBatchResource[] = resume && resumableThemeTranslateResources.length
+            ? resumableThemeTranslateResources
             : translatableThemes.map(theme => ({
                 resourceId: theme.name,
                 label: theme.name,
@@ -714,7 +734,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             taskIdRef.current = null;
             setBatchTask(prev => ({ ...prev, isRunning: false, currentLabel: '' }));
         }
-    }, [allThemeStates, batchTask.isRunning, i18n, runWorkerTask, t, themeTranslateCheckpoint, translatableThemes]);
+    }, [allThemeStates, batchTask.isRunning, i18n, resumableThemeTranslateResources, runWorkerTask, t, themeTranslateCheckpoint, translatableThemes]);
 
     const handleBatchTranslate = useCallback(() => startThemeBatchTranslate(false), [startThemeBatchTranslate]);
     const handleResumeTranslate = useCallback(() => startThemeBatchTranslate(true), [startThemeBatchTranslate]);
@@ -879,7 +899,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                                 {t('Manager.Common.Actions.StopTask', '停止任务')}
                             </Button>
                         )}
-                        {!batchTask.isRunning && (themeExtractCheckpoint?.resources?.length ?? 0) > 0 && (
+                        {!batchTask.isRunning && resumableThemeExtractResources.length > 0 && (
                             <Button
                                 variant="outline"
                                 size="sm"
@@ -888,10 +908,10 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                             >
                                 <RotateCcw className="w-4 h-4" />
                                 {t('Manager.Common.Actions.ResumeExtract', '继续提取')}
-                                <span className="text-muted-foreground">{themeExtractCheckpoint?.resources?.length ?? 0}</span>
+                                <span className="text-muted-foreground">{resumableThemeExtractResources.length}</span>
                             </Button>
                         )}
-                        {!batchTask.isRunning && (themeTranslateCheckpoint?.resources?.length ?? 0) > 0 && (
+                        {!batchTask.isRunning && resumableThemeTranslateResources.length > 0 && (
                             <Button
                                 variant="outline"
                                 size="sm"
@@ -900,7 +920,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                             >
                                 <RotateCcw className="w-4 h-4" />
                                 {t('Manager.Common.Actions.ResumeTranslate', '继续翻译')}
-                                <span className="text-muted-foreground">{themeTranslateCheckpoint?.resources?.length ?? 0}</span>
+                                <span className="text-muted-foreground">{resumableThemeTranslateResources.length}</span>
                             </Button>
                         )}
                         {!batchTask.isRunning && themeFailureRecords.length > 0 && (
