@@ -7,7 +7,8 @@ import { Settings, FolderOpen, Pen, FileOutput, XCircle, Loader2, MoreHorizontal
 import I18N from 'src/main';
 import { PluginTranslationV1 } from 'src/types';
 import { i18nOpen } from '../../../utils/common/general';
-import { getPluginTranslationSources, hasExtractedTranslationContent, calculateChecksum } from '../../../utils/translator/light';
+import { generatePlugin } from '../../../utils/translator/base';
+import { getPluginTranslationSources, hasBoundedChineseRuns, hasExtractedTranslationContent, hasChineseText, calculateChecksum } from '../../../utils/translator/light';
 import { loadTranslationFile } from '../../../manager/io-manager';
 import { useGlobalStoreInstance } from '~/utils/store/global';
 import { EDITOR_VIEW_TYPE } from '../../../views';
@@ -190,40 +191,16 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
                 i18n.notice.error(t('Manager.Plugins.Errors.MainNotFound'));
                 return;
             }
-            const result = await i18n.companionWorkerManager.runTask<any>('plugin-extract', {
-                resourceId: plugin.id,
-                label: plugin.name,
-                pluginName: plugin.name,
-                pluginVersion: plugin.version,
-                mainDoc,
-                manifestDoc,
-                language: settings.language,
-                settings: {
-                    author: i18n.settings.author,
-                    reFlags: i18n.settings.reFlags,
-                    reLength: i18n.settings.reLength,
-                    reDatas: i18n.settings.reDatas,
-                    reRejectRe: i18n.settings.reRejectRe,
-                    reValidRe: i18n.settings.reValidRe,
-                    chineseSkipMode: i18n.settings.chineseSkipMode || 'source',
-                    astAssignments: i18n.settings.astAssignments,
-                    astFunctions: i18n.settings.astFunctions,
-                    astKeys: i18n.settings.astKeys,
-                    astMaxLength: i18n.settings.astMaxLength ?? 300,
-                    astRejectRe: i18n.settings.astRejectRe,
-                    astValidRe: i18n.settings.astValidRe,
-                },
-            });
-
-            if (result.status === 'skipped') {
-                i18n.notice.result(false, result.reason === 'chinese' ? '检测到插件已包含中文内容，已跳过提取' : '未提取到可翻译内容，已跳过提取');
+            const [mainStr, manifestJSON] = await Promise.all([
+                fs.readFile(mainDoc, 'utf8'),
+                fs.readJson(manifestDoc),
+            ]);
+            if (hasChineseText(`${manifestJSON.name || plugin.name}\n${manifestJSON.description || ''}`) || hasBoundedChineseRuns(mainStr)) {
+                i18n.notice.result(false, '检测到插件已包含中文内容，已跳过提取');
                 return;
             }
-            if (result.status !== 'success' || !result.content) {
-                throw new Error(result.error || 'Extract failed');
-            }
 
-            const translationJson = result.content;
+            const translationJson = generatePlugin(plugin.version, manifestJSON, mainStr, settings.language, i18n.settings);
             const extractedSources = getPluginTranslationSources(translationJson);
             if (!hasExtractedTranslationContent(extractedSources)) {
                 i18n.notice.result(false, '未提取到可翻译内容，已跳过提取');

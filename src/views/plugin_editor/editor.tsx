@@ -20,6 +20,8 @@ import { StringPicker } from '~/utils/ui/string-picker';
 import { calculateChecksum, mergeAstItems, mergeRegexItems } from '@/src/utils/translator/light';
 import { saveTranslationFile } from '@/src/manager/io-manager';
 import { createTranslationProvider } from '~/ai/provider-factory';
+import { AstTranslator } from '~/utils/translator/core-ast-translator';
+import { RegexTranslator } from '~/utils/translator/core-regex-translator';
 
 import { useTranslation } from 'react-i18next';
 import { t as gt } from 'src/locales';
@@ -30,6 +32,17 @@ import { MetadataCard } from './components/common/metadata-card';
 import { AstSidebar } from './components/ast/ast-sidebar';
 import { RegexSidebar } from './components/regex/regex-sidebar';
 import { TemplateCard } from './components/common/template-card';
+
+const extractCodeWithJsPipeline = (code: string, settings: any) => {
+    const astTranslator = new AstTranslator(settings);
+    const ast = astTranslator.loadCode(code);
+    const regexTranslator = new RegexTranslator(settings);
+
+    return {
+        ast: ast ? astTranslator.extract(ast) : [],
+        regex: regexTranslator.loadCode(code) || [],
+    };
+};
 
 // ====================================================================================================
 // 子组件 & 辅助功能
@@ -296,10 +309,7 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
             }
 
             const mainStr = fs.readFileSync(fileDoc).toString();
-            const extracted = await i18n.companionWorkerManager.codeExtract({
-                code: mainStr,
-                settings: getExtractionSettings(),
-            });
+            const extracted = extractCodeWithJsPipeline(mainStr, getExtractionSettings());
             const newAstItems = extracted.ast || [];
             const currentAstItems = useRegexStore.getState().astItems;
 
@@ -339,10 +349,7 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
             }
 
             const mainStr = fs.readFileSync(fileDoc).toString();
-            const extracted = await i18n.companionWorkerManager.codeExtract({
-                code: mainStr,
-                settings: getExtractionSettings(),
-            });
+            const extracted = extractCodeWithJsPipeline(mainStr, getExtractionSettings());
             const newRegexItems = extracted.regex || [];
             const currentRegexItems = useRegexStore.getState().regexItems;
 
@@ -721,10 +728,7 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
             }
 
             const results: DiagnoseError[] = [];
-            const extracted = await i18n.companionWorkerManager.codeExtract({
-                code: originalCode,
-                settings: getExtractionSettings(),
-            });
+            const extracted = extractCodeWithJsPipeline(originalCode, getExtractionSettings());
             const hitAst = new Set((extracted.ast || []).flatMap(item => [
                 `${item.type}:${item.name || ''}:${item.source}`,
                 item.source,
