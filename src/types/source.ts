@@ -39,7 +39,63 @@ export interface TranslationSourceMeta {
     sources: Record<string, TranslationSource>;
 }
 
+export type BatchTaskScope = 'plugin' | 'theme';
+export type BatchTaskMode = 'extract' | 'translate';
+export type BatchTaskFailureKind = 'ast' | 'regex' | 'theme';
+
+export interface BatchTaskCheckpointResource {
+    resourceId: string;
+    label: string;
+    sourceId?: string | null;
+}
+
+export interface BatchTaskCheckpoint {
+    scope: BatchTaskScope;
+    mode: BatchTaskMode;
+    resources: BatchTaskCheckpointResource[];
+    totalResources: number;
+    completedResources: number;
+    totalItems: number;
+    processedItems: number;
+    stoppedAt: number;
+}
+
+export interface BatchTaskFailureItemDescriptor {
+    source: string;
+    target: string;
+    dictIndex: number;
+    file?: string;
+    type?: string;
+    name?: string;
+}
+
+export interface BatchTaskFailureRecord {
+    id: string;
+    scope: BatchTaskScope;
+    resourceId: string;
+    resourceLabel: string;
+    sourceId: string;
+    batchType: BatchTaskFailureKind;
+    errorMessage: string;
+    items: BatchTaskFailureItemDescriptor[];
+    failedAt: number;
+}
+
+export interface BatchTaskRecordMeta {
+    schemaVersion: number;
+    checkpoints: Record<string, BatchTaskCheckpoint>;
+    failures: BatchTaskFailureRecord[];
+    updatedAt: number;
+}
+
 export const EMPTY_META: TranslationSourceMeta = {
     schemaVersion: 2,
     sources: {}
+};
+
+export const EMPTY_BATCH_TASK_RECORD: BatchTaskRecordMeta = {
+    schemaVersion: 1,
+    checkpoints: {},
+    failures: [],
+    updatedAt: 0
 };

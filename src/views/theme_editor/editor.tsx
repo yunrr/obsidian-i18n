@@ -120,11 +120,11 @@ const ReactThemeEditor: React.FC = () => {
             setMetadata({
                 theme: themeName || '',
                 language: 'zh-cn',
-                version: '1.0.0',
+                version: '1.0.1',
                 supportedVersions: oldManifest.pluginVersion || '0.0.0',
                 title: themeName || '',
                 description: '',
-                author: ''
+                author: 'yun'
             });
         }
 
@@ -182,11 +182,11 @@ const ReactThemeEditor: React.FC = () => {
                 metadata: metadata || {
                     theme: themeName || '',
                     language: 'zh-cn',
-                    version: '1.0.0',
+                    version: '1.0.1',
                     supportedVersions: '0.0.0',
                     title: themeName || '',
                     description: '',
-                    author: ''
+                    author: 'yun'
                 },
                 dict: cleanDict,
             };

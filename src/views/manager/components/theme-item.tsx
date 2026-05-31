@@ -48,6 +48,7 @@ export interface ThemeItemData {
     activeSourceId: string | null;
     isApplied: boolean;
     isTranslated: boolean;
+    pendingTranslationCount?: number;
     translationVersion?: string;
     description?: string;
     supportedVersion?: string;

@@ -9,7 +9,7 @@
  */
 
 import { useGlobalStoreInstance } from '~/utils';
-import { ITranslationProvider, OnRegexBatchComplete, OnAstBatchComplete, OnThemeBatchComplete } from './provider-types';
+import { ITranslationProvider, OnRegexBatchComplete, OnAstBatchComplete, OnThemeBatchComplete, OnRegexBatchError, OnAstBatchError, OnThemeBatchError } from './provider-types';
 import { RegexItem, AstItem } from '../views/plugin_editor/types';
 import { ThemeTranslationItem } from '../views/theme_editor/types';
 import { parseTranslationResponse } from '../utils/ai/response-parser';
@@ -55,30 +55,33 @@ export abstract class BaseProvider implements ITranslationProvider {
         return profiles?.find((p: any) => p.id === activeId) || profiles?.[0];
     }
 
-    public async regexTranslate(items: RegexItem[], onBatchComplete: OnRegexBatchComplete, signal?: AbortSignal): Promise<RegexItem[]> {
+    public async regexTranslate(items: RegexItem[], onBatchComplete: OnRegexBatchComplete, signal?: AbortSignal, onBatchError?: OnRegexBatchError): Promise<RegexItem[]> {
         return this.executeParallelBatches(
             items,
             (batch, sig) => this.callRegexTranslationAPI(batch, sig),
             onBatchComplete,
-            signal
+            signal,
+            onBatchError
         );
     }
 
-    public async astTranslate(items: AstItem[], onBatchComplete: OnAstBatchComplete, signal?: AbortSignal): Promise<AstItem[]> {
+    public async astTranslate(items: AstItem[], onBatchComplete: OnAstBatchComplete, signal?: AbortSignal, onBatchError?: OnAstBatchError): Promise<AstItem[]> {
         return this.executeParallelBatches(
             items,
             (batch, sig) => this.callAstTranslationAPI(batch, sig),
             onBatchComplete,
-            signal
+            signal,
+            onBatchError
         );
     }
 
-    public async themeTranslate(items: ThemeTranslationItem[], onBatchComplete: OnThemeBatchComplete, signal?: AbortSignal): Promise<ThemeTranslationItem[]> {
+    public async themeTranslate(items: ThemeTranslationItem[], onBatchComplete: OnThemeBatchComplete, signal?: AbortSignal, onBatchError?: OnThemeBatchError): Promise<ThemeTranslationItem[]> {
         return this.executeParallelBatches(
             items,
             (batch, sig) => this.callThemeTranslationAPI(batch, sig),
             onBatchComplete,
-            signal
+            signal,
+            onBatchError
         );
     }
 
@@ -131,7 +134,8 @@ export abstract class BaseProvider implements ITranslationProvider {
 
     /** 获取并发限制数 */
     protected getConcurrencyLimit(): number {
-        return useGlobalStoreInstance.getState().i18n.settings.llmConcurrencyLimit || 3;
+        const limit = useGlobalStoreInstance.getState().i18n.settings.llmConcurrencyLimit;
+        return Number.isFinite(limit) ? Math.max(1, Math.floor(limit)) : 3;
     }
 
     /** 获取超时时间 */
@@ -164,7 +168,8 @@ export abstract class BaseProvider implements ITranslationProvider {
         items: T[],
         callApi: (batch: T[], signal?: AbortSignal) => Promise<T[]>,
         onBatchComplete: (batchResult: T[], batchIndex: number, totalBatches: number) => void | Promise<void>,
-        signal?: AbortSignal
+        signal?: AbortSignal,
+        onBatchError?: (batchItems: T[], error: Error, batchIndex: number, totalBatches: number) => void | Promise<void>
     ): Promise<T[]> {
         this.validateInput(items);
         const batches = this.splitIntoBatches(items);
@@ -188,9 +193,11 @@ export abstract class BaseProvider implements ITranslationProvider {
                     await onBatchComplete(batchResult, completedBatchesCount, totalBatches);
                     resultsBuffer[index] = batchResult;
                 } catch (error) {
-                    if ((error as Error).message !== '翻译任务已取消') {
-                        console.error(`Batch ${index + 1} failed:`, error);
-                        useGlobalStoreInstance.getState().i18n.notice.error(`AI翻译批次 ${index + 1} 失败: ${(error as Error).message}`);
+                    const normalizedError = error instanceof Error ? error : new Error(String(error));
+                    if (normalizedError.message !== '翻译任务已取消') {
+                        console.error(`Batch ${index + 1} failed:`, normalizedError);
+                        useGlobalStoreInstance.getState().i18n.notice.error(`AI翻译批次 ${index + 1} 失败: ${normalizedError.message}`);
+                        await onBatchError?.(batch, normalizedError, index + 1, totalBatches);
                     }
                     completedBatchesCount++;
                     resultsBuffer[index] = batch.map(item => ({ ...item, target: (item as any).source || '' })) as unknown as T[];

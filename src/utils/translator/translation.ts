@@ -42,12 +42,12 @@ export function generatePlugin(pluginVersion: string, manifestJSON: PluginManife
         schemaVersion: PluginTranslationSchemaVersion.V1,
         metadata: {
             plugin: manifestJSON.id,
-            version: '1.0.0',
+            version: '1.0.1',
             title: manifestJSON.name,
             description: `${manifestJSON.name} Localization & Tweaks`,
             language: language,
             supportedVersions: pluginVersion,
-            author: settings.author || '',
+            author: settings.author || 'yun',
         },
         dict: {
             'main.js': {
@@ -114,11 +114,11 @@ export function generateTheme(themeManifest: OBThemeManifest, themeStr: string, 
         metadata: {
             theme: themeManifest.name,
             language: 'zh-cn', // 默认语言
-            version: '1.0.0',
+            version: '1.0.1',
             supportedVersions: themeManifest.version,
             title: themeManifest.name,
             description: `${themeManifest.name} Localization & Tweaks`,
-            author: settings.author || '',
+            author: settings.author || 'yun',
         },
         dict: []
     };

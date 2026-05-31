@@ -17,6 +17,7 @@ export default {
     Status: {
         Success: "成功",
         Failure: "失败",
+        Skipped: "跳过",
         Loading: "加载中...",
         Reloading: "重载中...",
         Unknown: "未知",

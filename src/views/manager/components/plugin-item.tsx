@@ -51,6 +51,7 @@ export interface PluginItemData {
     manifestDoc: string;
     isApplied: boolean;
     isTranslated: boolean;
+    pendingTranslationCount?: number;
     translationVersion?: string;
     supportedVersion?: string;
     cloudEntries?: any[];

@@ -33,6 +33,106 @@ export interface DeepDiagnosticReport {
     logs: DiagnosticLog[];
 }
 
+function isSuccessStatus(status: number): boolean {
+    return status >= 200 && status < 300;
+}
+
+function normalizeRequestUrlText(response: any): string {
+    if (typeof response?.text === 'string' && response.text.length > 0) {
+        return response.text;
+    }
+
+    if (response?.json !== undefined && response.json !== null) {
+        return typeof response.json === 'string' ? response.json : JSON.stringify(response.json);
+    }
+
+    if (response?.arrayBuffer instanceof ArrayBuffer && response.arrayBuffer.byteLength > 0) {
+        return new TextDecoder().decode(response.arrayBuffer);
+    }
+
+    return '';
+}
+
+function normalizeStreamingResponseText(text: string): string {
+    const trimmed = text.trim();
+    if (!trimmed.startsWith('data:')) return text;
+
+    const chunks: string[] = [];
+    let lastEvent: any = null;
+
+    for (const line of text.split(/\r?\n/)) {
+        const trimmedLine = line.trim();
+        if (!trimmedLine.startsWith('data:')) continue;
+
+        const payload = trimmedLine.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+
+        try {
+            const event = JSON.parse(payload);
+            lastEvent = event;
+            const choice = event?.choices?.[0];
+            const deltaContent = choice?.delta?.content;
+            const messageContent = choice?.message?.content;
+            if (typeof deltaContent === 'string') chunks.push(deltaContent);
+            if (typeof messageContent === 'string') chunks.push(messageContent);
+        } catch {
+        }
+    }
+
+    const content = chunks.join('');
+    if (!content) return text;
+
+    return JSON.stringify({
+        id: lastEvent?.id || 'request-url-stream',
+        object: 'chat.completion',
+        created: lastEvent?.created || Math.floor(Date.now() / 1000),
+        model: lastEvent?.model || '',
+        choices: [{
+            index: 0,
+            message: { role: 'assistant', content },
+            finish_reason: lastEvent?.choices?.[0]?.finish_reason || 'stop',
+        }],
+        usage: lastEvent?.usage,
+    });
+}
+
+function normalizeRequestUrlResponse(response: any): any {
+    const text = normalizeStreamingResponseText(normalizeRequestUrlText(response));
+    let json = response?.json;
+
+    if (json === undefined || json === null || typeof json === 'string') {
+        try {
+            json = JSON.parse(typeof json === 'string' ? json : text);
+        } catch {
+            json = undefined;
+        }
+    }
+
+    return { ...response, text, json };
+}
+
+function parseRequestUrlJson(response: any): any | null {
+    const normalized = normalizeRequestUrlResponse(response);
+    return normalized.json ?? null;
+}
+
+function extractOpenAIContent(body: any): string {
+    const choice = body?.choices?.[0];
+    const content = choice?.message?.content ?? choice?.text ?? choice?.delta?.content;
+
+    if (Array.isArray(content)) {
+        return content.map((part: any) => {
+            if (typeof part === 'string') return part;
+            if (typeof part?.text === 'string') return part.text;
+            if (typeof part?.content === 'string') return part.content;
+            if (typeof part?.text?.value === 'string') return part.text.value;
+            return '';
+        }).join('');
+    }
+
+    return typeof content === 'string' ? content : '';
+}
+
 export class ConnectivityTester {
     private url: string;
     private key: string;
@@ -121,7 +221,7 @@ export class ConnectivityTester {
             const latency = Date.now() - startTime;
             report.endpoint.latency = latency;
 
-            if (res.status >= 200 && res.status < 300 || [401, 403, 405, 429].includes(res.status)) {
+            if (isSuccessStatus(res.status) || [401, 403, 405, 429].includes(res.status)) {
                 report.endpoint.status = report.endpoint.status === 'warn' ? 'warn' : 'pass';
                 report.endpoint.value = `${testUrl} (${res.status})`;
                 this.addLog('Endpoint', `成功连通 (耗时: ${latency}ms, 状态码: ${res.status})`);
@@ -207,7 +307,7 @@ export class ConnectivityTester {
             const authRes = await this.safeRequest(authProbeUrl, 'GET', true);
             report.auth.latency = Date.now() - authStartTime;
 
-            if (authRes.status === 200) {
+            if (isSuccessStatus(authRes.status)) {
                 report.auth.status = 'pass';
                 report.auth.value = '有效';
                 this.addLog('Auth', 'API Key 校验通过');
@@ -257,7 +357,7 @@ export class ConnectivityTester {
         });
         report.model.latency = Date.now() - modelStartTime;
 
-        if (modelRes.status === 200) {
+        if (isSuccessStatus(modelRes.status)) {
             report.model.status = 'pass';
             this.addLog('Model', `模型 ${this.model} 通道畅通，已能够生成对话`);
         } else {
@@ -294,7 +394,7 @@ export class ConnectivityTester {
         });
         report.systemRole.latency = Date.now() - sysRoleStartTime;
 
-        if (sysRoleRes.status === 200) {
+        if (isSuccessStatus(sysRoleRes.status)) {
             report.systemRole.status = 'pass';
             report.systemRole.value = '已支持';
             this.addLog('SystemRole', 'System 身份槽响应正常，允许承载系统提示词');
@@ -316,7 +416,7 @@ export class ConnectivityTester {
             response_format: { type: 'json_object' },
             max_tokens: 10
         });
-        if (jsonModeRes.status === 200) {
+        if (isSuccessStatus(jsonModeRes.status)) {
             report.jsonMode.status = 'pass';
             report.jsonMode.value = '已支持';
             this.addLog('Capabilities', '探测通过：原生 JSON_OBJECT 强制输出工作正常');
@@ -345,7 +445,7 @@ export class ConnectivityTester {
             },
             max_tokens: 10
         });
-        if (jsonSchemaRes.status === 200) {
+        if (isSuccessStatus(jsonSchemaRes.status)) {
             report.jsonSchema.status = 'pass';
             report.jsonSchema.value = '已支持';
             this.addLog('Capabilities', '探测通过：基于 JSON Schema 的高度结构化约束功能完好');
@@ -418,11 +518,10 @@ export class ConnectivityTester {
             const transLatency = Date.now() - transStartTime;
             report.translation.latency = transLatency;
 
-            if (transRes.status !== 200) {
+            if (!isSuccessStatus(transRes.status)) {
                 report.translation.status = 'fail';
                 report.translation.value = `HTTP ${transRes.status}`;
-                let errBody: any = null;
-                try { errBody = typeof transRes.json === 'object' ? transRes.json : JSON.parse(transRes.text); } catch { }
+                let errBody: any = parseRequestUrlJson(transRes);
                 const errMsg = errBody?.error?.message || errBody?.message || '';
 
                 if (transRes.status === 400 && this.responseFormat !== 'text') {
@@ -436,8 +535,8 @@ export class ConnectivityTester {
             } else {
                 let parseSuccess = false;
                 try {
-                    const body = typeof transRes.json === 'object' ? transRes.json : JSON.parse(transRes.text);
-                    const content = body?.choices?.[0]?.message?.content;
+                    const body = parseRequestUrlJson(transRes);
+                    const content = extractOpenAIContent(body);
                     if (content) {
                         let resultArray: any[] = [];
                         try {
@@ -458,10 +557,10 @@ export class ConnectivityTester {
                                 report.translation.value = `✔ 通过 (${transLatency}ms)`;
                                 this.addLog('Translation', `✔ 沙盒全链路通过：成功捕获并重组出 ${resultArray.length} 条元数据，响应耗时 ${transLatency}ms`);
 
-                                if (transRes.json?.usage) {
+                                if (body?.usage) {
                                     report.translation.usage = {
-                                        prompt: transRes.json.usage.prompt_tokens,
-                                        completion: transRes.json.usage.completion_tokens
+                                        prompt: body.usage.prompt_tokens,
+                                        completion: body.usage.completion_tokens
                                     };
                                 }
                             }
@@ -474,14 +573,20 @@ export class ConnectivityTester {
                 if (!parseSuccess) {
                     report.translation.status = 'fail';
                     report.translation.value = '格式解析失败';
-                    const rawBody = typeof transRes.json === 'object' ? JSON.stringify(transRes.json, null, 2) : transRes.text;
+                    const rawBody = transRes.json ? JSON.stringify(transRes.json, null, 2) : transRes.text;
                     let contentPreview = '';
                     try {
-                        const body = typeof transRes.json === 'object' ? transRes.json : JSON.parse(transRes.text);
-                        contentPreview = body?.choices?.[0]?.message?.content || '';
+                        contentPreview = extractOpenAIContent(parseRequestUrlJson(transRes));
                     } catch { }
 
-                    report.translation.tip = `模型返回了无法被解析的内容。当前选择格式: "${this.responseFormat}"。\n模型实际输出预览: "${contentPreview.substring(0, 200)}..."\n建议: 若模型输出了大量非 JSON 文字，请确认其是否支持 JSON 模式，或改用 Text 格式。`;
+                    const outputPreview = contentPreview.trim()
+                        ? `"${contentPreview.substring(0, 200)}..."`
+                        : '未能从响应中提取模型内容，可能是本地网关返回格式不是标准 OpenAI Chat Completion。';
+                    const suggestion = this.responseFormat === 'text'
+                        ? '当前已是 Text 模式，说明模型输出内容不是插件需要的 JSON 数组，或本地网关返回结构不符合 OpenAI Chat Completion 格式。请确认模型实际输出包含 [{ "i": 1, "t": "译文" }] 这样的数组。'
+                        : `当前使用 ${this.responseFormat} 模式，若模型或网关不支持该响应格式，可改用 Text；但 Text 模式下模型仍必须按提示词输出 JSON 数组。`;
+
+                    report.translation.tip = `模型返回了无法被解析的内容。当前选择格式: "${this.responseFormat}"。\n模型实际输出预览: ${outputPreview}\n建议: ${suggestion}`;
                     report.translation.rawResponse = rawBody;
                     report.overallStatus = 'failed';
                     this.addLog('Translation', '模型生成的内容无法解析，请检查服务商返回的数据或响应格式是否正确。', 'error', rawBody);
@@ -536,8 +641,8 @@ export class ConnectivityTester {
         try {
             const fixRes = await this.safeRequest(`${testUrl}/chat/completions`, 'POST', true, fixBody);
             report.translationFix!.latency = Date.now() - fixStartTime;
-            if (fixRes.status === 200) {
-                const content = (fixRes.json?.choices?.[0]?.message?.content || fixRes.text || '').trim();
+            if (isSuccessStatus(fixRes.status)) {
+                const content = (extractOpenAIContent(parseRequestUrlJson(fixRes)) || fixRes.text || '').trim();
                 if (content && content.length < 100) {
                     report.translationFix!.status = 'pass';
                     report.translationFix!.value = `✔ 通过 (${report.translationFix!.latency}ms)`;
@@ -579,7 +684,7 @@ export class ConnectivityTester {
                 report.concurrency!.latency = Date.now() - burstStart;
 
                 const has429 = burstResults.some(r => r.status === 429);
-                const allOk = burstResults.every(r => r.status === 200);
+                const allOk = burstResults.every(r => isSuccessStatus(r.status));
 
                 if (allOk) {
                     report.concurrency!.status = 'pass';
@@ -618,16 +723,20 @@ export class ConnectivityTester {
         if (body) headers['Content-Type'] = 'application/json';
 
         try {
-            const res = await requestUrl({
+            const requestBody = body && url.includes('/chat/completions') && body.stream === undefined
+                ? { ...body, stream: false }
+                : body;
+
+            const res = normalizeRequestUrlResponse(await requestUrl({
                 url,
                 method,
                 headers,
-                body: body ? JSON.stringify(body) : undefined,
+                body: requestBody ? JSON.stringify(requestBody) : undefined,
                 throw: false
-            });
+            }));
 
             // 安全防御：如果接口返回的是带有 HTML 的网页文件，说明填错了基础地址（比如误填了官网主页）
-            if (res.status >= 200 && res.status < 300 && res.text) {
+            if (isSuccessStatus(res.status) && res.text) {
                 const head = res.text.trim().toLowerCase();
                 if (head.startsWith('<!doctype') || head.startsWith('<html')) {
                     this.addLog('Network', `安全降级拦截：向 ${url} 请求时收到 HTML 载荷。判断为接口地址配置错误（可能误填为官网主页），已自动阻断后续无效请求。`, 'warn');
