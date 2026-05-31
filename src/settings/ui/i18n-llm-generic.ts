@@ -433,19 +433,6 @@ export default class I18nLLMGeneric extends BaseSetting {
             );
 
         new Setting(this.containerEl)
-            .setName(t('Settings.Ai.BatchTranslateConcurrencyTitle'))
-            .setDesc(t('Settings.Ai.BatchTranslateConcurrencyDesc'))
-            .addText(text => {
-                text.setValue(String(this.settings.batchTranslateConcurrency || 2))
-                    .onChange(async (value) => {
-                        this.settings.batchTranslateConcurrency = parseLimit(value, 2);
-                        await this.i18n.saveSettings();
-                    });
-                text.inputEl.type = 'number';
-                text.inputEl.min = '1';
-            });
-
-        new Setting(this.containerEl)
             .setName(t('Settings.Ai.LlmConcurrencyTitle'))
             .setDesc(t('Settings.Ai.LlmConcurrencyDesc'))
             .addText(text => {
