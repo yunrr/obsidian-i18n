@@ -20,6 +20,7 @@ export class SourceManager {
     private batchTaskRecordPath: string;
     private meta: TranslationSourceMeta;
     private i18n?: I18N;
+    private sourceVersionIndex = new Map<string, TranslationSource[]>();
 
     constructor(i18nPluginDir: string) {
         this.basePath = i18nPluginDir;
@@ -28,6 +29,7 @@ export class SourceManager {
         this.checkpointPath = path.join(i18nPluginDir, 'backup-checkpoint.json');
         this.batchTaskRecordPath = path.join(i18nPluginDir, 'batch-task-records.json');
         this.meta = this.loadMeta();
+        this.rebuildSourceVersionIndex();
     }
 
     public setI18n(i18n: I18N): void {
@@ -87,11 +89,31 @@ export class SourceManager {
         try {
             fs.ensureDirSync(this.sourcesDir);
             fs.writeJsonSync(this.metaPath, this.meta, { spaces: 2 });
+            this.rebuildSourceVersionIndex();
             useGlobalStoreInstance.getState().triggerSourceUpdate();
         } catch (error) {
             console.error('[SourceManager] Failed to save meta:', error);
             throw error;
         }
+    }
+
+    private getSourceVersionIndexKey(pluginId: string, type: TranslationSource['type'], version: string): string {
+        return `${type}\u0000${pluginId}\u0000${version}`;
+    }
+
+    private rebuildSourceVersionIndex(): void {
+        const index = new Map<string, TranslationSource[]>();
+        for (const source of Object.values(this.meta.sources)) {
+            if (!source.translationVersion) continue;
+            const key = this.getSourceVersionIndexKey(source.plugin, source.type, source.translationVersion);
+            const bucket = index.get(key) || [];
+            bucket.push(source);
+            index.set(key, bucket);
+        }
+        for (const bucket of index.values()) {
+            bucket.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+        }
+        this.sourceVersionIndex = index;
     }
 
     private getMetadataIndex(content: any): Pick<TranslationSource, 'translationVersion' | 'supportedVersions' | 'language' | 'description' | 'totalTranslationCount' | 'pendingTranslationCount' | 'translationFormatValid' | 'metadataIndexedAt'> {
@@ -187,6 +209,7 @@ export class SourceManager {
 
     public reloadFromDisk(): void {
         this.meta = this.loadMeta();
+        this.rebuildSourceVersionIndex();
         useGlobalStoreInstance.getState().triggerSourceUpdate();
     }
 
@@ -240,18 +263,18 @@ export class SourceManager {
 
     getIndexedTranslationVersions(type?: TranslationSource['type']): string[] {
         const versions = new Set<string>();
-        Object.values(this.meta.sources).forEach(source => {
-            if (type && source.type !== type) return;
-            if (source.translationVersion) versions.add(source.translationVersion);
-        });
+        for (const [key] of this.sourceVersionIndex) {
+            const [sourceType, , version] = key.split('\u0000');
+            if (type && sourceType !== type) continue;
+            if (version) versions.add(version);
+        }
         return Array.from(versions).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
     }
 
     getSourceForPluginVersion(pluginId: string, type: TranslationSource['type'], version: string): TranslationSource | null {
-        const sources = Object.values(this.meta.sources)
-            .filter(source => source.plugin === pluginId && source.type === type && source.translationVersion === version);
+        const sources = this.sourceVersionIndex.get(this.getSourceVersionIndexKey(pluginId, type, version)) || [];
         if (sources.length === 0) return null;
-        return sources.find(source => source.isActive) || sources.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0] || null;
+        return sources.find(source => source.isActive) || sources[0] || null;
     }
 
     hasSourceForPluginVersion(pluginId: string, type: TranslationSource['type'], version: string): boolean {

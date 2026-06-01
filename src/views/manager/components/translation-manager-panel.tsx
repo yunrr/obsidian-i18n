@@ -1,5 +1,6 @@
-import React, { useEffect, useState, useMemo, useRef } from 'react';
+import React, { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import {
     Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
     Input, Button, Checkbox, Badge, ScrollArea,
@@ -20,6 +21,8 @@ interface TranslationManagerPanelProps {
     i18n: I18N;
 }
 
+type ManagedTranslationSource = TranslationSource & { isInstalled: boolean };
+
 export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = ({ i18n }) => {
     const { t } = useTranslation();
     const sourceManager = i18n.sourceManager;
@@ -29,6 +32,8 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
     const [originFilter, setOriginFilter] = useState<'all' | 'local' | 'cloud'>('all');
     const [typeFilter, setTypeFilter] = useState<'all' | 'plugin' | 'theme'>('all');
     const [versionFilter, setVersionFilter] = useState<string>('all');
+    const deferredSearchQuery = useDeferredValue(searchQuery);
+    const parentRef = useRef<HTMLDivElement>(null);
     const metadataIndexAttemptedRef = useRef<Set<string>>(new Set());
 
     // 监听全局更新 Tick 以刷新列表
@@ -53,19 +58,15 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
     }, [sourceManager, sourceTick]);
 
     const versionOptions = useMemo(() => {
-        const versions = new Set<string>();
-        sourceManager.getAllSources().forEach(source => {
-            if (source.translationVersion) versions.add(source.translationVersion);
-        });
-        return Array.from(versions).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+        return sourceManager.getIndexedTranslationVersions();
     }, [sourceManager, sourceTick]);
 
     // 获取所有翻译源并应用过滤
-    const allSources = useMemo(() => {
+    const allSources = useMemo<ManagedTranslationSource[]>(() => {
         let sources = sourceManager.getAllSources();
 
-        if (searchQuery) {
-            const query = searchQuery.toLowerCase();
+        if (deferredSearchQuery) {
+            const query = deferredSearchQuery.toLowerCase();
             sources = sources.filter(s =>
                 s.title.toLowerCase().includes(query) ||
                 s.plugin.toLowerCase().includes(query) ||
@@ -93,7 +94,27 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
             const isInstalled = s.isInstalled ?? (s.type === 'plugin' ? !!i18n.app.plugins.manifests[s.plugin] : true);
             return { ...s, isInstalled };
         });
-    }, [i18n, searchQuery, originFilter, typeFilter, versionFilter, sourceTick, i18n.app.plugins.manifests]);
+    }, [sourceManager, deferredSearchQuery, originFilter, typeFilter, versionFilter, sourceTick, i18n.app.plugins.manifests]);
+
+    const sourceOriginCounts = useMemo(() => {
+        let local = 0;
+        let cloud = 0;
+        for (const source of allSources) {
+            if (source.origin === 'local') local++;
+            if (source.origin === 'cloud') cloud++;
+        }
+        return { local, cloud };
+    }, [allSources]);
+
+    const rowVirtualizer = useVirtualizer({
+        count: allSources.length,
+        getScrollElement: () => parentRef.current,
+        estimateSize: useCallback(() => 48, []),
+        getItemKey: useCallback((index: number) => allSources[index]?.id || index, [allSources]),
+        overscan: 8,
+    });
+
+    const virtualItems = rowVirtualizer.getVirtualItems();
 
     // 处理全选/反选
     const toggleSelectAll = () => {
@@ -358,11 +379,11 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
             </div>
 
             {/* 内容列表区 */}
-            <ScrollArea className="flex-1 min-h-0 bg-background">
+            <ScrollArea className="flex-1 min-h-0 bg-background" viewportRef={parentRef}>
                 <div className="px-4 py-2 h-full">
 
 
-                    <div className="flex flex-col pb-6">
+                    <div className="relative pb-6" style={{ height: `${rowVirtualizer.getTotalSize()}px` }}>
                         {allSources.length === 0 ? (
                             <div className="flex flex-col items-center justify-center text-muted-foreground py-24 border border-dashed border-border/50 bg-muted/5 my-4 rounded-none">
                                 <FileJson className="w-10 h-10 opacity-30 text-primary mb-4" />
@@ -370,7 +391,9 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
                                 <p className="text-xs opacity-60">{t('Manager.Common.Placeholders.SearchPlaceholder')}</p>
                             </div>
                         ) : (
-                            allSources.map(source => {
+                            virtualItems.map(virtualRow => {
+                                const source = allSources[virtualRow.index];
+                                if (!source) return null;
                                 const isUninstalled = !source.isInstalled;
                                 const isCloud = source.origin === 'cloud';
 
@@ -389,13 +412,25 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
                                     : (isCloud ? t('Manager.Sources.Filters.OriginCloud') : t('Manager.Sources.Filters.OriginLocal'));
 
                                 return (
-                                    <div key={source.id} className={cn(
-                                        "group relative border rounded-none text-card-foreground shadow-xs hover:shadow-md hover:bg-muted/10 transition-all duration-300 px-4 py-1.5 w-full overflow-hidden backdrop-blur-md mb-1",
-                                        isUninstalled && "border-dashed border-destructive/50",
-                                        selectedIds.has(source.id)
-                                            ? "bg-primary/[0.05] border-primary/40 ring-1 ring-primary/20"
-                                            : "bg-card/75 hover:bg-muted/20 border-border/50"
-                                    )}>
+                                    <div
+                                        key={virtualRow.key}
+                                        style={{
+                                            position: 'absolute',
+                                            top: 0,
+                                            left: 0,
+                                            width: '100%',
+                                            height: `${virtualRow.size}px`,
+                                            transform: `translateY(${virtualRow.start}px)`,
+                                            paddingBottom: '4px',
+                                        }}
+                                    >
+                                        <div className={cn(
+                                            "group relative border rounded-none text-card-foreground shadow-xs hover:shadow-md hover:bg-muted/10 transition-all duration-300 px-4 py-1.5 w-full overflow-hidden backdrop-blur-md",
+                                            isUninstalled && "border-dashed border-destructive/50",
+                                            selectedIds.has(source.id)
+                                                ? "bg-primary/[0.05] border-primary/40 ring-1 ring-primary/20"
+                                                : "bg-card/75 hover:bg-muted/20 border-border/50"
+                                        )}>
                                         {/* Side Status Accent */}
                                         <div className={cn("absolute left-0 top-0 bottom-0 w-[3px] transition-colors duration-300 z-10 bg-opacity-100", statusColor, isUninstalled && "animate-pulse")} />
 
@@ -485,6 +520,7 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
                                                 </DropdownMenu>
                                             </div>
                                         </div>
+                                        </div>
                                     </div>
                                 );
                             })
@@ -508,10 +544,10 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
                 </div>
                 <div className="flex items-center gap-2">
                     <span className="px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-600 border border-emerald-500/20">
-                        {t('Manager.Sources.Filters.OriginLocal')}: {allSources.filter(s => s.origin === 'local').length}
+                        {t('Manager.Sources.Filters.OriginLocal')}: {sourceOriginCounts.local}
                     </span>
                     <span className="px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-600 border border-blue-500/20">
-                        {t('Manager.Sources.Filters.OriginCloud')}: {allSources.filter(s => s.origin === 'cloud').length}
+                        {t('Manager.Sources.Filters.OriginCloud')}: {sourceOriginCounts.cloud}
                     </span>
                 </div>
             </div>

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef, useDeferredValue } from 'react';
 import * as path from 'path';
 import * as fs from 'fs-extra';
 import { useTranslation } from 'react-i18next';
@@ -183,6 +183,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
     const app = i18n.app;
 
     const [searchTerm, setSearchTerm] = useState('');
+    const deferredSearchTerm = useDeferredValue(searchTerm);
     const [sortType, setSortType] = useState('0');
     const [viewMode, setViewModeState] = useState<'list' | 'grid'>(i18n.settings.themeViewMode || 'list');
     const [themes, setThemes] = useState<ThemeInfo[]>([]);
@@ -485,8 +486,9 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
 
     const displayThemes = useMemo(() => {
         let result = [...themes];
-        if (searchTerm) {
-            result = result.filter(item => item.name.toLowerCase().includes(searchTerm.toLowerCase()));
+        if (deferredSearchTerm) {
+            const query = deferredSearchTerm.toLowerCase();
+            result = result.filter(item => item.name.toLowerCase().includes(query));
         }
 
         if (statusFilter !== 'all') {
@@ -519,7 +521,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             result.sort((a, b) => b.name.localeCompare(a.name));
         }
         return result;
-    }, [themes, searchTerm, sortType, statusFilter, allThemeStates]);
+    }, [themes, deferredSearchTerm, sortType, statusFilter, allThemeStates]);
 
     const extractableThemes = useMemo(() => {
         return displayThemes.filter(theme => !allThemeStates[theme.name]?.hasCurrentVersionTranslation);

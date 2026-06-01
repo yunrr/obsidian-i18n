@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef, useDeferredValue } from 'react';
 import { PluginManifest, Notice } from 'obsidian';
 import * as path from 'path';
 import { useTranslation } from 'react-i18next';
@@ -171,6 +171,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
     const settings = i18n.settings;
 
     const [searchTerm, setSearchTerm] = useState(settings.searchText);
+    const deferredSearchTerm = useDeferredValue(searchTerm);
     const [sortType, setSortType] = useState(settings.sort);
     const [viewMode, setViewModeState] = useState<'list' | 'grid'>(settings.pluginViewMode || 'list');
     const [statusFilter, setStatusFilter] = useState<'all' | 'applied' | 'unapplied' | 'translated' | 'untranslated' | 'partialFailed' | 'error' | 'toExtract'>('all');
@@ -215,6 +216,15 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             isMounted = false;
         };
     }, [settings.defaultCloudRepo, i18n]);
+
+    useEffect(() => {
+        if (settings.searchText === searchTerm) return;
+        const timer = window.setTimeout(() => {
+            settings.searchText = searchTerm;
+            void i18n.saveSettings();
+        }, 400);
+        return () => window.clearTimeout(timer);
+    }, [i18n, settings, searchTerm]);
 
     const sourceTick = useGlobalStoreInstance((state) => state.sourceUpdateTick);
     const currentExtractionVersion = settings.translationVersion || '1.0.1';
@@ -424,8 +434,9 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
 
     const displayPlugins = useMemo(() => {
         let result = [...plugins];
-        if (searchTerm) {
-            result = result.filter(item => item.name.toLowerCase().includes(searchTerm.toLowerCase()));
+        if (deferredSearchTerm) {
+            const query = deferredSearchTerm.toLowerCase();
+            result = result.filter(item => item.name.toLowerCase().includes(query));
         }
 
         if (statusFilter !== 'all') {
@@ -460,7 +471,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             result.sort((a, b) => b.name.localeCompare(a.name));
         }
         return result;
-    }, [plugins, searchTerm, sortType, statusFilter, allPluginStates]);
+    }, [plugins, deferredSearchTerm, sortType, statusFilter, allPluginStates]);
 
     const extractablePlugins = useMemo(() => {
         return displayPlugins.filter(plugin => !allPluginStates[plugin.id]?.hasCurrentVersionTranslation);
@@ -543,10 +554,13 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
     }, [allPluginStates, getPluginTranslationCounts, pluginTranslateCheckpoint, settings.llmOverwriteExistingTranslations]);
 
     const handleSearchChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-        const val = e.target.value;
-        setSearchTerm(val);
-        settings.searchText = val;
-        i18n.saveSettings();
+        setSearchTerm(e.target.value);
+    };
+
+    const handleSearchBlur = () => {
+        if (settings.searchText === searchTerm) return;
+        settings.searchText = searchTerm;
+        void i18n.saveSettings();
     };
 
     const handleSortChange = (val: string) => {
@@ -867,6 +881,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                             placeholder={t('Manager.Plugins.Placeholders.SearchPlugins')}
                             value={searchTerm}
                             onChange={handleSearchChange}
+                            onBlur={handleSearchBlur}
                             className="pl-8 h-9 rounded-none border-muted-foreground/20 focus:ring-1 text-[13px] bg-muted/10 shadow-sm transition-colors hover:bg-muted/20"
                         />
                     </div>
