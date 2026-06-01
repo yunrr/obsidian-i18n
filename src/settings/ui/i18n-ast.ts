@@ -3,6 +3,7 @@ import BaseSetting from "../base-setting"
 import { t } from "src/locales";
 import { AstExtractionProfile } from "../data";
 import { InputModal } from "./input-modal";
+import { AST_BUILT_IN_PROFILE_IDS } from "src/utils/translator/config";
 
 export default class I18nAST extends BaseSetting {
     private get activeProfile(): AstExtractionProfile {
@@ -94,9 +95,9 @@ export default class I18nAST extends BaseSetting {
             .addButton(button => button
                 .setButtonText(t('Settings.Ast.ProfileDelBtn'))
                 .setWarning()
-                .setDisabled(profile.id === 'default' || this.settings.astProfiles.length <= 1)
+                .setDisabled(AST_BUILT_IN_PROFILE_IDS.includes(profile.id) || this.settings.astProfiles.length <= 1)
                 .onClick(async () => {
-                    if (profile.id === 'default' || this.settings.astProfiles.length <= 1) return;
+                    if (AST_BUILT_IN_PROFILE_IDS.includes(profile.id) || this.settings.astProfiles.length <= 1) return;
                     if (!window.confirm(t('Settings.Ast.ProfileDelConfirm'))) return;
                     this.settings.astProfiles = this.settings.astProfiles.filter(item => item.id !== profile.id);
                     this.settings.activeAstProfileId = this.settings.astProfiles[0].id;

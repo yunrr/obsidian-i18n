@@ -34,6 +34,40 @@ export const AST_DEFAULT_CONFIG = {
     ]
 };
 
+export const AST_CLASSIC_CONFIG = {
+    assignments: [
+        'overwriteName', 'innerHTML', 'outerHTML', 'title', 'alt', 'placeholder',
+        'textContent', 'innerText', 'ariaLabel', 'nodeValue'
+    ],
+    functions: [
+        'Notice', 'setTitle', 'setContent', 'setName', 'setDesc', 'setButtonText',
+        'setPlaceholder', 'setTooltip', 'addOption', 'addHeading', 'addText',
+        'setHint', 'setWarning', 'setText', 'appendText', 'createEl', 'createDiv',
+        'createSpan', 'addCommand', 'insertText', 'replaceRange', 'replaceSelection',
+        'log', 'error', 'warn', 'info', 'alert', 'confirm', 'prompt'
+    ],
+    keys: [
+        'name', 'description', 'text', 'placeholder', 'label', 'tooltip', 'title',
+        'header', 'desc', 'message', 'buttontext', 'aria-label', 'heading', 'content',
+        'tab', 'caption', 'subtitle', 'summary', 'info', 'warning', 'error', 'success',
+        'hint', 'instructions', 'link', 'selection', 'annotation', 'search', 'speech',
+        'page', 'empty', 'detail', 'body', 'option', 'notice'
+    ]
+};
+
+export const AST_CLASSIC_REJECT_PATTERNS = [
+    "^\\s*$", "^\\d+$", "^[\\w-]+\\.[\\w-]+\\.\\w+$", "^https?:\\/\\/",
+    "^data:image\\/", "^#([0-9a-f]{3}|[0-9a-f]{6})$", "^[a-z0-9-]+$",
+    "^[a-z]+[A-Z][a-zA-Z0-9]*$", "^[A-Z_][A-Z0-9_]*$", "^px|em|rem|vh|vw|auto$",
+    "^rgba?\\(", "^\\.", "\\.(png|jpg|gif|svg|css|js|ts|md|json)$"
+];
+
+export const AST_ENHANCED_PROFILE_ID = 'default';
+export const AST_CLASSIC_PROFILE_ID = 'classic';
+export const AST_ENHANCED_PROFILE_NAME = 'Default (Enhanced)';
+export const AST_CLASSIC_PROFILE_NAME = 'Default (Classic)';
+export const AST_BUILT_IN_PROFILE_IDS = [AST_ENHANCED_PROFILE_ID, AST_CLASSIC_PROFILE_ID];
+
 /** AST 提取的内容过滤规则 (正则表达式对象) */
 export const AST_DEFAULT_RULES = {
     REJECT_PATTERNS: [
@@ -82,6 +116,32 @@ export const REGEX_DEFAULT_CONFIG = {
         "\\s", "[^\\x00-\\x7F]", "[!?,;:。！？，；：]\\s*$"
     ]
 };
+
+function makeAstProfile(
+    id: string,
+    name: string,
+    config: typeof AST_DEFAULT_CONFIG,
+    maxLength = 300,
+    rejectPatterns = REGEX_DEFAULT_CONFIG.rejectPatterns,
+) {
+    return {
+        id,
+        name,
+        astAssignments: [...config.assignments],
+        astFunctions: [...config.functions],
+        astKeys: [...config.keys],
+        astMaxLength: maxLength,
+        astRejectRe: [...rejectPatterns],
+        astValidRe: [...REGEX_DEFAULT_CONFIG.validPatterns],
+    };
+}
+
+export function getBuiltInAstProfiles(maxLength = 300) {
+    return [
+        makeAstProfile(AST_ENHANCED_PROFILE_ID, AST_ENHANCED_PROFILE_NAME, AST_DEFAULT_CONFIG, maxLength),
+        makeAstProfile(AST_CLASSIC_PROFILE_ID, AST_CLASSIC_PROFILE_NAME, AST_CLASSIC_CONFIG, maxLength, AST_CLASSIC_REJECT_PATTERNS),
+    ];
+}
 
 export interface EffectiveExtractionSettings {
     author: string;
@@ -162,18 +222,22 @@ export function syncExtractionProfileFields(settings: any): boolean {
     }
 
     if (!Array.isArray(settings.astProfiles) || settings.astProfiles.length === 0) {
-        settings.astProfiles = [{
-            id: 'default',
-            name: 'Default',
-            astAssignments: settings.astAssignments || AST_DEFAULT_CONFIG.assignments,
-            astFunctions: settings.astFunctions || AST_DEFAULT_CONFIG.functions,
-            astKeys: settings.astKeys || AST_DEFAULT_CONFIG.keys,
-            astMaxLength: settings.astMaxLength ?? 300,
-            astRejectRe: settings.astRejectRe || REGEX_DEFAULT_CONFIG.rejectPatterns,
-            astValidRe: settings.astValidRe || REGEX_DEFAULT_CONFIG.validPatterns,
-        }];
-        settings.activeAstProfileId = 'default';
+        settings.astProfiles = getBuiltInAstProfiles(settings.astMaxLength ?? 300);
+        settings.activeAstProfileId = AST_ENHANCED_PROFILE_ID;
         modified = true;
+    }
+    const builtInAstProfiles = getBuiltInAstProfiles(settings.astMaxLength ?? 300);
+    for (const builtInProfile of builtInAstProfiles) {
+        const existing = settings.astProfiles.find((profile: any) => profile.id === builtInProfile.id);
+        if (!existing) {
+            settings.astProfiles.push(builtInProfile);
+            modified = true;
+            continue;
+        }
+        if (existing.name === 'Default' || !existing.name) {
+            existing.name = builtInProfile.name;
+            modified = true;
+        }
     }
     if (!settings.activeAstProfileId || !settings.astProfiles.some((profile: any) => profile.id === settings.activeAstProfileId)) {
         settings.activeAstProfileId = settings.astProfiles[0].id;

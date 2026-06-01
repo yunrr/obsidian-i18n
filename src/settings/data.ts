@@ -1,7 +1,12 @@
 import type { pageRule } from '../utils/ui/immersive';
 import { DEFAULT_AST_PROMPT_TEMPLATE, DEFAULT_REGEX_PROMPT_TEMPLATE, DEFAULT_THEME_PROMPT_TEMPLATE } from '../ai/prompts';
 import { LLM_PROVIDERS } from '../ai/constants';
-import { AST_DEFAULT_CONFIG, REGEX_DEFAULT_CONFIG } from '../utils/translator/config';
+import {
+    AST_DEFAULT_CONFIG,
+    AST_ENHANCED_PROFILE_ID,
+    REGEX_DEFAULT_CONFIG,
+    getBuiltInAstProfiles,
+} from '../utils/translator/config';
 
 export interface LLMProfile {
     id: string;
@@ -615,17 +620,8 @@ export const DEFAULT_SETTINGS: I18nSettings = {
     astMaxLength: 300,
     astRejectRe: REGEX_DEFAULT_CONFIG.rejectPatterns, // Regex defaults are used as strings for UI
     astValidRe: REGEX_DEFAULT_CONFIG.validPatterns,
-    astProfiles: [{
-        id: 'default',
-        name: 'Default',
-        astAssignments: AST_DEFAULT_CONFIG.assignments,
-        astFunctions: AST_DEFAULT_CONFIG.functions,
-        astKeys: AST_DEFAULT_CONFIG.keys,
-        astMaxLength: 300,
-        astRejectRe: REGEX_DEFAULT_CONFIG.rejectPatterns,
-        astValidRe: REGEX_DEFAULT_CONFIG.validPatterns,
-    }],
-    activeAstProfileId: 'default',
+    astProfiles: getBuiltInAstProfiles(300),
+    activeAstProfileId: AST_ENHANCED_PROFILE_ID,
     astExtractionEnabled: true,
 
     // ==============================
