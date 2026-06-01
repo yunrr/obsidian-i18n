@@ -52,6 +52,8 @@ const port = Number(process.argv[2]) || 18743;
 const host = '127.0.0.1';
 const maxBodyBytes = 100 * 1024 * 1024;
 const maxExtractThreadConcurrency = 20;
+const extractCheckpointEveryResources = 100;
+const extractCheckpointEveryMs = 10_000;
 const extractThreadScript = path.join(__dirname, 'i18n-companion-extract-thread.cjs');
 
 type JsonRecord = Record<string, any>;
@@ -1023,6 +1025,17 @@ function getTranslationMetadataIndex(content: any): Pick<TranslationSource, 'tra
     };
 }
 
+function getTranslationMetadataSummary(content: any): Pick<TranslationSource, 'translationVersion' | 'supportedVersions' | 'language' | 'description' | 'translationFormatValid'> {
+    const metadata = content?.metadata || {};
+    return {
+        translationVersion: metadata.version ? String(metadata.version) : '',
+        supportedVersions: metadata.supportedVersions ? String(metadata.supportedVersions) : '',
+        language: metadata.language ? String(metadata.language) : '',
+        description: metadata.description ? String(metadata.description) : '',
+        translationFormatValid: !!(content && content.schemaVersion !== undefined && content.metadata && content.dict),
+    };
+}
+
 async function getTranslationSourceFileMtime(paths: WorkerPersistencePaths, sourceId: string) {
     try {
         const stat = await fs.stat(path.join(paths.sourcesDir, `${sourceId}.json`));
@@ -1066,7 +1079,7 @@ async function saveExtractedSource(paths: WorkerPersistencePaths, pluginId: stri
             origin: 'local',
             isActive: true,
             checksum: calculateChecksum(content),
-            ...getTranslationMetadataIndex(content),
+            ...getTranslationMetadataSummary(content),
             sourceFileExists: true,
             sourceFileMtime: await getTranslationSourceFileMtime(paths, sourceId),
             createdAt: now,
@@ -1406,12 +1419,22 @@ function createCheckpoint<T extends CompanionBatchResource>(scope: BatchTaskScop
     };
 }
 
+function shouldSaveExtractCheckpoint(progress: CompanionTaskProgress, lastCheckpointAt: { value: number }) {
+    if (progress.processedResources === progress.totalResources) return true;
+    if (progress.processedResources % extractCheckpointEveryResources === 0) return true;
+    const now = Date.now();
+    if (now - lastCheckpointAt.value < extractCheckpointEveryMs) return false;
+    lastCheckpointAt.value = now;
+    return true;
+}
+
 async function handlePluginBatchExtract(task: CompanionTaskRuntime, payload: CompanionPluginBatchExtractPayload) {
     const paths = getPersistencePaths(payload.persistence.basePath);
     const translationVersion = payload.translationVersion || payload.settings.translationVersion || '1.0.1';
     const completedIndexes = new Set<number>();
     const requests: ExtractThreadRequest[] = [];
     const requestIndexes: number[] = [];
+    const lastCheckpointAt = { value: Date.now() };
     for (const [index, resource] of payload.resources.entries()) {
         if (await hasExistingExtractedSource(paths, resource.resourceId, 'plugin', translationVersion)) {
             completedIndexes.add(index);
@@ -1419,8 +1442,10 @@ async function handlePluginBatchExtract(task: CompanionTaskRuntime, payload: Com
             task.progress.skippedCount++;
             if (task.progress.processedResources === task.progress.totalResources) touchProgress(task, { currentLabel: '' });
             touchProgress(task);
-            await saveCheckpoint(paths, payload.checkpointKey, createCheckpoint('plugin', 'extract', payload.resources, completedIndexes, task.progress));
-            bumpRecordRevision(task);
+            if (shouldSaveExtractCheckpoint(task.progress, lastCheckpointAt)) {
+                await saveCheckpoint(paths, payload.checkpointKey, createCheckpoint('plugin', 'extract', payload.resources, completedIndexes, task.progress));
+                bumpRecordRevision(task);
+            }
             continue;
         }
         requests.push({
@@ -1447,8 +1472,10 @@ async function handlePluginBatchExtract(task: CompanionTaskRuntime, payload: Com
         task.progress.processedResources++;
         if (task.progress.processedResources === task.progress.totalResources) touchProgress(task, { currentLabel: '' });
         touchProgress(task);
-        await saveCheckpoint(paths, payload.checkpointKey, createCheckpoint('plugin', 'extract', payload.resources, completedIndexes, task.progress));
-        bumpRecordRevision(task);
+        if (shouldSaveExtractCheckpoint(task.progress, lastCheckpointAt)) {
+            await saveCheckpoint(paths, payload.checkpointKey, createCheckpoint('plugin', 'extract', payload.resources, completedIndexes, task.progress));
+            bumpRecordRevision(task);
+        }
     });
 
     if (task.cancelRequested) return;
@@ -1462,6 +1489,7 @@ async function handleThemeBatchExtract(task: CompanionTaskRuntime, payload: Comp
     const completedIndexes = new Set<number>();
     const requests: ExtractThreadRequest[] = [];
     const requestIndexes: number[] = [];
+    const lastCheckpointAt = { value: Date.now() };
     for (const [index, resource] of payload.resources.entries()) {
         if (await hasExistingExtractedSource(paths, resource.resourceId, 'theme', translationVersion)) {
             completedIndexes.add(index);
@@ -1469,8 +1497,10 @@ async function handleThemeBatchExtract(task: CompanionTaskRuntime, payload: Comp
             task.progress.skippedCount++;
             if (task.progress.processedResources === task.progress.totalResources) touchProgress(task, { currentLabel: '' });
             touchProgress(task);
-            await saveCheckpoint(paths, payload.checkpointKey, createCheckpoint('theme', 'extract', payload.resources, completedIndexes, task.progress));
-            bumpRecordRevision(task);
+            if (shouldSaveExtractCheckpoint(task.progress, lastCheckpointAt)) {
+                await saveCheckpoint(paths, payload.checkpointKey, createCheckpoint('theme', 'extract', payload.resources, completedIndexes, task.progress));
+                bumpRecordRevision(task);
+            }
             continue;
         }
         requests.push({
@@ -1497,8 +1527,10 @@ async function handleThemeBatchExtract(task: CompanionTaskRuntime, payload: Comp
         task.progress.processedResources++;
         if (task.progress.processedResources === task.progress.totalResources) touchProgress(task, { currentLabel: '' });
         touchProgress(task);
-        await saveCheckpoint(paths, payload.checkpointKey, createCheckpoint('theme', 'extract', payload.resources, completedIndexes, task.progress));
-        bumpRecordRevision(task);
+        if (shouldSaveExtractCheckpoint(task.progress, lastCheckpointAt)) {
+            await saveCheckpoint(paths, payload.checkpointKey, createCheckpoint('theme', 'extract', payload.resources, completedIndexes, task.progress));
+            bumpRecordRevision(task);
+        }
     });
 
     if (task.cancelRequested) return;

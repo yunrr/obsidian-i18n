@@ -88,7 +88,7 @@ const EMPTY_BATCH_TASK_STATE: BatchTaskState = {
     skippedCount: 0,
 };
 
-const SOURCE_SYNC_THROTTLE_MS = 1500;
+const SOURCE_SYNC_THROTTLE_MS = 250;
 
 const shouldTranslateText = (target?: string, source?: string) => !target || target.trim() === '' || target === source;
 const getPositiveInt = (value: unknown, fallback: number) => {
@@ -369,7 +369,8 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             const translationFormatMark = isLangDoc ? activeSource?.translationFormatValid !== false : true;
             const pendingTranslationCount = activeSource?.pendingTranslationCount || 0;
             const totalTranslationCount = activeSource?.totalTranslationCount || 0;
-            const isTranslated = !!(isLangDoc && activeSourceId && translationFormatMark && !failedSourceIds.has(activeSourceId) && pendingTranslationCount === 0);
+            const hasTranslationCounts = typeof activeSource?.pendingTranslationCount === 'number' && typeof activeSource?.totalTranslationCount === 'number';
+            const isTranslated = !!(isLangDoc && activeSourceId && translationFormatMark && hasTranslationCounts && !failedSourceIds.has(activeSourceId) && pendingTranslationCount === 0);
 
             let statusColor: string = 'bg-muted-foreground';
             let statusText: string = t('Manager.Plugins.Status.ToExtract');
@@ -644,12 +645,13 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         });
 
         const revisions = syncRevisionRef.current;
-        const hasRevisionChange = progress.sourceRevision !== revisions.sourceRevision || progress.recordRevision !== revisions.recordRevision;
-        if (!hasRevisionChange) return;
+        const hasSourceRevisionChange = progress.sourceRevision !== revisions.sourceRevision;
+        const hasRecordRevisionChange = progress.recordRevision !== revisions.recordRevision;
+        if (!hasSourceRevisionChange && !hasRecordRevisionChange) return;
 
         revisions.sourceRevision = progress.sourceRevision;
         revisions.recordRevision = progress.recordRevision;
-        if (Date.now() - lastSourceSyncAtRef.current >= SOURCE_SYNC_THROTTLE_MS) {
+        if (hasSourceRevisionChange || Date.now() - lastSourceSyncAtRef.current >= SOURCE_SYNC_THROTTLE_MS) {
             syncSourceStateFromDisk();
         }
     }, [syncSourceStateFromDisk]);
