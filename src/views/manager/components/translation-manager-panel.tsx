@@ -10,7 +10,6 @@ import { Search, Download, Upload, Trash2, MoreVertical, FileJson, Globe, HardDr
 import I18N from 'src/main';
 import { TranslationSource } from 'src/types';
 import { Notice } from 'obsidian';
-import * as fs from 'fs-extra';
 import * as path from 'path';
 import { useGlobalStoreInstance } from '~/utils/store/global';
 import { i18nOpen } from '~/utils/common/general';
@@ -38,9 +37,8 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
     useEffect(() => {
         let cancelled = false;
         const indexMissingMetadata = async () => {
-            const missing = sourceManager.getAllSources()
-                .filter(source => !source.metadataIndexedAt && !metadataIndexAttemptedRef.current.has(source.id))
-                .map(source => source.id);
+            const missing = sourceManager.getMissingMetadataIndexSourceIds()
+                .filter(sourceId => !metadataIndexAttemptedRef.current.has(sourceId));
 
             for (let index = 0; index < missing.length && !cancelled; index += 8) {
                 const batch = missing.slice(index, index + 8);
@@ -91,17 +89,8 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
 
         sources = sources.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
 
-        // @ts-ignore - internal API
-        const basePath = path.normalize(i18n.app.vault.adapter.getBasePath());
-
         return sources.map(s => {
-            let isInstalled = false;
-            if (s.type === 'plugin') {
-                isInstalled = !!i18n.app.plugins.manifests[s.plugin];
-            } else {
-                isInstalled = fs.existsSync(path.join(basePath, '.obsidian', 'themes', s.plugin))
-                    || fs.existsSync(path.join(basePath, '.obsidian', 'themes', `${s.plugin}.css`));
-            }
+            const isInstalled = s.isInstalled ?? (s.type === 'plugin' ? !!i18n.app.plugins.manifests[s.plugin] : true);
             return { ...s, isInstalled };
         });
     }, [i18n, searchQuery, originFilter, typeFilter, versionFilter, sourceTick, i18n.app.plugins.manifests]);

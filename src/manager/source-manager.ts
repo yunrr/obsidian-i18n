@@ -231,8 +231,9 @@ export class SourceManager {
                 if (type && source.type !== type) return false;
                 if (!source.metadataIndexedAt) return true;
                 if (source.totalTranslationCount === undefined || source.pendingTranslationCount === undefined || source.translationFormatValid === undefined) return true;
-                const mtime = this.getSourceFileMtime(source.id);
-                return !!mtime && (!source.sourceFileMtime || Math.abs(source.sourceFileMtime - mtime) > 1);
+                if (source.sourceFileExists === undefined || source.sourceFileMtime === undefined) return true;
+                if (source.isInstalled === undefined) return true;
+                return false;
             })
             .map(source => source.id);
     }
@@ -255,7 +256,7 @@ export class SourceManager {
 
     hasSourceForPluginVersion(pluginId: string, type: TranslationSource['type'], version: string): boolean {
         const source = this.getSourceForPluginVersion(pluginId, type, version);
-        return !!source && fs.existsSync(this.getSourceFilePath(source.id));
+        return !!source && source.sourceFileExists !== false;
     }
 
     /**
@@ -342,7 +343,7 @@ export class SourceManager {
         if (!options?.skipFileIndex) {
             const content = this.readSourceFile(source.id);
             if (content?.metadata) {
-                source = { ...source, ...this.getMetadataIndex(content), sourceFileMtime: this.getSourceFileMtime(source.id) };
+                source = { ...source, ...this.getMetadataIndex(content), sourceFileExists: true, sourceFileMtime: this.getSourceFileMtime(source.id) };
             }
         }
         this.upsertSourceInMemory(source);
@@ -476,6 +477,8 @@ export class SourceManager {
                 ...source,
                 ...this.getMetadataIndex(content),
                 checksum: calculateChecksum(content),
+                sourceFileExists: true,
+                sourceFileMtime: this.getSourceFileMtime(sourceId),
                 updatedAt: Date.now(),
             };
             this.saveMeta();
@@ -510,6 +513,8 @@ export class SourceManager {
         this.meta.sources[sourceId] = {
             ...source,
             ...this.getMetadataIndex(content),
+            sourceFileExists: true,
+            sourceFileMtime: this.getSourceFileMtime(sourceId),
         };
         this.saveMeta();
         return true;
@@ -535,6 +540,7 @@ export class SourceManager {
             this.meta.sources[sourceId] = {
                 ...source,
                 ...this.getMetadataIndex(content),
+                sourceFileExists: true,
                 sourceFileMtime: this.getSourceFileMtime(sourceId),
             };
             count++;
@@ -558,6 +564,7 @@ export class SourceManager {
             isActive: true,
             checksum: calculateChecksum(content),
             ...this.getMetadataIndex(content),
+            sourceFileExists: true,
             updatedAt: Date.now(),
             createdAt: Date.now()
         };
@@ -588,6 +595,7 @@ export class SourceManager {
                 isActive: true,
                 checksum: calculateChecksum(entry.content),
                 ...this.getMetadataIndex(entry.content),
+                sourceFileExists: true,
                 updatedAt: Date.now(),
                 createdAt: Date.now()
             };
@@ -599,6 +607,7 @@ export class SourceManager {
                 });
 
             this.saveSourceFile(sourceId, entry.content);
+            translationSource.sourceFileMtime = this.getSourceFileMtime(sourceId);
             this.upsertSourceInMemory(translationSource);
             sourceIds.push(sourceId);
         }

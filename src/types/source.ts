@@ -25,6 +25,8 @@ export interface TranslationSource {
     pendingTranslationCount?: number; // 本地索引：待翻译条目数
     translationFormatValid?: boolean; // 本地索引：译文格式是否有效
     sourceFileMtime?: number;      // 本地索引：翻译文件更新时间
+    sourceFileExists?: boolean;    // 本地索引：翻译文件是否存在
+    isInstalled?: boolean;         // 本地索引：目标插件/主题是否仍安装
     metadataIndexedAt?: number;    // 本地索引更新时间
 
     // 云端元数据

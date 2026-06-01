@@ -1067,6 +1067,7 @@ async function saveExtractedSource(paths: WorkerPersistencePaths, pluginId: stri
             isActive: true,
             checksum: calculateChecksum(content),
             ...getTranslationMetadataIndex(content),
+            sourceFileExists: true,
             sourceFileMtime: await getTranslationSourceFileMtime(paths, sourceId),
             createdAt: now,
             updatedAt: now,
@@ -1089,6 +1090,7 @@ async function saveTranslatedSource(paths: WorkerPersistencePaths, sourceId: str
                 cloud: undefined,
                 checksum: calculateChecksum(content),
                 ...getTranslationMetadataIndex(content),
+                sourceFileExists: true,
                 sourceFileMtime: await getTranslationSourceFileMtime(paths, sourceId),
                 updatedAt: Date.now(),
             };

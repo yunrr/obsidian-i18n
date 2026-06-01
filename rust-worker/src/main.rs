@@ -3645,13 +3645,13 @@ fn simple_hash(text: &str) -> String {
     padded.repeat(4)
 }
 
-async fn handle_sync_task(_state: &AppState, task_type: &str, payload: Value) -> Result<Value> {
+async fn handle_sync_task(state: &AppState, task_type: &str, payload: Value) -> Result<Value> {
     match task_type {
         "ast-replace" => handle_ast_replace(payload).await,
         "code-extract" => handle_code_extract(payload).await,
         "plugin-apply-translation" => handle_plugin_apply_translation(payload).await,
         "theme-apply-translation" => handle_theme_apply_translation(payload).await,
-        "source-export" | "source-import" | "source-remove" | "source-set-active" | "source-index" => handle_source_manager_task(task_type, payload).await,
+        "source-export" | "source-import" | "source-remove" | "source-set-active" | "source-index" => handle_source_manager_task(state, task_type, payload).await,
         "plugin-extract" => Ok(serde_json::to_value(handle_plugin_extract(payload).await?)?),
         "theme-extract" => Ok(serde_json::to_value(handle_theme_extract(payload).await?)?),
         "plugin-translate" => {
@@ -3670,11 +3670,11 @@ async fn handle_sync_task(_state: &AppState, task_type: &str, payload: Value) ->
             let result = handle_theme_retry(payload, None).await?;
             Ok(serde_json::to_value(result)?)
         }
-        "cloud-publish-source" => handle_cloud_publish_source(_state, payload).await,
-        "cloud-download-source" => handle_cloud_download_source(_state, payload).await,
-        "cloud-update-sources" => handle_cloud_update_sources(_state, payload).await,
-        "cloud-prepare-backup" => handle_cloud_prepare_backup(_state, payload).await,
-        "cloud-restore-all" => handle_cloud_restore_all(_state, payload).await,
+        "cloud-publish-source" => handle_cloud_publish_source(state, payload).await,
+        "cloud-download-source" => handle_cloud_download_source(state, payload).await,
+        "cloud-update-sources" => handle_cloud_update_sources(state, payload).await,
+        "cloud-prepare-backup" => handle_cloud_prepare_backup(state, payload).await,
+        "cloud-restore-all" => handle_cloud_restore_all(state, payload).await,
         _ => Err(anyhow!("未知任务类型: {task_type}")),
     }
 }
@@ -3720,8 +3720,9 @@ async fn handle_theme_apply_translation(payload: Value) -> Result<Value> {
     .await?
 }
 
-async fn handle_source_manager_task(operation: &str, payload: Value) -> Result<Value> {
+async fn handle_source_manager_task(state: &AppState, operation: &str, payload: Value) -> Result<Value> {
     let operation = operation.to_string();
+    let state = state.clone();
     tokio::task::spawn_blocking(move || {
         let payload: SourceManagerPayload = serde_json::from_value(payload)?;
         let result = match operation.as_str() {
@@ -3729,7 +3730,7 @@ async fn handle_source_manager_task(operation: &str, payload: Value) -> Result<V
             "source-import" => source_import_blocking(payload)?,
             "source-remove" => source_remove_blocking(payload)?,
             "source-set-active" => source_set_active_blocking(payload)?,
-            "source-index" => source_index_blocking(payload)?,
+            "source-index" => source_index_blocking(&state, payload)?,
             _ => bail!("未知源管理操作: {operation}"),
         };
         Ok(serde_json::to_value(result)?)
@@ -4497,20 +4498,79 @@ fn merge_metadata_index(source: &mut Value, content: &Value) {
 
 fn merge_source_file_mtime(source: &mut Value, paths: &PersistencePaths, source_id: &str) {
     let file_path = paths.sources_dir.join(format!("{source_id}.json"));
-    let source_file_mtime = fs::metadata(file_path)
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_else(now_ms);
-    source["sourceFileMtime"] = json!(source_file_mtime);
+    match fs::metadata(file_path) {
+        Ok(metadata) => {
+            let source_file_mtime = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or_else(now_ms);
+            source["sourceFileExists"] = json!(true);
+            source["sourceFileMtime"] = json!(source_file_mtime);
+        }
+        Err(_) => {
+            source["sourceFileExists"] = json!(false);
+            source["sourceFileMtime"] = json!(0);
+        }
+    }
 }
 
-fn source_index_blocking(payload: SourceManagerPayload) -> Result<SourceImportExportResponse> {
+fn installed_resource_sets(state: &AppState) -> (HashSet<String>, HashSet<String>) {
+    let Ok(obsidian_dir) = obsidian_dir(state) else {
+        return (HashSet::new(), HashSet::new());
+    };
+
+    let mut plugins = HashSet::new();
+    let plugins_dir = obsidian_dir.join("plugins");
+    if let Ok(entries) = fs::read_dir(&plugins_dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|item| item.is_dir()).unwrap_or(false) {
+                let plugin_id = read_json_file(&entry.path().join("manifest.json"))
+                    .and_then(|manifest| manifest.get("id").and_then(Value::as_str).map(str::to_string))
+                    .unwrap_or_else(|| entry.file_name().to_string_lossy().to_string());
+                plugins.insert(plugin_id);
+            }
+        }
+    }
+
+    let mut themes = HashSet::new();
+    let themes_dir = obsidian_dir.join("themes");
+    if let Ok(entries) = fs::read_dir(&themes_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if entry.file_type().map(|item| item.is_dir()).unwrap_or(false) {
+                themes.insert(name);
+            } else if entry.file_type().map(|item| item.is_file()).unwrap_or(false)
+                && entry.path().extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("css"))
+            {
+                if let Some(stem) = entry.path().file_stem().and_then(|stem| stem.to_str()) {
+                    themes.insert(stem.to_string());
+                }
+            }
+        }
+    }
+
+    (plugins, themes)
+}
+
+fn merge_source_install_state(source: &mut Value, installed_plugins: &HashSet<String>, installed_themes: &HashSet<String>) {
+    let plugin_id = source.get("plugin").and_then(Value::as_str).unwrap_or_default();
+    let source_type = source.get("type").and_then(Value::as_str).unwrap_or("plugin");
+    let is_installed = if source_type == "theme" {
+        installed_themes.contains(plugin_id)
+    } else {
+        installed_plugins.contains(plugin_id)
+    };
+    source["isInstalled"] = json!(is_installed);
+}
+
+fn source_index_blocking(state: &AppState, payload: SourceManagerPayload) -> Result<SourceImportExportResponse> {
     let paths = paths(&payload.persistence.base_path);
     let mut meta = load_meta(&paths);
     let mut updated_count = 0usize;
     let mut skipped_count = 0usize;
+    let (installed_plugins, installed_themes) = installed_resource_sets(state);
 
     if let Some(sources) = meta.get_mut("sources").and_then(Value::as_object_mut) {
         let source_ids: Vec<String> = if payload.source_ids.is_empty() {
@@ -4526,6 +4586,10 @@ fn source_index_blocking(payload: SourceManagerPayload) -> Result<SourceImportEx
             };
             let file_path = paths.sources_dir.join(format!("{source_id}.json"));
             let Ok(metadata) = fs::metadata(&file_path) else {
+                source["sourceFileExists"] = json!(false);
+                source["sourceFileMtime"] = json!(0);
+                merge_source_install_state(source, &installed_plugins, &installed_themes);
+                updated_count += 1;
                 skipped_count += 1;
                 continue;
             };
@@ -4536,11 +4600,17 @@ fn source_index_blocking(payload: SourceManagerPayload) -> Result<SourceImportEx
                 .map(|duration| duration.as_millis() as u64)
                 .unwrap_or_else(now_ms);
             let Some(content) = read_translation(&paths, &source_id) else {
+                source["sourceFileExists"] = json!(false);
+                source["sourceFileMtime"] = json!(0);
+                merge_source_install_state(source, &installed_plugins, &installed_themes);
+                updated_count += 1;
                 skipped_count += 1;
                 continue;
             };
             merge_metadata_index(source, &content);
+            source["sourceFileExists"] = json!(true);
             source["sourceFileMtime"] = json!(source_file_mtime);
+            merge_source_install_state(source, &installed_plugins, &installed_themes);
             updated_count += 1;
         }
     }

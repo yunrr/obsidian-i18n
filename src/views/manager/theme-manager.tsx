@@ -422,7 +422,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             const sources = sourceIndex.byTheme[theme.name] || [];
             const activeSourceId = sourceIndex.activeByTheme[theme.name] || null;
             const translationPath = activeSourceId ? i18n.sourceManager.getSourceFilePath(activeSourceId) : '';
-            const hasTranslation = sources.some(source => fs.existsSync(i18n.sourceManager.getSourceFilePath(source.id)));
+            const hasTranslation = sources.some(source => source.sourceFileExists !== false);
             const hasCurrentVersionTranslation = i18n.sourceManager.hasSourceForPluginVersion(theme.name, 'theme', currentExtractionVersion);
             const state = i18n.stateManager.getThemeState(theme.name);
 

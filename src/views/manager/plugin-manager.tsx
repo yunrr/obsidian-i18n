@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { PluginManifest, Notice } from 'obsidian';
 import * as path from 'path';
-import * as fs from 'fs-extra';
 import { useTranslation } from 'react-i18next';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { Search, LayoutGrid, List, FileOutput, Languages, Loader2, RotateCcw, Square, AlertTriangle } from 'lucide-react';
@@ -348,7 +347,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             const activeSourceId = sourceIndex.activeByPlugin[plugin.id] || null;
             const langDoc = activeSourceId ? i18n.sourceManager.getSourceFilePath(activeSourceId) : '';
             const sources = sourceIndex.byPlugin[plugin.id] || [];
-            const isLangDoc = sources.some(source => fs.pathExistsSync(i18n.sourceManager.getSourceFilePath(source.id)));
+            const isLangDoc = sources.some(source => source.sourceFileExists !== false);
             const hasCurrentVersionTranslation = i18n.sourceManager.hasSourceForPluginVersion(plugin.id, 'plugin', currentExtractionVersion);
             const manifestDoc = path.join(pluginDir, 'manifest.json');
             const mainDoc = path.join(pluginDir, 'main.js');
@@ -372,7 +371,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             if (isLangDoc && translationFormatMark && activeSource) {
                 translationVersion = activeSource.translationVersion || '';
                 supportedVersion = activeSource.supportedVersions || '';
-                mtime = activeSource.sourceFileMtime || (isLangDoc ? fs.statSync(langDoc).mtimeMs : Date.now());
+                mtime = activeSource.sourceFileMtime || activeSource.updatedAt || Date.now();
 
                 const isApplied = !!(state && state.isApplied);
 
