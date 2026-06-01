@@ -3723,6 +3723,8 @@ async fn handle_theme_apply_translation(payload: Value) -> Result<Value> {
 async fn handle_source_manager_task(state: &AppState, operation: &str, payload: Value) -> Result<Value> {
     let operation = operation.to_string();
     let state = state.clone();
+    let persistence_lock = state.persistence_lock.clone();
+    let _guard = persistence_lock.lock().await;
     tokio::task::spawn_blocking(move || {
         let payload: SourceManagerPayload = serde_json::from_value(payload)?;
         let result = match operation.as_str() {
