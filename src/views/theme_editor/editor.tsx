@@ -68,6 +68,7 @@ const ReactThemeEditor: React.FC = () => {
     const themeTranslation = useGlobalStoreInstance.getState().editorThemeTranslation;
     const themeName = useGlobalStoreInstance.getState().editorThemeName;
     const themeDir = useGlobalStoreInstance.getState().editorThemeDir;
+    const themeCssPath = useGlobalStoreInstance.getState().editorThemeCssPath;
     const translationPath = useGlobalStoreInstance.getState().editorThemeTranslationPath;
     const storeThemeName = useThemeEditorStore.use.themeName();
 
@@ -129,11 +130,11 @@ const ReactThemeEditor: React.FC = () => {
         }
 
         if (themeName) {
-            setThemeInfo(themeName, themeDir || '', translationPath || '');
+            setThemeInfo(themeName, themeDir || '', translationPath || '', themeCssPath || '');
         }
 
         initializedRef.current = true;
-    }, [themeTranslation, themeName, themeDir, translationPath, setItems, setMetadata, setThemeInfo]);
+    }, [themeTranslation, themeName, themeDir, themeCssPath, translationPath, setItems, setMetadata, setThemeInfo]);
 
     // 获取 store 数据
     const items = useThemeEditorStore.use.items();
@@ -229,7 +230,7 @@ const ReactThemeEditor: React.FC = () => {
     // 增量提取
     const incrementalExtract = useCallback(async () => {
         try {
-            const { themeName, themeDir } = useThemeEditorStore.getState();
+            const { themeName, themeDir, themeCssPath: storedThemeCssPath } = useThemeEditorStore.getState();
 
             // 安全检查：如果已应用，禁止增量提取
             const isApplied = !!i18n.stateManager.getThemeState(themeName)?.isApplied;
@@ -238,7 +239,7 @@ const ReactThemeEditor: React.FC = () => {
                 return;
             }
 
-            const themeCssPath = path.join(themeDir, 'theme.css');
+            const themeCssPath = storedThemeCssPath || path.join(themeDir, 'theme.css');
 
             if (!fs.existsSync(themeCssPath)) {
                 notice.error(t('Editor.Errors.FileNotFound') + ': theme.css');
@@ -293,8 +294,8 @@ const ReactThemeEditor: React.FC = () => {
     // ================================================== Open File ==================================================
     const handleOpenFile = useCallback(async () => {
         try {
-            const { themeDir } = useThemeEditorStore.getState();
-            const themeCssPath = path.join(themeDir, 'theme.css');
+            const { themeDir, themeCssPath: storedThemeCssPath } = useThemeEditorStore.getState();
+            const themeCssPath = storedThemeCssPath || path.join(themeDir, 'theme.css');
 
             if (!fs.existsSync(themeCssPath)) {
                 notice.error(t('Common.Notices.ThemeNotFound'));

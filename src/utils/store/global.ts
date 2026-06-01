@@ -11,13 +11,14 @@ interface GlobalStore {
     editorThemeTranslation: ThemeTranslationV1;
     editorThemeName: string;
     editorThemeDir: string;
+    editorThemeCssPath: string;
     editorThemeTranslationPath: string;
     sourceUpdateTick: number;
     settingsUpdateTick: number;
     setI18n: (i18n: I18n) => void;
     setEditorPluginTranslation: (translation: PluginTranslationV1) => void;
     setEditorPluginTranslationPath: (path: string) => void;
-    setEditorTheme: (translation: ThemeTranslationV1, name: string, dir: string, translationPath: string) => void;
+    setEditorTheme: (translation: ThemeTranslationV1, name: string, dir: string, translationPath: string, themeCssPath?: string) => void;
     triggerSourceUpdate: () => void;
     triggerSettingsUpdate: () => void;
 }
@@ -31,6 +32,7 @@ const useGlobalStoreBase = create<GlobalStore>()((set, get) => {
         editorThemeTranslation: {} as ThemeTranslationV1,
         editorThemeName: '',
         editorThemeDir: '',
+        editorThemeCssPath: '',
         editorThemeTranslationPath: '',
         sourceUpdateTick: 0,
         settingsUpdateTick: 0,
@@ -38,10 +40,11 @@ const useGlobalStoreBase = create<GlobalStore>()((set, get) => {
         setI18n: (i18n) => set({ i18n }),
         setEditorPluginTranslation: (translation) => set({ editorPluginTranslation: translation }),
         setEditorPluginTranslationPath: (path) => set({ editorPluginTranslationPath: path }),
-        setEditorTheme: (translation, name, dir, translationPath) => set({
+        setEditorTheme: (translation, name, dir, translationPath, themeCssPath = '') => set({
             editorThemeTranslation: translation,
             editorThemeName: name,
             editorThemeDir: dir,
+            editorThemeCssPath: themeCssPath,
             editorThemeTranslationPath: translationPath,
         }),
         triggerSourceUpdate: () => set((state) => ({ sourceUpdateTick: state.sourceUpdateTick + 1 })),

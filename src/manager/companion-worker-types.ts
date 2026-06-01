@@ -13,6 +13,8 @@ export interface CompanionDiscoveredTheme {
     manifest: OBThemeManifest | null;
     dir: string;
     themeCssPath: string;
+    themeCssRelativePath?: string;
+    isLegacy?: boolean;
 }
 
 export interface CompanionResourceDiscoveryResponse {
@@ -150,6 +152,7 @@ export interface CompanionThemeApplyTranslationRequest {
     themeId: string;
     themeDir: string;
     themeCssPath: string;
+    themeCssRelativePath?: string;
     backupBasePath: string;
     translationJson: ThemeTranslationV1;
 }
@@ -231,6 +234,8 @@ export interface CompanionThemeExtractRequest {
     themeName: string;
     themeDir: string;
     themeCssPath: string;
+    themeCssRelativePath?: string;
+    isLegacy?: boolean;
 }
 
 export interface CompanionPluginExtractPayload extends CompanionPluginExtractRequest {

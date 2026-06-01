@@ -52,6 +52,8 @@ interface ThemeInfo {
     manifest: OBThemeManifest | null;
     dir: string;
     themeCssPath?: string;
+    themeCssRelativePath?: string;
+    isLegacy?: boolean;
     isActive: boolean;
 }
 
@@ -142,6 +144,10 @@ const getCompanionTranslationConfig = (settings: I18N['settings']): CompanionTra
 const getCompanionExtractionSettings = (settings: I18N['settings']): CompanionExtractionSettings => getEffectiveExtractionSettings(settings);
 
 const formatFailureTime = (failedAt: number) => failedAt ? new Date(failedAt).toLocaleString() : '';
+
+const getThemeCssRelativePath = (theme: Pick<ThemeInfo, 'name' | 'isLegacy' | 'themeCssRelativePath'>) => {
+    return theme.themeCssRelativePath || (theme.isLegacy ? `${theme.name}.css` : 'theme.css');
+};
 
 const BatchFailureDetails: React.FC<{ records: BatchTaskFailureRecord[]; title: string }> = ({ records, title }) => {
     if (records.length === 0) return null;
@@ -288,11 +294,13 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
 
                     const entries = fs.readdirSync(themesDir, { withFileTypes: true });
                     const themeList: ThemeInfo[] = [];
+                    const modernThemeNames = new Set<string>();
                     // @ts-ignore
                     const currentTheme = app.customCss?.theme || '';
 
                     for (const entry of entries) {
                         if (!entry.isDirectory()) continue;
+                        modernThemeNames.add(entry.name);
                         const themeDir = path.join(themesDir, entry.name);
                         const manifestPath = path.join(themeDir, 'manifest.json');
 
@@ -309,7 +317,24 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                             manifest,
                             dir: themeDir,
                             themeCssPath: path.join(themeDir, 'theme.css'),
+                            themeCssRelativePath: 'theme.css',
+                            isLegacy: false,
                             isActive: entry.name === currentTheme,
+                        });
+                    }
+
+                    for (const entry of entries) {
+                        if (!entry.isFile() || path.extname(entry.name).toLowerCase() !== '.css') continue;
+                        const themeName = path.basename(entry.name, '.css');
+                        if (modernThemeNames.has(themeName)) continue;
+                        themeList.push({
+                            name: themeName,
+                            manifest: null,
+                            dir: themesDir,
+                            themeCssPath: path.join(themesDir, entry.name),
+                            themeCssRelativePath: entry.name,
+                            isLegacy: true,
+                            isActive: themeName === currentTheme,
                         });
                     }
 
@@ -330,6 +355,8 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                     manifest: theme.manifest,
                     dir: theme.dir,
                     themeCssPath: theme.themeCssPath,
+                    themeCssRelativePath: theme.themeCssRelativePath,
+                    isLegacy: theme.isLegacy,
                     isActive: theme.name === currentTheme,
                 })));
             } catch (error) {
@@ -465,6 +492,8 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                 translationPath: translationPath || '',
                 themeDir,
                 themeCssPath,
+                themeCssRelativePath: getThemeCssRelativePath(theme),
+                isLegacy: theme.isLegacy,
                 sources,
                 activeSourceId,
                 hasFailedBatches,
@@ -683,6 +712,8 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                 themeName: theme.name,
                 themeDir: theme.dir,
                 themeCssPath: data.themeCssPath,
+                themeCssRelativePath: data.themeCssRelativePath,
+                isLegacy: data.isLegacy,
             }];
         });
 

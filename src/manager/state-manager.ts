@@ -141,8 +141,8 @@ export class StateManager {
                 if (fs.existsSync(themesDir)) {
                     const entries = fs.readdirSync(themesDir, { withFileTypes: true });
                     for (const entry of entries) {
-                        if (!entry.isDirectory()) continue;
-                        const themeId = entry.name;
+                        if (!entry.isDirectory() && !(entry.isFile() && path.extname(entry.name).toLowerCase() === '.css')) continue;
+                        const themeId = entry.isDirectory() ? entry.name : path.basename(entry.name, '.css');
                         const manifestPath = path.join(themesDir, themeId, 'manifest.json');
                         let currentVersion = '0.0.0';
                         if (fs.existsSync(manifestPath)) {
@@ -222,8 +222,9 @@ export class StateManager {
             if (!basePath) continue;
 
             const themeDir = path.join(basePath, app.vault.configDir, 'themes', id);
-            if (!fs.existsSync(themeDir)) {
-                // 主题文件夹已不存在
+            const legacyThemeCssPath = path.join(basePath, app.vault.configDir, 'themes', `${id}.css`);
+            if (!fs.existsSync(themeDir) && !fs.existsSync(legacyThemeCssPath)) {
+                // 主题文件夹或 legacy CSS 文件已不存在
                 const state = this.data.themes[id];
 
                 // 主题暂不支持 restoreBackup 这种多文件还原逻辑（BackupManager 目前的主题逻辑较简单）

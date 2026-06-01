@@ -27,6 +27,8 @@ export interface ThemeEditorStore {
     themeName: string;
     /** 主题目录路径 */
     themeDir: string;
+    /** 主题 CSS 文件路径 */
+    themeCssPath: string;
     /** 翻译文件路径 */
     translationPath: string;
     /** 是否正在翻译中 */
@@ -62,7 +64,7 @@ export interface ThemeEditorStore {
     /** 更新 metadata 元信息 */
     updateMetadata: (updates: Partial<ThemeTranslationV1Metadata>) => void;
     /** 设置主题基本信息 */
-    setThemeInfo: (name: string, dir: string, translationPath: string) => void;
+    setThemeInfo: (name: string, dir: string, translationPath: string, themeCssPath?: string) => void;
     /** 更新翻译状态 */
     setTranslationStatus: (status: Partial<{ isTranslating: boolean; progress: number; processedCount: number; totalCount: number; overwrite: boolean }>) => void;
 }

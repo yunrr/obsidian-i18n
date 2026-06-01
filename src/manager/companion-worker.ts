@@ -495,8 +495,9 @@ function applyThemeSettingsTranslations(css: string, translations: Array<{ sourc
 
 async function handleThemeApplyTranslation(payload: CompanionThemeApplyTranslationRequest) {
     try {
-        await createWorkerBackup(payload.backupBasePath, payload.themeId, payload.themeDir, ['theme.css']);
-        const backupCss = await readWorkerBackupContent(payload.backupBasePath, payload.themeId, 'theme.css');
+        const cssRelativePath = payload.themeCssRelativePath || 'theme.css';
+        await createWorkerBackup(payload.backupBasePath, payload.themeId, payload.themeDir, [cssRelativePath]);
+        const backupCss = await readWorkerBackupContent(payload.backupBasePath, payload.themeId, cssRelativePath);
         const sourceCss = backupCss || await fs.readFile(payload.themeCssPath, 'utf8');
         const translatedCss = applyThemeSettingsTranslations(sourceCss, payload.translationJson.dict || []);
         await fs.writeFile(payload.themeCssPath, translatedCss);

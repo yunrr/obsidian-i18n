@@ -40,8 +40,8 @@ export class InjectorManager {
                     if (fs.existsSync(themesDir)) {
                         const entries = fs.readdirSync(themesDir, { withFileTypes: true });
                         for (const entry of entries) {
-                            if (!entry.isDirectory()) continue;
-                            const themeId = entry.name;
+                            if (!entry.isDirectory() && !(entry.isFile() && path.extname(entry.name).toLowerCase() === '.css')) continue;
+                            const themeId = entry.isDirectory() ? entry.name : path.basename(entry.name, '.css');
                             const manifestPath = path.join(themesDir, themeId, 'manifest.json');
                             let currentVersion = '0.0.0';
                             if (fs.existsSync(manifestPath)) {
@@ -168,8 +168,19 @@ export class InjectorManager {
     public async applyToTheme(themeId: string): Promise<boolean> {
         // @ts-ignore
         const basePath = path.normalize(this.i18n.app.vault.adapter.getBasePath());
-        const themeDir = path.join(basePath, this.i18n.app.vault.configDir, 'themes', themeId);
-        const themeCssPath = path.join(themeDir, 'theme.css');
+        const themesDir = path.join(basePath, this.i18n.app.vault.configDir, 'themes');
+        let themeDir = path.join(themesDir, themeId);
+        let themeCssPath = path.join(themeDir, 'theme.css');
+        let themeCssRelativePath = 'theme.css';
+
+        if (!fs.existsSync(themeCssPath)) {
+            const legacyThemeCssPath = path.join(themesDir, `${themeId}.css`);
+            if (fs.existsSync(legacyThemeCssPath)) {
+                themeDir = themesDir;
+                themeCssPath = legacyThemeCssPath;
+                themeCssRelativePath = `${themeId}.css`;
+            }
+        }
 
         if (!fs.existsSync(themeCssPath)) return false;
 
@@ -198,6 +209,7 @@ export class InjectorManager {
                 themeId,
                 themeDir,
                 themeCssPath,
+                themeCssRelativePath,
                 backupBasePath,
                 translationJson,
             });

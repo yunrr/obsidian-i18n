@@ -9,6 +9,7 @@ const useThemeEditorStoreBase = create<ThemeEditorStore>()((set, get) => ({
     metadata: null,
     themeName: '',
     themeDir: '',
+    themeCssPath: '',
     translationPath: '',
     isTranslating: false,
     progress: 0,
@@ -60,9 +61,10 @@ const useThemeEditorStoreBase = create<ThemeEditorStore>()((set, get) => ({
         metadata: state.metadata ? { ...state.metadata, ...updates } : null
     })),
 
-    setThemeInfo: (name, dir, translationPath) => set({
+    setThemeInfo: (name, dir, translationPath, themeCssPath = '') => set({
         themeName: name,
         themeDir: dir,
+        themeCssPath,
         translationPath,
     }),
 

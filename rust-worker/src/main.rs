@@ -103,6 +103,8 @@ struct ThemeApplyTranslationPayload {
     theme_id: String,
     theme_dir: String,
     theme_css_path: String,
+    #[serde(default)]
+    theme_css_relative_path: Option<String>,
     backup_base_path: String,
     translation_json: Value,
 }
@@ -424,6 +426,10 @@ struct ThemeExtractPayload {
     theme_name: String,
     theme_dir: String,
     theme_css_path: String,
+    #[serde(default)]
+    theme_css_relative_path: Option<String>,
+    #[serde(default)]
+    is_legacy: bool,
     settings: ExtractionSettings,
 }
 
@@ -805,6 +811,7 @@ async fn discover_themes(state: &AppState) -> Result<Vec<Value>> {
     }
 
     let mut themes = Vec::new();
+    let mut modern_theme_names = HashSet::new();
     for entry in fs::read_dir(&themes_dir).with_context(|| format!("failed to read {}", themes_dir.display()))? {
         let entry = entry?;
         let file_type = entry.file_type()?;
@@ -813,6 +820,7 @@ async fn discover_themes(state: &AppState) -> Result<Vec<Value>> {
         }
         let dir = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
+        modern_theme_names.insert(name.clone());
         let manifest = read_json_file(&dir.join("manifest.json"));
         let theme_css_path = dir.join("theme.css");
         themes.push(json!({
@@ -820,6 +828,33 @@ async fn discover_themes(state: &AppState) -> Result<Vec<Value>> {
             "manifest": manifest,
             "dir": dir.to_string_lossy(),
             "themeCssPath": theme_css_path.to_string_lossy(),
+            "themeCssRelativePath": "theme.css",
+            "isLegacy": false,
+        }));
+    }
+
+    for entry in fs::read_dir(&themes_dir).with_context(|| format!("failed to read {}", themes_dir.display()))? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() || !entry.path().extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("css")) {
+            continue;
+        }
+        let path = entry.path();
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let name = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or(&file_name)
+            .to_string();
+        if modern_theme_names.contains(&name) {
+            continue;
+        }
+        themes.push(json!({
+            "name": name,
+            "manifest": Value::Null,
+            "dir": themes_dir.to_string_lossy(),
+            "themeCssPath": path.to_string_lossy(),
+            "themeCssRelativePath": file_name,
+            "isLegacy": true,
         }));
     }
 
@@ -3752,7 +3787,8 @@ fn apply_theme_translation_blocking(payload: ThemeApplyTranslationPayload) -> Re
         .get("dict")
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("translationJson.dict missing"))?;
-    create_plugin_backup(&payload.backup_base_path, &payload.theme_id, &payload.theme_dir, &["theme.css".to_string()], false)?;
+    let css_relative_path = payload.theme_css_relative_path.as_deref().unwrap_or("theme.css");
+    create_plugin_backup(&payload.backup_base_path, &payload.theme_id, &payload.theme_dir, &[css_relative_path.to_string()], false)?;
     let theme_css_path = PathBuf::from(&payload.theme_css_path);
     let mut css = fs::read_to_string(&theme_css_path)
         .with_context(|| format!("failed to read {}", theme_css_path.display()))?;

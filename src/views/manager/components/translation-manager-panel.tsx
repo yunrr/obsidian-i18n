@@ -99,7 +99,8 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
             if (s.type === 'plugin') {
                 isInstalled = !!i18n.app.plugins.manifests[s.plugin];
             } else {
-                isInstalled = fs.existsSync(path.join(basePath, '.obsidian', 'themes', s.plugin));
+                isInstalled = fs.existsSync(path.join(basePath, '.obsidian', 'themes', s.plugin))
+                    || fs.existsSync(path.join(basePath, '.obsidian', 'themes', `${s.plugin}.css`));
             }
             return { ...s, isInstalled };
         });

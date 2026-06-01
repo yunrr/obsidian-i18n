@@ -47,6 +47,8 @@ export interface ThemeItemData {
     translationPath: string;
     themeDir: string;
     themeCssPath: string;
+    themeCssRelativePath?: string;
+    isLegacy?: boolean;
     sources: any[];
     activeSourceId: string | null;
     hasFailedBatches: boolean;
@@ -61,7 +63,7 @@ export interface ThemeItemData {
 }
 
 interface ThemeItemProps {
-    theme: { name: string; manifest: OBThemeManifest | null; dir: string; isActive: boolean };
+    theme: { name: string; manifest: OBThemeManifest | null; dir: string; isActive: boolean; themeCssPath?: string; themeCssRelativePath?: string; isLegacy?: boolean };
     i18n: I18N;
     data: ThemeItemData;
     refreshParent: () => void;
@@ -77,7 +79,7 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
 
     const {
         statusColor, statusText, statusDesc, hasTranslation, translationPath,
-        themeDir, themeCssPath, sources, activeSourceId, isApplied,
+        themeDir, themeCssPath, themeCssRelativePath, isLegacy, sources, activeSourceId, isApplied,
         isTranslated, translationVersion, description, supportedVersion, cloudEntries
     } = data;
 
@@ -187,6 +189,8 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
                 themeName: theme.name,
                 themeDir,
                 themeCssPath,
+                themeCssRelativePath,
+                isLegacy,
                 settings: extractionSettings,
             });
             if (result.status === 'skipped') {
@@ -384,7 +388,7 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
                                                 const translationJson: ThemeTranslationV1 = loadTranslationFile(translationPath);
                                                 if (translationJson) {
                                                     useGlobalStoreInstance.getState().setEditorTheme(
-                                                        translationJson, theme.name, themeDir, translationPath
+                                                        translationJson, theme.name, themeDir, translationPath, themeCssPath
                                                     );
                                                     i18n.view.activateView(THEME_EDITOR_VIEW_TYPE);
                                                 }
@@ -406,7 +410,7 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
                                             </DropdownMenuItem>
                                         )}
                                         <DropdownMenuSeparator className="bg-border/40" />
-                                        <DropdownMenuItem onClick={() => i18nOpen(i18n, themeDir)} className="text-[12px] py-2">
+                                        <DropdownMenuItem onClick={() => i18nOpen(i18n, isLegacy ? themeCssPath : themeDir)} className="text-[12px] py-2">
                                             <FolderOpen className="w-3.5 h-3.5 mr-2.5 text-amber-500/70" />
                                             <span>{t('Manager.Common.Actions.OpenFolder')}</span>
                                         </DropdownMenuItem>
@@ -479,7 +483,7 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
                                             const translationJson: ThemeTranslationV1 = loadTranslationFile(translationPath);
                                             if (translationJson) {
                                                 useGlobalStoreInstance.getState().setEditorTheme(
-                                                    translationJson, theme.name, themeDir, translationPath
+                                                    translationJson, theme.name, themeDir, translationPath, themeCssPath
                                                 );
                                                 i18n.view.activateView(THEME_EDITOR_VIEW_TYPE);
                                             }
@@ -569,7 +573,7 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
                                     </DropdownMenuItem>
                                 )}
                                 <DropdownMenuSeparator className="bg-border/40" />
-                                <DropdownMenuItem onClick={() => i18nOpen(i18n, themeDir)} className="text-[12px] py-2">
+                                <DropdownMenuItem onClick={() => i18nOpen(i18n, isLegacy ? themeCssPath : themeDir)} className="text-[12px] py-2">
                                     <FolderOpen className="w-3.5 h-3.5 mr-2.5 text-amber-500/70" />
                                     <span>{t('Manager.Common.Actions.OpenFolder')}</span>
                                 </DropdownMenuItem>
