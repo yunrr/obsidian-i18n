@@ -181,6 +181,33 @@ export class SourceManager {
         return Object.values(this.meta.sources);
     }
 
+    getMissingMetadataIndexSourceIds(type?: TranslationSource['type']): string[] {
+        return Object.values(this.meta.sources)
+            .filter(source => (!type || source.type === type) && !source.metadataIndexedAt)
+            .map(source => source.id);
+    }
+
+    getIndexedTranslationVersions(type?: TranslationSource['type']): string[] {
+        const versions = new Set<string>();
+        Object.values(this.meta.sources).forEach(source => {
+            if (type && source.type !== type) return;
+            if (source.translationVersion) versions.add(source.translationVersion);
+        });
+        return Array.from(versions).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+    }
+
+    getSourceForPluginVersion(pluginId: string, type: TranslationSource['type'], version: string): TranslationSource | null {
+        const sources = Object.values(this.meta.sources)
+            .filter(source => source.plugin === pluginId && source.type === type && source.translationVersion === version);
+        if (sources.length === 0) return null;
+        return sources.find(source => source.isActive) || sources.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0] || null;
+    }
+
+    hasSourceForPluginVersion(pluginId: string, type: TranslationSource['type'], version: string): boolean {
+        const source = this.getSourceForPluginVersion(pluginId, type, version);
+        return !!source && fs.existsSync(this.getSourceFilePath(source.id));
+    }
+
     /**
      * 获取插件的所有翻译源
      */

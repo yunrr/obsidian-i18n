@@ -43,6 +43,7 @@ export interface ThemeItemData {
     statusText: string;
     statusDesc: string;
     hasTranslation: boolean;
+    hasCurrentVersionTranslation?: boolean;
     translationPath: string;
     themeDir: string;
     themeCssPath: string;

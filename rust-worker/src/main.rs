@@ -327,6 +327,8 @@ struct ExtractBatchPayload {
     language: String,
     #[serde(default)]
     settings: ExtractionSettings,
+    #[serde(default = "default_translation_version")]
+    translation_version: String,
     #[serde(default)]
     completed_resources: Option<usize>,
     #[serde(default)]
@@ -3561,6 +3563,23 @@ fn source_from_entry(entry: &Value, content: &Value, owner: &str, repo: &str, ex
     Ok(source)
 }
 
+fn has_existing_extracted_source(paths: &PersistencePaths, plugin_id: &str, source_type: &str, translation_version: &str) -> bool {
+    load_meta(paths)
+        .get("sources")
+        .and_then(Value::as_object)
+        .is_some_and(|sources| {
+            sources.values().any(|source| {
+                source.get("plugin").and_then(Value::as_str) == Some(plugin_id)
+                    && source.get("type").and_then(Value::as_str) == Some(source_type)
+                    && source.get("translationVersion").and_then(Value::as_str) == Some(translation_version)
+                    && source
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|source_id| paths.sources_dir.join(format!("{source_id}.json")).exists())
+            })
+        })
+}
+
 fn has_any_sources_for_plugin(paths: &PersistencePaths, plugin_id: &str) -> bool {
     load_meta(paths)
         .get("sources")
@@ -4442,7 +4461,19 @@ async fn save_extracted_source(
     let _guard = state.persistence_lock.lock().await;
     let mut meta = load_meta(paths);
     let source_id = nanoid!(32);
+    let translation_version = content.pointer("/metadata/version").and_then(Value::as_str).unwrap_or_default();
     if let Some(sources) = meta.get_mut("sources").and_then(Value::as_object_mut) {
+        if sources.values().any(|source| {
+            source.get("plugin").and_then(Value::as_str) == Some(plugin_id)
+                && source.get("type").and_then(Value::as_str) == Some(source_type)
+                && source.get("translationVersion").and_then(Value::as_str) == Some(translation_version)
+                && source
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|existing_source_id| paths.sources_dir.join(format!("{existing_source_id}.json")).exists())
+        }) {
+            return Ok(());
+        }
         for source in sources.values_mut() {
             if source.get("plugin").and_then(Value::as_str) == Some(plugin_id) {
                 source["isActive"] = json!(false);
@@ -4580,6 +4611,11 @@ async fn handle_extract_batch(
     let paths = paths(&batch.persistence.base_path);
     let batch_language = batch.language.clone();
     let batch_settings = serde_json::to_value(&batch.settings)?;
+    let batch_translation_version = if batch.translation_version.is_empty() {
+        batch.settings.translation_version.clone()
+    } else {
+        batch.translation_version.clone()
+    };
     let completed = Arc::new(Mutex::new(HashSet::<usize>::new()));
     let semaphore = Arc::new(Semaphore::new(
         batch.concurrency.max(1).min(MAX_EXTRACT_CPU_CONCURRENCY),
@@ -4600,6 +4636,7 @@ async fn handle_extract_batch(
         let checkpoint_key = batch.checkpoint_key.clone();
         let batch_language = batch_language.clone();
         let batch_settings = batch_settings.clone();
+        let batch_translation_version = batch_translation_version.clone();
         let scope = scope.to_string();
         let mode = mode.to_string();
         handles.push(tokio::spawn(async move {
@@ -4608,6 +4645,32 @@ async fn handle_extract_batch(
                 return Ok::<(), anyhow::Error>(());
             }
             let mut resource = resource;
+            let resource_id = resource
+                .get("resourceId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if has_existing_extracted_source(
+                &paths,
+                &resource_id,
+                if scope == "theme" { "theme" } else { "plugin" },
+                &batch_translation_version,
+            ) {
+                completed.lock().await.insert(index);
+                increment_progress(&task, "processedResources", 1).await;
+                increment_progress(&task, "skippedCount", 1).await;
+                let progress = task.progress.lock().await.clone();
+                let completed_set = completed.lock().await.clone();
+                save_checkpoint(
+                    &state,
+                    &paths,
+                    &checkpoint_key,
+                    create_checkpoint(&scope, &mode, &resources, &completed_set, &progress),
+                )
+                .await?;
+                bump_record_revision(&task).await;
+                return Ok::<(), anyhow::Error>(());
+            }
             if let Some(object) = resource.as_object_mut() {
                 if !object.contains_key("settings") {
                     object.insert("settings".to_string(), batch_settings.clone());

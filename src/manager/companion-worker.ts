@@ -993,10 +993,11 @@ function getTranslationMetadataIndex(content: any): Pick<TranslationSource, 'tra
     };
 }
 
-async function hasExistingExtractedSource(paths: WorkerPersistencePaths, pluginId: string, type: 'plugin' | 'theme'): Promise<boolean> {
+async function hasExistingExtractedSource(paths: WorkerPersistencePaths, pluginId: string, type: 'plugin' | 'theme', translationVersion: string): Promise<boolean> {
     const meta = await loadMeta(paths);
     for (const source of Object.values(meta.sources)) {
         if (source.plugin !== pluginId || source.type !== type) continue;
+        if (translationVersion && source.translationVersion !== translationVersion) continue;
         if (await fs.pathExists(path.join(paths.sourcesDir, `${source.id}.json`))) return true;
     }
     return false;
@@ -1006,8 +1007,10 @@ async function saveExtractedSource(paths: WorkerPersistencePaths, pluginId: stri
     await withPersistenceLock(async () => {
         const meta = await loadMeta(paths);
         const type = options.type || 'plugin';
+        const translationVersion = content.metadata?.version || '';
         for (const source of Object.values(meta.sources)) {
             if (source.plugin !== pluginId || source.type !== type) continue;
+            if (translationVersion && source.translationVersion !== translationVersion) continue;
             if (await fs.pathExists(path.join(paths.sourcesDir, `${source.id}.json`))) return;
         }
         const now = Date.now();
@@ -1362,11 +1365,12 @@ function createCheckpoint<T extends CompanionBatchResource>(scope: BatchTaskScop
 
 async function handlePluginBatchExtract(task: CompanionTaskRuntime, payload: CompanionPluginBatchExtractPayload) {
     const paths = getPersistencePaths(payload.persistence.basePath);
+    const translationVersion = payload.translationVersion || payload.settings.translationVersion || '1.0.1';
     const completedIndexes = new Set<number>();
     const requests: ExtractThreadRequest[] = [];
     const requestIndexes: number[] = [];
     for (const [index, resource] of payload.resources.entries()) {
-        if (await hasExistingExtractedSource(paths, resource.resourceId, 'plugin')) {
+        if (await hasExistingExtractedSource(paths, resource.resourceId, 'plugin', translationVersion)) {
             completedIndexes.add(index);
             task.progress.processedResources++;
             task.progress.skippedCount++;
@@ -1411,11 +1415,12 @@ async function handlePluginBatchExtract(task: CompanionTaskRuntime, payload: Com
 
 async function handleThemeBatchExtract(task: CompanionTaskRuntime, payload: CompanionThemeBatchExtractPayload) {
     const paths = getPersistencePaths(payload.persistence.basePath);
+    const translationVersion = payload.translationVersion || payload.settings.translationVersion || '1.0.1';
     const completedIndexes = new Set<number>();
     const requests: ExtractThreadRequest[] = [];
     const requestIndexes: number[] = [];
     for (const [index, resource] of payload.resources.entries()) {
-        if (await hasExistingExtractedSource(paths, resource.resourceId, 'theme')) {
+        if (await hasExistingExtractedSource(paths, resource.resourceId, 'theme', translationVersion)) {
             completedIndexes.add(index);
             task.progress.processedResources++;
             task.progress.skippedCount++;

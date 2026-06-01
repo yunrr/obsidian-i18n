@@ -405,6 +405,7 @@ export interface CompanionPluginBatchExtractPayload {
     resources: CompanionPluginBatchExtractResource[];
     language: string;
     settings: CompanionExtractionSettings;
+    translationVersion: string;
     concurrency: number;
     checkpointKey: string;
     completedResources?: number;
@@ -415,6 +416,7 @@ export interface CompanionThemeBatchExtractPayload {
     persistence: CompanionWorkerPersistenceConfig;
     resources: CompanionThemeExtractRequest[];
     settings: CompanionExtractionSettings;
+    translationVersion: string;
     concurrency: number;
     checkpointKey: string;
     completedResources?: number;

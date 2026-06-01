@@ -71,6 +71,8 @@ interface PluginBatchResource {
     resourceId: string;
     label: string;
     sourceId?: string | null;
+    pendingTranslationCount?: number;
+    totalTranslationCount?: number;
 }
 
 const PLUGIN_EXTRACT_CHECKPOINT_KEY = 'plugin:extract';
@@ -181,9 +183,11 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
     const [cloudManifest, setCloudManifest] = useState<any[]>([]);
     const [batchTask, setBatchTask] = useState<BatchTaskState>(EMPTY_BATCH_TASK_STATE);
     const [showFailureDetails, setShowFailureDetails] = useState(false);
+    const [batchTranslationVersion, setBatchTranslationVersion] = useState(settings.translationVersion || '1.0.1');
     const taskIdRef = useRef<string | null>(null);
     const syncRevisionRef = useRef({ sourceRevision: 0, recordRevision: 0 });
     const lastSourceSyncAtRef = useRef(0);
+    const metadataIndexAttemptedRef = useRef<Set<string>>(new Set());
 
     const setViewMode = useCallback((mode: 'list' | 'grid') => {
         setViewModeState(mode);
@@ -216,6 +220,39 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
     }, [settings.defaultCloudRepo, i18n]);
 
     const sourceTick = useGlobalStoreInstance((state) => state.sourceUpdateTick);
+    const currentExtractionVersion = settings.translationVersion || '1.0.1';
+
+    useEffect(() => {
+        let cancelled = false;
+        const indexMissingMetadata = async () => {
+            const missing = i18n.sourceManager.getMissingMetadataIndexSourceIds('plugin')
+                .filter(sourceId => !metadataIndexAttemptedRef.current.has(sourceId));
+            for (let index = 0; index < missing.length && !cancelled; index += 8) {
+                const batch = missing.slice(index, index + 8);
+                batch.forEach(sourceId => metadataIndexAttemptedRef.current.add(sourceId));
+                i18n.sourceManager.batchIndexSourceMetadata(batch);
+                await new Promise(resolve => window.setTimeout(resolve, 25));
+            }
+        };
+        void indexMissingMetadata();
+        return () => { cancelled = true; };
+    }, [i18n.sourceManager, sourceTick]);
+
+    const translationVersionOptions = useMemo(() => {
+        return i18n.sourceManager.getIndexedTranslationVersions('plugin');
+    }, [i18n.sourceManager, sourceTick]);
+
+    useEffect(() => {
+        if (translationVersionOptions.includes(batchTranslationVersion)) return;
+        const defaultVersion = settings.translationVersion || '1.0.1';
+        if (translationVersionOptions.includes(defaultVersion)) {
+            setBatchTranslationVersion(defaultVersion);
+        } else if (translationVersionOptions.length > 0) {
+            setBatchTranslationVersion(translationVersionOptions[0]);
+        } else {
+            setBatchTranslationVersion(defaultVersion);
+        }
+    }, [batchTranslationVersion, settings.translationVersion, translationVersionOptions]);
 
     const sortOptions = useMemo(() => [
         { key: '0', label: t('Common.Data.SortAsc') },
@@ -341,6 +378,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             const langDoc = activeSourceId ? i18n.sourceManager.getSourceFilePath(activeSourceId) : '';
             const sources = sourceIndex.byPlugin[plugin.id] || [];
             const isLangDoc = sources.some(source => fs.pathExistsSync(i18n.sourceManager.getSourceFilePath(source.id)));
+            const hasCurrentVersionTranslation = i18n.sourceManager.hasSourceForPluginVersion(plugin.id, 'plugin', currentExtractionVersion);
             const manifestDoc = path.join(pluginDir, 'manifest.json');
             const mainDoc = path.join(pluginDir, 'main.js');
 
@@ -405,6 +443,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                 statusText,
                 statusDesc,
                 isLangDoc,
+                hasCurrentVersionTranslation,
                 langDoc,
                 pluginDir,
                 sources,
@@ -424,7 +463,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             };
         }
         return stats;
-    }, [plugins, i18n, refreshKey, sourceIndex, t, checkIsTranslated, countPendingTranslationItems, countTranslationItems, cloudEntriesByPlugin, failedSourceIds]);
+    }, [plugins, i18n, refreshKey, sourceIndex, t, checkIsTranslated, countPendingTranslationItems, countTranslationItems, cloudEntriesByPlugin, failedSourceIds, currentExtractionVersion]);
 
     const displayPlugins = useMemo(() => {
         let result = [...plugins];
@@ -451,7 +490,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                     case 'error':
                         return data.hasFormatError;
                     case 'toExtract':
-                        return !data.isLangDoc;
+                        return !data.hasCurrentVersionTranslation;
                     default:
                         return true;
                 }
@@ -467,20 +506,51 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
     }, [plugins, searchTerm, sortType, statusFilter, allPluginStates]);
 
     const extractablePlugins = useMemo(() => {
-        return displayPlugins.filter(plugin => !allPluginStates[plugin.id]?.isLangDoc);
+        return displayPlugins.filter(plugin => !allPluginStates[plugin.id]?.hasCurrentVersionTranslation);
     }, [displayPlugins, allPluginStates]);
 
     const batchExtractPlugins = useMemo(() => extractablePlugins, [extractablePlugins]);
 
+    const getPluginTranslationCounts = useCallback((sourceId?: string | null) => {
+        if (!sourceId) return null;
+        const filePath = i18n.sourceManager.getSourceFilePath(sourceId);
+        if (!fs.existsSync(filePath)) return null;
+        try {
+            const json = loadTranslationFile(filePath) as PluginTranslationV1;
+            if (!isValidPluginTranslationV1Format(json)) return null;
+            return {
+                pendingTranslationCount: countPendingTranslationItems(json),
+                totalTranslationCount: countTranslationItems(json),
+            };
+        } catch {
+            return null;
+        }
+    }, [countPendingTranslationItems, countTranslationItems, i18n.sourceManager]);
+
+    const pluginTranslateResourcesById = useMemo(() => {
+        const resources = new Map<string, PluginBatchResource>();
+        if (!batchTranslationVersion) return resources;
+        for (const plugin of displayPlugins) {
+            const source = i18n.sourceManager.getSourceForPluginVersion(plugin.id, 'plugin', batchTranslationVersion);
+            const counts = getPluginTranslationCounts(source?.id);
+            if (!source || !counts) continue;
+            const itemCount = settings.llmOverwriteExistingTranslations === true
+                ? counts.totalTranslationCount
+                : counts.pendingTranslationCount;
+            if ((itemCount || 0) <= 0) continue;
+            resources.set(plugin.id, {
+                resourceId: plugin.id,
+                label: plugin.name,
+                sourceId: source.id,
+                ...counts,
+            });
+        }
+        return resources;
+    }, [batchTranslationVersion, displayPlugins, getPluginTranslationCounts, i18n.sourceManager, settings.llmOverwriteExistingTranslations, sourceTick]);
+
     const translatablePlugins = useMemo(() => {
-        return displayPlugins.filter(plugin => {
-            const data = allPluginStates[plugin.id];
-            if (!data?.translationFormatMark) return false;
-            return settings.llmOverwriteExistingTranslations === true
-                ? (data?.totalTranslationCount || 0) > 0
-                : (data?.pendingTranslationCount || 0) > 0;
-        });
-    }, [displayPlugins, allPluginStates, settings.llmOverwriteExistingTranslations]);
+        return displayPlugins.filter(plugin => pluginTranslateResourcesById.has(plugin.id));
+    }, [displayPlugins, pluginTranslateResourcesById]);
 
     const pluginExtractCheckpoint = useMemo(() => {
         return i18n.sourceManager.loadBatchTaskCheckpoint(PLUGIN_EXTRACT_CHECKPOINT_KEY);
@@ -492,7 +562,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
 
     const resumablePluginExtractResources = useMemo<PluginBatchResource[]>(() => {
         return (pluginExtractCheckpoint?.resources || [])
-            .filter(resource => !allPluginStates[resource.resourceId]?.isLangDoc)
+            .filter(resource => !allPluginStates[resource.resourceId]?.hasCurrentVersionTranslation)
             .map(resource => ({
                 resourceId: resource.resourceId,
                 label: resource.label,
@@ -504,19 +574,22 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         return (pluginTranslateCheckpoint?.resources || [])
             .flatMap(resource => {
                 const data = allPluginStates[resource.resourceId];
-                if (!data?.isLangDoc || !data.translationFormatMark || !data.activeSourceId) return [];
+                if (!data) return [];
+                const counts = getPluginTranslationCounts(resource.sourceId);
+                if (!counts || !resource.sourceId) return [];
                 const itemCount = settings.llmOverwriteExistingTranslations === true
-                    ? data.totalTranslationCount
-                    : data.pendingTranslationCount;
+                    ? counts.totalTranslationCount
+                    : counts.pendingTranslationCount;
                 const remainingCount = itemCount || 0;
                 if (remainingCount <= 0) return [];
                 return [{
                     resourceId: resource.resourceId,
                     label: resource.label,
-                    sourceId: data.activeSourceId,
+                    sourceId: resource.sourceId,
+                    ...counts,
                 }];
             });
-    }, [allPluginStates, pluginTranslateCheckpoint, settings.llmOverwriteExistingTranslations]);
+    }, [allPluginStates, getPluginTranslationCounts, pluginTranslateCheckpoint, settings.llmOverwriteExistingTranslations]);
 
     const handleSearchChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         const val = e.target.value;
@@ -691,6 +764,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                 resources: workerResources,
                 language: settings.language,
                 settings: getCompanionExtractionSettings(i18n.settings),
+                translationVersion: currentExtractionVersion,
                 concurrency: getPositiveInt(i18n.settings.batchExtractConcurrency, 3),
                 checkpointKey: PLUGIN_EXTRACT_CHECKPOINT_KEY,
                 completedResources: displayedCompletedResources,
@@ -709,7 +783,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             taskIdRef.current = null;
             setBatchTask(prev => ({ ...prev, isRunning: false, currentLabel: '' }));
         }
-    }, [allPluginStates, batchExtractPlugins, batchTask.isRunning, i18n, plugins, pluginExtractCheckpoint, resumablePluginExtractResources, runWorkerTask, settings.language, t]);
+    }, [allPluginStates, batchExtractPlugins, batchTask.isRunning, currentExtractionVersion, i18n, plugins, pluginExtractCheckpoint, resumablePluginExtractResources, runWorkerTask, settings.language, t]);
 
     const handleBatchExtract = useCallback(() => startPluginBatchExtract(false), [startPluginBatchExtract]);
     const handleResumeExtract = useCallback(() => startPluginBatchExtract(true), [startPluginBatchExtract]);
@@ -717,11 +791,10 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
     const startPluginBatchTranslate = useCallback(async (resume: boolean) => {
         const resources: PluginBatchResource[] = resume && resumablePluginTranslateResources.length
             ? resumablePluginTranslateResources
-            : translatablePlugins.map(plugin => ({
-                resourceId: plugin.id,
-                label: plugin.name,
-                sourceId: allPluginStates[plugin.id]?.activeSourceId,
-            }));
+            : translatablePlugins.flatMap(plugin => {
+                const resource = pluginTranslateResourcesById.get(plugin.id);
+                return resource ? [resource] : [];
+            });
 
         if (batchTask.isRunning || resources.length === 0) return;
 
@@ -729,11 +802,9 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         const totalResources = resume ? pluginTranslateCheckpoint?.totalResources || resources.length : resources.length;
         const processedItems = resume ? pluginTranslateCheckpoint?.processedItems || 0 : 0;
         const totalItems = resume ? pluginTranslateCheckpoint?.totalItems || resources.reduce((sum, resource) => {
-            const data = allPluginStates[resource.resourceId];
-            return sum + (settings.llmOverwriteExistingTranslations === true ? data?.totalTranslationCount || 0 : data?.pendingTranslationCount || 0);
+            return sum + (settings.llmOverwriteExistingTranslations === true ? resource.totalTranslationCount || 0 : resource.pendingTranslationCount || 0);
         }, 0) : resources.reduce((sum, resource) => {
-            const data = allPluginStates[resource.resourceId];
-            return sum + (settings.llmOverwriteExistingTranslations === true ? data?.totalTranslationCount || 0 : data?.pendingTranslationCount || 0);
+            return sum + (settings.llmOverwriteExistingTranslations === true ? resource.totalTranslationCount || 0 : resource.pendingTranslationCount || 0);
         }, 0);
 
         setBatchTask({
@@ -774,7 +845,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             taskIdRef.current = null;
             setBatchTask(prev => ({ ...prev, isRunning: false, currentLabel: '' }));
         }
-    }, [allPluginStates, batchTask.isRunning, i18n, pluginTranslateCheckpoint, resumablePluginTranslateResources, runWorkerTask, settings.llmOverwriteExistingTranslations, t, translatablePlugins]);
+    }, [batchTask.isRunning, i18n, pluginTranslateCheckpoint, pluginTranslateResourcesById, resumablePluginTranslateResources, runWorkerTask, settings.llmOverwriteExistingTranslations, t, translatablePlugins]);
 
     const handleBatchTranslate = useCallback(() => startPluginBatchTranslate(false), [startPluginBatchTranslate]);
     const handleResumeTranslate = useCallback(() => startPluginBatchTranslate(true), [startPluginBatchTranslate]);
@@ -881,6 +952,21 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                         <SelectContent>
                             {sortOptions.map((opt) => (
                                 <SelectItem key={opt.key} value={opt.key}>{opt.label}</SelectItem>
+                            ))}
+                        </SelectContent>
+                    </Select>
+
+                    <Select value={batchTranslationVersion} onValueChange={setBatchTranslationVersion}>
+                        <SelectTrigger className="w-[130px] h-9 rounded-none border-muted-foreground/20 shadow-sm text-[13px]" size="default">
+                            <SelectValue placeholder={t('Manager.Sources.Filters.VersionAll')} />
+                        </SelectTrigger>
+                        <SelectContent>
+                            {translationVersionOptions.length === 0 ? (
+                                <SelectItem value={batchTranslationVersion || currentExtractionVersion}>
+                                    v{batchTranslationVersion || currentExtractionVersion}
+                                </SelectItem>
+                            ) : translationVersionOptions.map(version => (
+                                <SelectItem key={version} value={version}>v{version}</SelectItem>
                             ))}
                         </SelectContent>
                     </Select>

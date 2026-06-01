@@ -76,6 +76,8 @@ interface ThemeBatchResource {
     resourceId: string;
     label: string;
     sourceId?: string | null;
+    pendingTranslationCount?: number;
+    totalTranslationCount?: number;
 }
 
 const THEME_EXTRACT_CHECKPOINT_KEY = 'theme:extract';
@@ -184,9 +186,11 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
     const [cloudManifest, setCloudManifest] = useState<any[]>([]);
     const [batchTask, setBatchTask] = useState<BatchTaskState>(EMPTY_BATCH_TASK_STATE);
     const [showFailureDetails, setShowFailureDetails] = useState(false);
+    const [batchTranslationVersion, setBatchTranslationVersion] = useState(i18n.settings.translationVersion || '1.0.1');
     const taskIdRef = useRef<string | null>(null);
     const syncRevisionRef = useRef({ sourceRevision: 0, recordRevision: 0 });
     const lastSourceSyncAtRef = useRef(0);
+    const metadataIndexAttemptedRef = useRef<Set<string>>(new Set());
 
     const setViewMode = useCallback((mode: 'list' | 'grid') => {
         setViewModeState(mode);
@@ -219,6 +223,39 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
     }, [i18n.settings.defaultCloudRepo, i18n]);
 
     const sourceTick = useGlobalStoreInstance((state) => state.sourceUpdateTick);
+    const currentExtractionVersion = i18n.settings.translationVersion || '1.0.1';
+
+    useEffect(() => {
+        let cancelled = false;
+        const indexMissingMetadata = async () => {
+            const missing = i18n.sourceManager.getMissingMetadataIndexSourceIds('theme')
+                .filter(sourceId => !metadataIndexAttemptedRef.current.has(sourceId));
+            for (let index = 0; index < missing.length && !cancelled; index += 8) {
+                const batch = missing.slice(index, index + 8);
+                batch.forEach(sourceId => metadataIndexAttemptedRef.current.add(sourceId));
+                i18n.sourceManager.batchIndexSourceMetadata(batch);
+                await new Promise(resolve => window.setTimeout(resolve, 25));
+            }
+        };
+        void indexMissingMetadata();
+        return () => { cancelled = true; };
+    }, [i18n.sourceManager, sourceTick]);
+
+    const translationVersionOptions = useMemo(() => {
+        return i18n.sourceManager.getIndexedTranslationVersions('theme');
+    }, [i18n.sourceManager, sourceTick]);
+
+    useEffect(() => {
+        if (translationVersionOptions.includes(batchTranslationVersion)) return;
+        const defaultVersion = i18n.settings.translationVersion || '1.0.1';
+        if (translationVersionOptions.includes(defaultVersion)) {
+            setBatchTranslationVersion(defaultVersion);
+        } else if (translationVersionOptions.length > 0) {
+            setBatchTranslationVersion(translationVersionOptions[0]);
+        } else {
+            setBatchTranslationVersion(defaultVersion);
+        }
+    }, [batchTranslationVersion, i18n.settings.translationVersion, translationVersionOptions]);
 
     const sortOptions = useMemo(() => [
         { key: '0', label: t('Common.Data.SortAsc') },
@@ -374,6 +411,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             const activeSourceId = sourceIndex.activeByTheme[theme.name] || null;
             const translationPath = activeSourceId ? i18n.sourceManager.getSourceFilePath(activeSourceId) : '';
             const hasTranslation = sources.some(source => fs.existsSync(i18n.sourceManager.getSourceFilePath(source.id)));
+            const hasCurrentVersionTranslation = i18n.sourceManager.hasSourceForPluginVersion(theme.name, 'theme', currentExtractionVersion);
             const state = i18n.stateManager.getThemeState(theme.name);
 
             let isTranslated = false;
@@ -423,6 +461,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                 statusText,
                 statusDesc,
                 hasTranslation,
+                hasCurrentVersionTranslation,
                 translationPath: translationPath || '',
                 themeDir,
                 themeCssPath,
@@ -441,7 +480,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
         }
 
         return stats;
-    }, [themes, i18n, refreshKey, sourceIndex, t, checkIsTranslated, countPendingTranslationItems, countTranslationItems, cloudEntriesByTheme, failedSourceIds]);
+    }, [themes, i18n, refreshKey, sourceIndex, t, checkIsTranslated, countPendingTranslationItems, countTranslationItems, cloudEntriesByTheme, failedSourceIds, currentExtractionVersion]);
 
     const displayThemes = useMemo(() => {
         let result = [...themes];
@@ -466,7 +505,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                     case 'partialFailed':
                         return data.hasFailedBatches;
                     case 'toExtract':
-                        return !data.hasTranslation;
+                        return !data.hasCurrentVersionTranslation;
                     default:
                         return true;
                 }
@@ -482,20 +521,50 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
     }, [themes, searchTerm, sortType, statusFilter, allThemeStates]);
 
     const extractableThemes = useMemo(() => {
-        return displayThemes.filter(theme => !allThemeStates[theme.name]?.hasTranslation);
+        return displayThemes.filter(theme => !allThemeStates[theme.name]?.hasCurrentVersionTranslation);
     }, [displayThemes, allThemeStates]);
 
     const batchExtractThemes = useMemo(() => extractableThemes, [extractableThemes]);
 
+    const getThemeTranslationCounts = useCallback((sourceId?: string | null) => {
+        if (!sourceId) return null;
+        const filePath = i18n.sourceManager.getSourceFilePath(sourceId);
+        if (!fs.existsSync(filePath)) return null;
+        try {
+            const json = loadTranslationFile(filePath) as ThemeTranslationV1;
+            return {
+                pendingTranslationCount: countPendingTranslationItems(json),
+                totalTranslationCount: countTranslationItems(json),
+            };
+        } catch {
+            return null;
+        }
+    }, [countPendingTranslationItems, countTranslationItems, i18n.sourceManager]);
+
+    const themeTranslateResourcesById = useMemo(() => {
+        const resources = new Map<string, ThemeBatchResource>();
+        if (!batchTranslationVersion) return resources;
+        for (const theme of displayThemes) {
+            const source = i18n.sourceManager.getSourceForPluginVersion(theme.name, 'theme', batchTranslationVersion);
+            const counts = getThemeTranslationCounts(source?.id);
+            if (!source || !counts) continue;
+            const itemCount = i18n.settings.llmOverwriteExistingTranslations === true
+                ? counts.totalTranslationCount
+                : counts.pendingTranslationCount;
+            if ((itemCount || 0) <= 0) continue;
+            resources.set(theme.name, {
+                resourceId: theme.name,
+                label: theme.name,
+                sourceId: source.id,
+                ...counts,
+            });
+        }
+        return resources;
+    }, [batchTranslationVersion, displayThemes, getThemeTranslationCounts, i18n.settings.llmOverwriteExistingTranslations, i18n.sourceManager, sourceTick]);
+
     const translatableThemes = useMemo(() => {
-        return displayThemes.filter(theme => {
-            const data = allThemeStates[theme.name];
-            if (!data?.hasTranslation) return false;
-            return i18n.settings.llmOverwriteExistingTranslations === true
-                ? (data?.totalTranslationCount || 0) > 0
-                : (data?.pendingTranslationCount || 0) > 0;
-        });
-    }, [displayThemes, allThemeStates, i18n.settings.llmOverwriteExistingTranslations]);
+        return displayThemes.filter(theme => themeTranslateResourcesById.has(theme.name));
+    }, [displayThemes, themeTranslateResourcesById]);
 
     const themeExtractCheckpoint = useMemo(() => {
         return i18n.sourceManager.loadBatchTaskCheckpoint(THEME_EXTRACT_CHECKPOINT_KEY);
@@ -507,7 +576,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
 
     const resumableThemeExtractResources = useMemo<ThemeBatchResource[]>(() => {
         return (themeExtractCheckpoint?.resources || [])
-            .filter(resource => !allThemeStates[resource.resourceId]?.hasTranslation)
+            .filter(resource => !allThemeStates[resource.resourceId]?.hasCurrentVersionTranslation)
             .map(resource => ({
                 resourceId: resource.resourceId,
                 label: resource.label,
@@ -519,19 +588,22 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
         return (themeTranslateCheckpoint?.resources || [])
             .flatMap(resource => {
                 const data = allThemeStates[resource.resourceId];
-                if (!data?.hasTranslation || !data.activeSourceId) return [];
+                if (!data || !resource.sourceId) return [];
+                const counts = getThemeTranslationCounts(resource.sourceId);
+                if (!counts) return [];
                 const itemCount = i18n.settings.llmOverwriteExistingTranslations === true
-                    ? data.totalTranslationCount
-                    : data.pendingTranslationCount;
+                    ? counts.totalTranslationCount
+                    : counts.pendingTranslationCount;
                 const remainingCount = itemCount || 0;
                 if (remainingCount <= 0) return [];
                 return [{
                     resourceId: resource.resourceId,
                     label: resource.label,
-                    sourceId: data.activeSourceId,
+                    sourceId: resource.sourceId,
+                    ...counts,
                 }];
             });
-    }, [allThemeStates, i18n.settings.llmOverwriteExistingTranslations, themeTranslateCheckpoint]);
+    }, [allThemeStates, getThemeTranslationCounts, i18n.settings.llmOverwriteExistingTranslations, themeTranslateCheckpoint]);
 
     const handleRefresh = useCallback(() => {
         setRefreshKey(k => k + 1);
@@ -641,6 +713,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                 persistence: { basePath: i18n.sourceManager.getBasePath() },
                 resources: workerResources,
                 settings: getCompanionExtractionSettings(i18n.settings),
+                translationVersion: currentExtractionVersion,
                 concurrency: getPositiveInt(i18n.settings.batchExtractConcurrency, 3),
                 checkpointKey: THEME_EXTRACT_CHECKPOINT_KEY,
                 completedResources: displayedCompletedResources,
@@ -659,7 +732,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             taskIdRef.current = null;
             setBatchTask(prev => ({ ...prev, isRunning: false, currentLabel: '' }));
         }
-    }, [allThemeStates, batchExtractThemes, batchTask.isRunning, i18n, resumableThemeExtractResources, runWorkerTask, t, themeExtractCheckpoint, themes]);
+    }, [allThemeStates, batchExtractThemes, batchTask.isRunning, currentExtractionVersion, i18n, resumableThemeExtractResources, runWorkerTask, t, themeExtractCheckpoint, themes]);
 
     const handleBatchExtract = useCallback(() => startThemeBatchExtract(false), [startThemeBatchExtract]);
     const handleResumeExtract = useCallback(() => startThemeBatchExtract(true), [startThemeBatchExtract]);
@@ -667,11 +740,10 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
     const startThemeBatchTranslate = useCallback(async (resume: boolean) => {
         const resources: ThemeBatchResource[] = resume && resumableThemeTranslateResources.length
             ? resumableThemeTranslateResources
-            : translatableThemes.map(theme => ({
-                resourceId: theme.name,
-                label: theme.name,
-                sourceId: allThemeStates[theme.name]?.activeSourceId,
-            }));
+            : translatableThemes.flatMap(theme => {
+                const resource = themeTranslateResourcesById.get(theme.name);
+                return resource ? [resource] : [];
+            });
 
         if (batchTask.isRunning || resources.length === 0) return;
 
@@ -679,11 +751,9 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
         const totalResources = resume ? themeTranslateCheckpoint?.totalResources || resources.length : resources.length;
         const processedItems = resume ? themeTranslateCheckpoint?.processedItems || 0 : 0;
         const totalItems = resume ? themeTranslateCheckpoint?.totalItems || resources.reduce((sum, resource) => {
-            const data = allThemeStates[resource.resourceId];
-            return sum + (i18n.settings.llmOverwriteExistingTranslations === true ? data?.totalTranslationCount || 0 : data?.pendingTranslationCount || 0);
+            return sum + (i18n.settings.llmOverwriteExistingTranslations === true ? resource.totalTranslationCount || 0 : resource.pendingTranslationCount || 0);
         }, 0) : resources.reduce((sum, resource) => {
-            const data = allThemeStates[resource.resourceId];
-            return sum + (i18n.settings.llmOverwriteExistingTranslations === true ? data?.totalTranslationCount || 0 : data?.pendingTranslationCount || 0);
+            return sum + (i18n.settings.llmOverwriteExistingTranslations === true ? resource.totalTranslationCount || 0 : resource.pendingTranslationCount || 0);
         }, 0);
 
         setBatchTask({
@@ -724,7 +794,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             taskIdRef.current = null;
             setBatchTask(prev => ({ ...prev, isRunning: false, currentLabel: '' }));
         }
-    }, [allThemeStates, batchTask.isRunning, i18n, resumableThemeTranslateResources, runWorkerTask, t, themeTranslateCheckpoint, translatableThemes]);
+    }, [batchTask.isRunning, i18n, resumableThemeTranslateResources, runWorkerTask, t, themeTranslateCheckpoint, themeTranslateResourcesById, translatableThemes]);
 
     const handleBatchTranslate = useCallback(() => startThemeBatchTranslate(false), [startThemeBatchTranslate]);
     const handleResumeTranslate = useCallback(() => startThemeBatchTranslate(true), [startThemeBatchTranslate]);
@@ -868,6 +938,21 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                         <SelectContent>
                             {sortOptions.map((opt) => (
                                 <SelectItem key={opt.key} value={opt.key}>{opt.label}</SelectItem>
+                            ))}
+                        </SelectContent>
+                    </Select>
+
+                    <Select value={batchTranslationVersion} onValueChange={setBatchTranslationVersion}>
+                        <SelectTrigger className="w-[130px] h-9 rounded-none border-muted-foreground/20 shadow-sm text-[13px]" size="default">
+                            <SelectValue placeholder={t('Manager.Sources.Filters.VersionAll')} />
+                        </SelectTrigger>
+                        <SelectContent>
+                            {translationVersionOptions.length === 0 ? (
+                                <SelectItem value={batchTranslationVersion || currentExtractionVersion}>
+                                    v{batchTranslationVersion || currentExtractionVersion}
+                                </SelectItem>
+                            ) : translationVersionOptions.map(version => (
+                                <SelectItem key={version} value={version}>v{version}</SelectItem>
                             ))}
                         </SelectContent>
                     </Select>

@@ -44,6 +44,7 @@ export interface PluginItemData {
     statusText: string;
     statusDesc: string;
     isLangDoc: boolean;
+    hasCurrentVersionTranslation?: boolean;
     langDoc: string;
     pluginDir: string;
     sources: any[];
