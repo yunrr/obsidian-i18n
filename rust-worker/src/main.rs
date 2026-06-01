@@ -1978,7 +1978,18 @@ async fn run_async_task(
     task_type: String,
     payload: Value,
 ) {
-    touch_progress(&task, json!({ "status": "running" })).await;
+    let progress_snapshot = task.progress.lock().await.clone();
+    touch_progress(
+        &task,
+        json!({
+            "status": "running",
+            "processedResources": payload.get("completedResources").and_then(Value::as_u64).unwrap_or(progress_snapshot.processed_resources as u64),
+            "totalResources": payload.get("totalResources").and_then(Value::as_u64).unwrap_or(progress_snapshot.total_resources as u64),
+            "processedItems": payload.get("processedItems").and_then(Value::as_u64).unwrap_or(progress_snapshot.processed_items as u64),
+            "totalItems": payload.get("totalItems").and_then(Value::as_u64).unwrap_or(progress_snapshot.total_items as u64),
+        }),
+    )
+    .await;
     let result = match task_type.as_str() {
         "plugin-batch-extract" => {
             handle_extract_batch(&state, task.clone(), payload, "plugin", "extract").await

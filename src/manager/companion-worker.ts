@@ -1771,7 +1771,13 @@ function createInitialProgress(type: CompanionAsyncTaskType, payload: any, taskI
 
 async function runAsyncTask(task: CompanionTaskRuntime, type: CompanionAsyncTaskType, payload: any) {
     try {
-        touchProgress(task, { status: 'running' });
+        touchProgress(task, {
+            status: 'running',
+            processedResources: Number(payload.completedResources || task.progress.processedResources || 0),
+            totalResources: Number(payload.totalResources || task.progress.totalResources || 0),
+            processedItems: Number(payload.processedItems || task.progress.processedItems || 0),
+            totalItems: Number(payload.totalItems || task.progress.totalItems || 0),
+        });
         if (type === 'plugin-batch-extract') await handlePluginBatchExtract(task, payload);
         else if (type === 'theme-batch-extract') await handleThemeBatchExtract(task, payload);
         else if (type === 'plugin-batch-translate') await handlePluginBatchTranslate(task, payload);

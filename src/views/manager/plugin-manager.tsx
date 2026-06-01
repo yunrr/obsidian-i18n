@@ -631,18 +631,18 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
     }, [handleRefresh, i18n]);
 
     const syncWorkerProgress = useCallback((progress: CompanionTaskProgress) => {
-        setBatchTask({
+        setBatchTask(prev => ({
             mode: progress.mode,
             isRunning: progress.status === 'queued' || progress.status === 'running',
             currentLabel: progress.currentLabel,
             processedResources: progress.processedResources,
-            totalResources: progress.totalResources,
+            totalResources: progress.totalResources || prev.totalResources,
             processedItems: progress.processedItems,
-            totalItems: progress.totalItems,
+            totalItems: progress.totalItems || prev.totalItems,
             successCount: progress.successCount,
             failedCount: progress.failedCount,
             skippedCount: progress.skippedCount,
-        });
+        }));
 
         const revisions = syncRevisionRef.current;
         const hasSourceRevisionChange = progress.sourceRevision !== revisions.sourceRevision;
@@ -665,7 +665,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
 
         let progress = started.progress;
         while (progress.status === 'queued' || progress.status === 'running') {
-            await new Promise(resolve => window.setTimeout(resolve, 150));
+            await new Promise(resolve => window.setTimeout(resolve, 80));
             const status = await i18n.companionWorkerManager.getTaskStatus(started.taskId);
             progress = status.progress;
             syncWorkerProgress(progress);
