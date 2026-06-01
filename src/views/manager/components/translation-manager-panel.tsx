@@ -45,7 +45,7 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
             for (let index = 0; index < missing.length && !cancelled; index += 8) {
                 const batch = missing.slice(index, index + 8);
                 batch.forEach(id => metadataIndexAttemptedRef.current.add(id));
-                sourceManager.batchIndexSourceMetadata(batch);
+                await sourceManager.batchIndexSourceMetadata(batch);
                 await new Promise(resolve => setTimeout(resolve, 25));
             }
         };

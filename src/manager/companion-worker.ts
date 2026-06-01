@@ -984,14 +984,52 @@ async function readTranslationFile<T>(paths: WorkerPersistencePaths, sourceId: s
     }
 }
 
-function getTranslationMetadataIndex(content: any): Pick<TranslationSource, 'translationVersion' | 'supportedVersions' | 'language' | 'metadataIndexedAt'> {
+function getTranslationMetadataIndex(content: any): Pick<TranslationSource, 'translationVersion' | 'supportedVersions' | 'language' | 'description' | 'totalTranslationCount' | 'pendingTranslationCount' | 'translationFormatValid' | 'metadataIndexedAt'> {
     const metadata = content?.metadata || {};
+    const sourceMatches = (item: any) => {
+        const source = String(item?.source || '').trim();
+        const target = String(item?.target || '').trim();
+        return target === '' || target === source;
+    };
+    let totalTranslationCount = 0;
+    let pendingTranslationCount = 0;
+    let translationFormatValid = !!(content && content.schemaVersion !== undefined && content.metadata && content.dict);
+
+    if (content?.dict && typeof content.dict === 'object') {
+        if (Array.isArray(content.dict)) {
+            totalTranslationCount = content.dict.length;
+            pendingTranslationCount = content.dict.filter(sourceMatches).length;
+        } else {
+            for (const group of Object.values(content.dict) as any[]) {
+                if (!Array.isArray(group?.ast) || !Array.isArray(group?.regex)) translationFormatValid = false;
+                const items = [...(Array.isArray(group?.ast) ? group.ast : []), ...(Array.isArray(group?.regex) ? group.regex : [])];
+                totalTranslationCount += items.length;
+                pendingTranslationCount += items.filter(sourceMatches).length;
+            }
+        }
+    } else {
+        translationFormatValid = false;
+    }
+
     return {
         translationVersion: metadata.version ? String(metadata.version) : '',
         supportedVersions: metadata.supportedVersions ? String(metadata.supportedVersions) : '',
         language: metadata.language ? String(metadata.language) : '',
+        description: metadata.description ? String(metadata.description) : '',
+        totalTranslationCount,
+        pendingTranslationCount,
+        translationFormatValid,
         metadataIndexedAt: Date.now(),
     };
+}
+
+async function getTranslationSourceFileMtime(paths: WorkerPersistencePaths, sourceId: string) {
+    try {
+        const stat = await fs.stat(path.join(paths.sourcesDir, `${sourceId}.json`));
+        return stat.mtimeMs;
+    } catch {
+        return Date.now();
+    }
 }
 
 async function hasExistingExtractedSource(paths: WorkerPersistencePaths, pluginId: string, type: 'plugin' | 'theme', translationVersion: string): Promise<boolean> {
@@ -1019,6 +1057,7 @@ async function saveExtractedSource(paths: WorkerPersistencePaths, pluginId: stri
         for (const source of Object.values(meta.sources)) {
             if (source.plugin === pluginId) source.isActive = false;
         }
+        await saveTranslationFile(paths, sourceId, content);
         const source: TranslationSource = {
             id: sourceId,
             plugin: pluginId,
@@ -1028,10 +1067,10 @@ async function saveExtractedSource(paths: WorkerPersistencePaths, pluginId: stri
             isActive: true,
             checksum: calculateChecksum(content),
             ...getTranslationMetadataIndex(content),
+            sourceFileMtime: await getTranslationSourceFileMtime(paths, sourceId),
             createdAt: now,
             updatedAt: now,
         };
-        await saveTranslationFile(paths, sourceId, content);
         meta.sources[sourceId] = source;
         await saveMeta(paths, meta);
     });
@@ -1050,6 +1089,7 @@ async function saveTranslatedSource(paths: WorkerPersistencePaths, sourceId: str
                 cloud: undefined,
                 checksum: calculateChecksum(content),
                 ...getTranslationMetadataIndex(content),
+                sourceFileMtime: await getTranslationSourceFileMtime(paths, sourceId),
                 updatedAt: Date.now(),
             };
             await saveMeta(paths, meta);

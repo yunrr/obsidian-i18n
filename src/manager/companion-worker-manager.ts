@@ -189,6 +189,10 @@ export class CompanionWorkerManager {
         return this.runTask<CompanionSourceManagerResponse>('source-set-active', request);
     }
 
+    public async indexSources(request: CompanionSourceManagerRequest): Promise<CompanionSourceManagerResponse> {
+        return this.runTask<CompanionSourceManagerResponse>('source-index', request);
+    }
+
     public async runCloudTask(type: CompanionCloudTaskType, payload: unknown): Promise<CompanionCloudResponse> {
         return this.runTask<CompanionCloudResponse>(type, payload);
     }

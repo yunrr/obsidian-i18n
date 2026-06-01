@@ -7,10 +7,8 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 import { Search, LayoutGrid, List, FileOutput, Languages, Loader2, RotateCcw, Square, AlertTriangle } from 'lucide-react';
 
 import I18N from 'src/main';
-import { PluginTranslationV1, BatchTaskFailureRecord } from 'src/types';
+import { BatchTaskFailureRecord } from 'src/types';
 import { formatTimestamp } from '../../utils/data/format';
-import { isValidPluginTranslationV1Format } from '../../utils/data/validation';
-import { loadTranslationFile } from '../../manager/io-manager';
 import { useGlobalStoreInstance } from '~/utils/store/global';
 import { normalizeOpenAIUrl } from '~/utils/ai/url-helper';
 import { LLM_PROVIDERS } from '~/ai/constants';
@@ -230,7 +228,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             for (let index = 0; index < missing.length && !cancelled; index += 8) {
                 const batch = missing.slice(index, index + 8);
                 batch.forEach(sourceId => metadataIndexAttemptedRef.current.add(sourceId));
-                i18n.sourceManager.batchIndexSourceMetadata(batch);
+                await i18n.sourceManager.batchIndexSourceMetadata(batch);
                 await new Promise(resolve => window.setTimeout(resolve, 25));
             }
         };
@@ -332,28 +330,6 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         return grouped;
     }, [cloudManifest]);
 
-    const countPendingTranslationItems = useCallback((json: PluginTranslationV1) => {
-        if (!json?.dict) return 0;
-
-        let count = 0;
-        for (const fileData of Object.values(json.dict)) {
-            count += fileData.ast.filter(item => shouldTranslateText(item.target, item.source)).length;
-            count += fileData.regex.filter(item => shouldTranslateText(item.target, item.source)).length;
-        }
-        return count;
-    }, []);
-
-    const countTranslationItems = useCallback((json: PluginTranslationV1) => {
-        if (!json?.dict) return 0;
-
-        let count = 0;
-        for (const fileData of Object.values(json.dict)) {
-            count += fileData.ast.length;
-            count += fileData.regex.length;
-        }
-        return count;
-    }, []);
-
     const pluginFailureRecords = useMemo(() => {
         return i18n.sourceManager.getBatchTaskFailures('plugin');
     }, [i18n, sourceTick]);
@@ -361,11 +337,6 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
     const failedSourceIds = useMemo(() => {
         return new Set(pluginFailureRecords.map(record => record.sourceId));
     }, [pluginFailureRecords]);
-
-    const checkIsTranslated = useCallback((json: PluginTranslationV1, sourceId: string | null) => {
-        if (!json.dict || !sourceId || failedSourceIds.has(sourceId)) return false;
-        return countPendingTranslationItems(json) === 0;
-    }, [countPendingTranslationItems, failedSourceIds]);
 
     const allPluginStates = useMemo(() => {
         const stats: Record<string, PluginItemData> = {};
@@ -385,24 +356,11 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             const state = i18n.stateManager.getPluginState(plugin.id);
             const hasFailedBatches = !!activeSourceId && failedSourceIds.has(activeSourceId);
 
-            let localJson: PluginTranslationV1 | undefined;
-            let translationFormatMark = true;
-            let isTranslated = false;
-            let pendingTranslationCount = 0;
-            let totalTranslationCount = 0;
-            if (isLangDoc) {
-                try {
-                    localJson = loadTranslationFile(langDoc);
-                    translationFormatMark = isValidPluginTranslationV1Format(localJson);
-                    if (translationFormatMark && localJson) {
-                        pendingTranslationCount = countPendingTranslationItems(localJson);
-                        totalTranslationCount = countTranslationItems(localJson);
-                        isTranslated = checkIsTranslated(localJson, activeSourceId);
-                    }
-                } catch (e) {
-                    translationFormatMark = false;
-                }
-            }
+            const activeSource = activeSourceId ? i18n.sourceManager.getSource(activeSourceId) : null;
+            const translationFormatMark = isLangDoc ? activeSource?.translationFormatValid !== false : true;
+            const pendingTranslationCount = activeSource?.pendingTranslationCount || 0;
+            const totalTranslationCount = activeSource?.totalTranslationCount || 0;
+            const isTranslated = !!(isLangDoc && activeSourceId && translationFormatMark && !failedSourceIds.has(activeSourceId) && pendingTranslationCount === 0);
 
             let statusColor: string = 'bg-muted-foreground';
             let statusText: string = t('Manager.Plugins.Status.ToExtract');
@@ -411,10 +369,10 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             let translationVersion = '';
             let supportedVersion = '';
 
-            if (localJson && translationFormatMark) {
-                translationVersion = localJson.metadata.version;
-                supportedVersion = localJson.metadata.supportedVersions;
-                mtime = isLangDoc ? fs.statSync(langDoc).mtimeMs : Date.now();
+            if (isLangDoc && translationFormatMark && activeSource) {
+                translationVersion = activeSource.translationVersion || '';
+                supportedVersion = activeSource.supportedVersions || '';
+                mtime = activeSource.sourceFileMtime || (isLangDoc ? fs.statSync(langDoc).mtimeMs : Date.now());
 
                 const isApplied = !!(state && state.isApplied);
 
@@ -463,7 +421,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             };
         }
         return stats;
-    }, [plugins, i18n, refreshKey, sourceIndex, t, checkIsTranslated, countPendingTranslationItems, countTranslationItems, cloudEntriesByPlugin, failedSourceIds, currentExtractionVersion]);
+    }, [plugins, i18n, refreshKey, sourceIndex, t, cloudEntriesByPlugin, failedSourceIds, currentExtractionVersion]);
 
     const displayPlugins = useMemo(() => {
         let result = [...plugins];
@@ -513,19 +471,13 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
 
     const getPluginTranslationCounts = useCallback((sourceId?: string | null) => {
         if (!sourceId) return null;
-        const filePath = i18n.sourceManager.getSourceFilePath(sourceId);
-        if (!fs.existsSync(filePath)) return null;
-        try {
-            const json = loadTranslationFile(filePath) as PluginTranslationV1;
-            if (!isValidPluginTranslationV1Format(json)) return null;
-            return {
-                pendingTranslationCount: countPendingTranslationItems(json),
-                totalTranslationCount: countTranslationItems(json),
-            };
-        } catch {
-            return null;
-        }
-    }, [countPendingTranslationItems, countTranslationItems, i18n.sourceManager]);
+        const source = i18n.sourceManager.getSource(sourceId);
+        if (!source || source.translationFormatValid === false) return null;
+        return {
+            pendingTranslationCount: source.pendingTranslationCount || 0,
+            totalTranslationCount: source.totalTranslationCount || 0,
+        };
+    }, [i18n.sourceManager]);
 
     const pluginTranslateResourcesById = useMemo(() => {
         const resources = new Map<string, PluginBatchResource>();

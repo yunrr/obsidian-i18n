@@ -208,7 +208,8 @@ const ReactThemeEditor: React.FC = () => {
                                 source.origin = 'local';
                                 source.cloud = undefined;
                             }
-                            i18n.sourceManager.saveSource(source);
+                            i18n.sourceManager.saveSource(source, { skipFileIndex: true });
+                            void i18n.sourceManager.batchIndexSourceMetadata([source.id]);
                         }
                     } catch (err) {
                         console.error("Failed to update meta.json", err);

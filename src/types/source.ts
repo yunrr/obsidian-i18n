@@ -20,6 +20,11 @@ export interface TranslationSource {
     translationVersion?: string;   // 本地索引：译文版本 metadata.version
     supportedVersions?: string;    // 本地索引：兼容版本 metadata.supportedVersions
     language?: string;             // 本地索引：语言 metadata.language
+    description?: string;          // 本地索引：metadata.description
+    totalTranslationCount?: number; // 本地索引：总翻译条目数
+    pendingTranslationCount?: number; // 本地索引：待翻译条目数
+    translationFormatValid?: boolean; // 本地索引：译文格式是否有效
+    sourceFileMtime?: number;      // 本地索引：翻译文件更新时间
     metadataIndexedAt?: number;    // 本地索引更新时间
 
     // 云端元数据

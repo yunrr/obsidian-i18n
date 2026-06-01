@@ -7,9 +7,8 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 import { Search, LayoutGrid, List, FileOutput, Languages, Loader2, RotateCcw, Square, AlertTriangle } from 'lucide-react';
 
 import I18N from 'src/main';
-import { OBThemeManifest, ThemeTranslationV1, BatchTaskFailureRecord } from 'src/types';
+import { OBThemeManifest, BatchTaskFailureRecord } from 'src/types';
 import { useGlobalStoreInstance } from '~/utils/store/global';
-import { loadTranslationFile } from '../../manager/io-manager';
 import { normalizeOpenAIUrl } from '~/utils/ai/url-helper';
 import { LLM_PROVIDERS } from '~/ai/constants';
 import {
@@ -239,7 +238,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             for (let index = 0; index < missing.length && !cancelled; index += 8) {
                 const batch = missing.slice(index, index + 8);
                 batch.forEach(sourceId => metadataIndexAttemptedRef.current.add(sourceId));
-                i18n.sourceManager.batchIndexSourceMetadata(batch);
+                await i18n.sourceManager.batchIndexSourceMetadata(batch);
                 await new Promise(resolve => window.setTimeout(resolve, 25));
             }
         };
@@ -406,15 +405,6 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
         return grouped;
     }, [cloudManifest]);
 
-    const countPendingTranslationItems = useCallback((json: ThemeTranslationV1) => {
-        if (!json?.dict) return 0;
-        return json.dict.filter(item => shouldTranslateText(item.target, item.source)).length;
-    }, []);
-
-    const countTranslationItems = useCallback((json: ThemeTranslationV1) => {
-        return json?.dict?.length || 0;
-    }, []);
-
     const themeFailureRecords = useMemo(() => {
         return i18n.sourceManager.getBatchTaskFailures('theme');
     }, [i18n, sourceTick]);
@@ -422,11 +412,6 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
     const failedSourceIds = useMemo(() => {
         return new Set(themeFailureRecords.map(record => record.sourceId));
     }, [themeFailureRecords]);
-
-    const checkIsTranslated = useCallback((json: ThemeTranslationV1, sourceId: string | null) => {
-        if (!json.dict || !sourceId || failedSourceIds.has(sourceId)) return false;
-        return countPendingTranslationItems(json) === 0;
-    }, [countPendingTranslationItems, failedSourceIds]);
 
     const allThemeStates = useMemo(() => {
         const stats: Record<string, ThemeItemData> = {};
@@ -441,26 +426,13 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             const hasCurrentVersionTranslation = i18n.sourceManager.hasSourceForPluginVersion(theme.name, 'theme', currentExtractionVersion);
             const state = i18n.stateManager.getThemeState(theme.name);
 
-            let isTranslated = false;
-            let pendingTranslationCount = 0;
-            let totalTranslationCount = 0;
-            let translationVersion = '';
-            let supportedVersion = '';
-            let description = '';
-
-            if (hasTranslation && translationPath) {
-                try {
-                    const localJson = loadTranslationFile(translationPath) as ThemeTranslationV1;
-                    pendingTranslationCount = countPendingTranslationItems(localJson);
-                    totalTranslationCount = countTranslationItems(localJson);
-                    isTranslated = checkIsTranslated(localJson, activeSourceId);
-                    translationVersion = localJson.metadata.version;
-                    supportedVersion = localJson.metadata.supportedVersions;
-                    description = localJson.metadata.description;
-                } catch (e) {
-                    // ignore invalid translation
-                }
-            }
+            const activeSource = activeSourceId ? i18n.sourceManager.getSource(activeSourceId) : null;
+            const pendingTranslationCount = activeSource?.pendingTranslationCount || 0;
+            const totalTranslationCount = activeSource?.totalTranslationCount || 0;
+            const isTranslated = !!(hasTranslation && activeSourceId && activeSource?.translationFormatValid !== false && !failedSourceIds.has(activeSourceId) && pendingTranslationCount === 0);
+            const translationVersion = activeSource?.translationVersion || '';
+            const supportedVersion = activeSource?.supportedVersions || '';
+            const description = activeSource?.description || '';
 
             let statusColor: string = 'bg-muted-foreground';
             let statusText: string = t('Manager.Themes.Status.ToExtract');
@@ -509,7 +481,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
         }
 
         return stats;
-    }, [themes, i18n, refreshKey, sourceIndex, t, checkIsTranslated, countPendingTranslationItems, countTranslationItems, cloudEntriesByTheme, failedSourceIds, currentExtractionVersion]);
+    }, [themes, i18n, refreshKey, sourceIndex, t, cloudEntriesByTheme, failedSourceIds, currentExtractionVersion]);
 
     const displayThemes = useMemo(() => {
         let result = [...themes];
@@ -557,18 +529,13 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
 
     const getThemeTranslationCounts = useCallback((sourceId?: string | null) => {
         if (!sourceId) return null;
-        const filePath = i18n.sourceManager.getSourceFilePath(sourceId);
-        if (!fs.existsSync(filePath)) return null;
-        try {
-            const json = loadTranslationFile(filePath) as ThemeTranslationV1;
-            return {
-                pendingTranslationCount: countPendingTranslationItems(json),
-                totalTranslationCount: countTranslationItems(json),
-            };
-        } catch {
-            return null;
-        }
-    }, [countPendingTranslationItems, countTranslationItems, i18n.sourceManager]);
+        const source = i18n.sourceManager.getSource(sourceId);
+        if (!source || source.translationFormatValid === false) return null;
+        return {
+            pendingTranslationCount: source.pendingTranslationCount || 0,
+            totalTranslationCount: source.totalTranslationCount || 0,
+        };
+    }, [i18n.sourceManager]);
 
     const themeTranslateResourcesById = useMemo(() => {
         const resources = new Map<string, ThemeBatchResource>();

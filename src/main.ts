@@ -230,6 +230,7 @@ export default class I18N extends Plugin {
         // @ts-ignore
         const i18nPluginDir = path.join(path.normalize(this.app.vault.adapter.getBasePath()), this.manifest.dir);
         this.sourceManager = new SourceManager(i18nPluginDir);
+        this.sourceManager.setI18n(this);
 
         // [管理器] 注入管理器
         this.injectorManager = new InjectorManager(this);

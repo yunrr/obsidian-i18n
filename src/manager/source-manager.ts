@@ -10,6 +10,7 @@ import { nanoid } from 'nanoid';
 import { useGlobalStoreInstance } from '~/utils/store/global';
 import { t } from '../locales'; // Correct import path
 import { loadTranslationFile, saveTranslationFile, TRANSLATION_FILE_EXTENSION } from './io-manager';
+import type I18N from '../main';
 
 export class SourceManager {
     private basePath: string;           // i18n插件目录
@@ -18,6 +19,7 @@ export class SourceManager {
     private checkpointPath: string;     // backup-checkpoint.json路径
     private batchTaskRecordPath: string;
     private meta: TranslationSourceMeta;
+    private i18n?: I18N;
 
     constructor(i18nPluginDir: string) {
         this.basePath = i18nPluginDir;
@@ -26,6 +28,10 @@ export class SourceManager {
         this.checkpointPath = path.join(i18nPluginDir, 'backup-checkpoint.json');
         this.batchTaskRecordPath = path.join(i18nPluginDir, 'batch-task-records.json');
         this.meta = this.loadMeta();
+    }
+
+    public setI18n(i18n: I18N): void {
+        this.i18n = i18n;
     }
 
     // ========== 元数据管理 ========== 
@@ -88,14 +94,52 @@ export class SourceManager {
         }
     }
 
-    private getMetadataIndex(content: any): Pick<TranslationSource, 'translationVersion' | 'supportedVersions' | 'language' | 'metadataIndexedAt'> {
+    private getMetadataIndex(content: any): Pick<TranslationSource, 'translationVersion' | 'supportedVersions' | 'language' | 'description' | 'totalTranslationCount' | 'pendingTranslationCount' | 'translationFormatValid' | 'metadataIndexedAt'> {
         const metadata = content?.metadata || {};
+        const sourceMatches = (item: any) => {
+            const source = String(item?.source || '').trim();
+            const target = String(item?.target || '').trim();
+            return target === '' || target === source;
+        };
+        let totalTranslationCount = 0;
+        let pendingTranslationCount = 0;
+        let translationFormatValid = !!(content && content.schemaVersion !== undefined && content.metadata && content.dict);
+
+        if (content?.dict && typeof content.dict === 'object') {
+            if (Array.isArray(content.dict)) {
+                totalTranslationCount = content.dict.length;
+                pendingTranslationCount = content.dict.filter(sourceMatches).length;
+            } else {
+                for (const group of Object.values(content.dict) as any[]) {
+                    if (!Array.isArray(group?.ast) || !Array.isArray(group?.regex)) translationFormatValid = false;
+                    const items = [...(Array.isArray(group?.ast) ? group.ast : []), ...(Array.isArray(group?.regex) ? group.regex : [])];
+                    totalTranslationCount += items.length;
+                    pendingTranslationCount += items.filter(sourceMatches).length;
+                }
+            }
+        } else {
+            translationFormatValid = false;
+        }
+
         return {
             translationVersion: metadata.version ? String(metadata.version) : '',
             supportedVersions: metadata.supportedVersions ? String(metadata.supportedVersions) : '',
             language: metadata.language ? String(metadata.language) : '',
+            description: metadata.description ? String(metadata.description) : '',
+            totalTranslationCount,
+            pendingTranslationCount,
+            translationFormatValid,
             metadataIndexedAt: Date.now(),
         };
+    }
+
+    private getSourceFileMtime(sourceId: string): number {
+        try {
+            const filePath = this.getSourceFilePath(sourceId);
+            return fs.existsSync(filePath) ? fs.statSync(filePath).mtimeMs : 0;
+        } catch {
+            return 0;
+        }
     }
 
     private loadBatchTaskRecord(): BatchTaskRecordMeta {
@@ -183,7 +227,13 @@ export class SourceManager {
 
     getMissingMetadataIndexSourceIds(type?: TranslationSource['type']): string[] {
         return Object.values(this.meta.sources)
-            .filter(source => (!type || source.type === type) && !source.metadataIndexedAt)
+            .filter(source => {
+                if (type && source.type !== type) return false;
+                if (!source.metadataIndexedAt) return true;
+                if (source.totalTranslationCount === undefined || source.pendingTranslationCount === undefined || source.translationFormatValid === undefined) return true;
+                const mtime = this.getSourceFileMtime(source.id);
+                return !!mtime && (!source.sourceFileMtime || Math.abs(source.sourceFileMtime - mtime) > 1);
+            })
             .map(source => source.id);
     }
 
@@ -288,10 +338,12 @@ export class SourceManager {
     /**
      * 添加/更新翻译源
      */
-    saveSource(source: TranslationSource, options?: { activate?: boolean }): void {
-        const content = this.readSourceFile(source.id);
-        if (content?.metadata) {
-            source = { ...source, ...this.getMetadataIndex(content) };
+    saveSource(source: TranslationSource, options?: { activate?: boolean; skipFileIndex?: boolean }): void {
+        if (!options?.skipFileIndex) {
+            const content = this.readSourceFile(source.id);
+            if (content?.metadata) {
+                source = { ...source, ...this.getMetadataIndex(content), sourceFileMtime: this.getSourceFileMtime(source.id) };
+            }
         }
         this.upsertSourceInMemory(source);
         if (options?.activate) {
@@ -463,7 +515,17 @@ export class SourceManager {
         return true;
     }
 
-    batchIndexSourceMetadata(sourceIds: string[]): number {
+    async batchIndexSourceMetadata(sourceIds: string[]): Promise<number> {
+        if (sourceIds.length === 0) return 0;
+        if (this.i18n?.companionWorkerManager) {
+            const result = await this.i18n.companionWorkerManager.indexSources({
+                persistence: { basePath: this.basePath },
+                sourceIds,
+            });
+            this.reloadFromDisk();
+            return result.updatedCount || 0;
+        }
+
         let count = 0;
         for (const sourceId of sourceIds) {
             const source = this.meta.sources[sourceId];
@@ -473,6 +535,7 @@ export class SourceManager {
             this.meta.sources[sourceId] = {
                 ...source,
                 ...this.getMetadataIndex(content),
+                sourceFileMtime: this.getSourceFileMtime(sourceId),
             };
             count++;
         }

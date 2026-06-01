@@ -3651,7 +3651,7 @@ async fn handle_sync_task(_state: &AppState, task_type: &str, payload: Value) ->
         "code-extract" => handle_code_extract(payload).await,
         "plugin-apply-translation" => handle_plugin_apply_translation(payload).await,
         "theme-apply-translation" => handle_theme_apply_translation(payload).await,
-        "source-export" | "source-import" | "source-remove" | "source-set-active" => handle_source_manager_task(task_type, payload).await,
+        "source-export" | "source-import" | "source-remove" | "source-set-active" | "source-index" => handle_source_manager_task(task_type, payload).await,
         "plugin-extract" => Ok(serde_json::to_value(handle_plugin_extract(payload).await?)?),
         "theme-extract" => Ok(serde_json::to_value(handle_theme_extract(payload).await?)?),
         "plugin-translate" => {
@@ -3729,6 +3729,7 @@ async fn handle_source_manager_task(operation: &str, payload: Value) -> Result<V
             "source-import" => source_import_blocking(payload)?,
             "source-remove" => source_remove_blocking(payload)?,
             "source-set-active" => source_set_active_blocking(payload)?,
+            "source-index" => source_index_blocking(payload)?,
             _ => bail!("未知源管理操作: {operation}"),
         };
         Ok(serde_json::to_value(result)?)
@@ -4314,6 +4315,7 @@ fn source_import_blocking(payload: SourceManagerPayload) -> Result<SourceImportE
             source["updatedAt"] = json!(now);
             merge_metadata_index(&mut source, &content);
             save_translation(&paths, &source_id, &content)?;
+            merge_source_file_mtime(&mut source, &paths, &source_id);
             sources.insert(source_id, source);
         }
     }
@@ -4435,10 +4437,51 @@ fn save_translation(paths: &PersistencePaths, source_id: &str, content: &Value) 
 }
 
 fn metadata_index(content: &Value) -> Value {
+    let source_matches = |item: &Value| {
+        let source = item.get("source").and_then(Value::as_str).unwrap_or_default().trim();
+        let target = item.get("target").and_then(Value::as_str).unwrap_or_default().trim();
+        target.is_empty() || target == source
+    };
+
+    let (format_valid, total_count, pending_count) = if let Some(dict) = content.get("dict") {
+        if let Some(plugin_dict) = dict.as_object() {
+            let mut total = 0u64;
+            let mut pending = 0u64;
+            let mut valid = content.get("schemaVersion").is_some() && content.get("metadata").is_some();
+            for group in plugin_dict.values() {
+                let ast = group.get("ast").and_then(Value::as_array);
+                let regex = group.get("regex").and_then(Value::as_array);
+                if ast.is_none() || regex.is_none() {
+                    valid = false;
+                }
+                for item in ast.into_iter().flatten().chain(regex.into_iter().flatten()) {
+                    total += 1;
+                    if source_matches(item) {
+                        pending += 1;
+                    }
+                }
+            }
+            (valid, total, pending)
+        } else if let Some(theme_items) = dict.as_array() {
+            let total = theme_items.len() as u64;
+            let pending = theme_items.iter().filter(|item| source_matches(item)).count() as u64;
+            let valid = content.get("schemaVersion").is_some() && content.get("metadata").is_some();
+            (valid, total, pending)
+        } else {
+            (false, 0, 0)
+        }
+    } else {
+        (false, 0, 0)
+    };
+
     json!({
         "translationVersion": content.pointer("/metadata/version").and_then(Value::as_str).unwrap_or_default(),
         "supportedVersions": content.pointer("/metadata/supportedVersions").and_then(Value::as_str).unwrap_or_default(),
         "language": content.pointer("/metadata/language").and_then(Value::as_str).unwrap_or_default(),
+        "description": content.pointer("/metadata/description").and_then(Value::as_str).unwrap_or_default(),
+        "totalTranslationCount": total_count,
+        "pendingTranslationCount": pending_count,
+        "translationFormatValid": format_valid,
         "metadataIndexedAt": now_ms(),
     })
 }
@@ -4450,6 +4493,70 @@ fn merge_metadata_index(source: &mut Value, content: &Value) {
             source[key] = value.clone();
         }
     }
+}
+
+fn merge_source_file_mtime(source: &mut Value, paths: &PersistencePaths, source_id: &str) {
+    let file_path = paths.sources_dir.join(format!("{source_id}.json"));
+    let source_file_mtime = fs::metadata(file_path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_else(now_ms);
+    source["sourceFileMtime"] = json!(source_file_mtime);
+}
+
+fn source_index_blocking(payload: SourceManagerPayload) -> Result<SourceImportExportResponse> {
+    let paths = paths(&payload.persistence.base_path);
+    let mut meta = load_meta(&paths);
+    let mut updated_count = 0usize;
+    let mut skipped_count = 0usize;
+
+    if let Some(sources) = meta.get_mut("sources").and_then(Value::as_object_mut) {
+        let source_ids: Vec<String> = if payload.source_ids.is_empty() {
+            sources.keys().cloned().collect()
+        } else {
+            payload.source_ids
+        };
+
+        for source_id in source_ids {
+            let Some(source) = sources.get_mut(&source_id) else {
+                skipped_count += 1;
+                continue;
+            };
+            let file_path = paths.sources_dir.join(format!("{source_id}.json"));
+            let Ok(metadata) = fs::metadata(&file_path) else {
+                skipped_count += 1;
+                continue;
+            };
+            let source_file_mtime = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or_else(now_ms);
+            let Some(content) = read_translation(&paths, &source_id) else {
+                skipped_count += 1;
+                continue;
+            };
+            merge_metadata_index(source, &content);
+            source["sourceFileMtime"] = json!(source_file_mtime);
+            updated_count += 1;
+        }
+    }
+
+    if updated_count > 0 {
+        write_json_pretty(&paths.meta_path, &meta)?;
+    }
+
+    Ok(SourceImportExportResponse {
+        state: true,
+        content_base64: None,
+        added_count: 0,
+        updated_count,
+        skipped_count,
+        deleted_count: 0,
+    })
 }
 
 async fn save_translated_source(
@@ -4470,9 +4577,10 @@ async fn save_translated_source(
                     .get("title")
                     .cloned()
                     .unwrap_or(Value::String(String::new()))
-            });
+        });
         source["origin"] = json!("local");
         merge_metadata_index(source, content);
+        merge_source_file_mtime(source, paths, source_id);
         if let Some(obj) = source.as_object_mut() {
             obj.remove("cloud");
             obj.insert(
@@ -4526,13 +4634,11 @@ async fn save_extracted_source(
             "createdAt": now_ms(),
             "updatedAt": now_ms(),
         });
+        save_translation(paths, &source_id, content)?;
         merge_metadata_index(&mut source, content);
-        sources.insert(
-            source_id.clone(),
-            source,
-        );
+        merge_source_file_mtime(&mut source, paths, &source_id);
+        sources.insert(source_id.clone(), source);
     }
-    save_translation(paths, &source_id, content)?;
     write_json_pretty(&paths.meta_path, &meta)?;
     Ok(())
 }
