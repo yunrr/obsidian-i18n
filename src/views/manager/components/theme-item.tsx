@@ -10,6 +10,7 @@ import { getThemeTranslationSources, hasExtractedTranslationContent, calculateCh
 import { loadTranslationFile } from '../../../manager/io-manager';
 import { useGlobalStoreInstance } from '~/utils/store/global';
 import { THEME_EDITOR_VIEW_TYPE } from '../../theme_editor/editor';
+import { getEffectiveExtractionSettings } from '../../../utils/translator/config';
 import {
     Button,
     Select,
@@ -178,27 +179,14 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
                 return;
             }
 
+            const extractionSettings = getEffectiveExtractionSettings(i18n.settings);
             const result = await i18n.companionWorkerManager.runTask<any>('theme-extract', {
                 resourceId: theme.name,
                 label: theme.name,
                 themeName: theme.name,
                 themeDir,
                 themeCssPath,
-                settings: {
-                    author: i18n.settings.author,
-                    reFlags: i18n.settings.reFlags,
-                    reLength: i18n.settings.reLength,
-                    reDatas: i18n.settings.reDatas,
-                    reRejectRe: i18n.settings.reRejectRe,
-                    reValidRe: i18n.settings.reValidRe,
-                    chineseSkipMode: i18n.settings.chineseSkipMode || 'source',
-                    astAssignments: i18n.settings.astAssignments,
-                    astFunctions: i18n.settings.astFunctions,
-                    astKeys: i18n.settings.astKeys,
-                    astMaxLength: i18n.settings.astMaxLength ?? 300,
-                    astRejectRe: i18n.settings.astRejectRe,
-                    astValidRe: i18n.settings.astValidRe,
-                },
+                settings: extractionSettings,
             });
             if (result.status === 'skipped') {
                 i18n.notice.result(false, result.reason === 'chinese' ? '检测到主题已包含中文内容，已跳过提取' : '未提取到可翻译内容，已跳过提取');
@@ -211,7 +199,7 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
             const themeTranslation = result.content;
             const extractedSources = getThemeTranslationSources(themeTranslation);
 
-            if (!hasExtractedTranslationContent(extractedSources)) {
+            if ((extractionSettings.astExtractionEnabled || extractionSettings.reExtractionEnabled) && !hasExtractedTranslationContent(extractedSources)) {
                 i18n.notice.result(false, '未提取到可翻译内容，已跳过提取');
                 return;
             }

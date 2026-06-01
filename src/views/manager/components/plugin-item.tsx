@@ -11,6 +11,7 @@ import { getPluginTranslationSources, hasExtractedTranslationContent, calculateC
 import { loadTranslationFile } from '../../../manager/io-manager';
 import { useGlobalStoreInstance } from '~/utils/store/global';
 import { EDITOR_VIEW_TYPE } from '../../../views';
+import { getEffectiveExtractionSettings } from '../../../utils/translator/config';
 import {
     Button,
     Select,
@@ -194,6 +195,7 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
                 i18n.notice.error(t('Manager.Plugins.Errors.MainNotFound'));
                 return;
             }
+            const extractionSettings = getEffectiveExtractionSettings(i18n.settings);
             const result = await i18n.companionWorkerManager.runTask<any>('plugin-extract', {
                 resourceId: plugin.id,
                 label: plugin.name,
@@ -202,21 +204,7 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
                 mainDoc,
                 manifestDoc,
                 language: settings.language,
-                settings: {
-                    author: i18n.settings.author,
-                    reFlags: i18n.settings.reFlags,
-                    reLength: i18n.settings.reLength,
-                    reDatas: i18n.settings.reDatas,
-                    reRejectRe: i18n.settings.reRejectRe,
-                    reValidRe: i18n.settings.reValidRe,
-                    chineseSkipMode: i18n.settings.chineseSkipMode || 'source',
-                    astAssignments: i18n.settings.astAssignments,
-                    astFunctions: i18n.settings.astFunctions,
-                    astKeys: i18n.settings.astKeys,
-                    astMaxLength: i18n.settings.astMaxLength ?? 300,
-                    astRejectRe: i18n.settings.astRejectRe,
-                    astValidRe: i18n.settings.astValidRe,
-                },
+                settings: extractionSettings,
             });
 
             if (result.status === 'skipped') {
@@ -229,7 +217,7 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
 
             const translationJson = result.content;
             const extractedSources = getPluginTranslationSources(translationJson);
-            if (!hasExtractedTranslationContent(extractedSources)) {
+            if ((extractionSettings.astExtractionEnabled || extractionSettings.reExtractionEnabled) && !hasExtractedTranslationContent(extractedSources)) {
                 i18n.notice.result(false, '未提取到可翻译内容，已跳过提取');
                 return;
             }

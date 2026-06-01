@@ -22,6 +22,7 @@ import {
     generateRegexSystemPrompt,
     generateThemeSystemPrompt,
 } from '~/ai/prompts';
+import { getEffectiveExtractionSettings } from '~/utils/translator/config';
 import type {
     CompanionExtractionSettings,
     CompanionPluginBatchExtractPayload,
@@ -131,21 +132,7 @@ const getCompanionTranslationConfig = (settings: I18N['settings']): CompanionTra
     };
 };
 
-const getCompanionExtractionSettings = (settings: I18N['settings']): CompanionExtractionSettings => ({
-    author: settings.author,
-    reFlags: settings.reFlags,
-    reLength: settings.reLength,
-    reDatas: settings.reDatas,
-    reRejectRe: settings.reRejectRe,
-    reValidRe: settings.reValidRe,
-    chineseSkipMode: settings.chineseSkipMode || 'source',
-    astAssignments: settings.astAssignments,
-    astFunctions: settings.astFunctions,
-    astKeys: settings.astKeys,
-    astMaxLength: settings.astMaxLength ?? 300,
-    astRejectRe: settings.astRejectRe,
-    astValidRe: settings.astValidRe,
-});
+const getCompanionExtractionSettings = (settings: I18N['settings']): CompanionExtractionSettings => getEffectiveExtractionSettings(settings);
 
 const formatFailureTime = (failedAt: number) => failedAt ? new Date(failedAt).toLocaleString() : '';
 

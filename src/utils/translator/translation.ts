@@ -24,6 +24,7 @@ import type { PluginManifest } from 'obsidian';
 import { OBThemeManifest, ThemeTranslationV1, ThemeTranslationSchemaVersion, PluginTranslationV1, PluginTranslationSchemaVersion } from '../../types';
 import { AstTranslator } from './core-ast-translator';
 import { RegexTranslator } from './core-regex-translator';
+import { getEffectiveExtractionSettings } from './config';
 export {
     calculateChecksum,
     countChineseTranslationSources,
@@ -48,16 +49,17 @@ export {
  * @returns 一个包含翻译信息的 Translation 对象。
  */
 export function generatePlugin(pluginVersion: string, manifestJSON: PluginManifest, mainStr: string, language: string, settings: any): PluginTranslationV1 {
+    const effectiveSettings = getEffectiveExtractionSettings(settings);
     const translationJson: PluginTranslationV1 = {
         schemaVersion: PluginTranslationSchemaVersion.V1,
         metadata: {
             plugin: manifestJSON.id,
-            version: '1.0.1',
+            version: effectiveSettings.translationVersion,
             title: manifestJSON.name,
             description: `${manifestJSON.name} Localization & Tweaks`,
             language: language,
             supportedVersions: pluginVersion,
-            author: settings.author || '',
+            author: effectiveSettings.author,
         },
         dict: {
             'main.js': {
@@ -66,11 +68,11 @@ export function generatePlugin(pluginVersion: string, manifestJSON: PluginManife
             }
         }
     };
-    const astTranslator = new AstTranslator(settings);
+    const astTranslator = new AstTranslator(effectiveSettings as any);
     const ast = astTranslator.loadCode(mainStr);
     if (ast) translationJson.dict['main.js'].ast = astTranslator.extract(ast);
 
-    const regexTranslator = new RegexTranslator(settings);
+    const regexTranslator = new RegexTranslator(effectiveSettings as any);
     const regex = regexTranslator.loadCode(mainStr);
     if (regex) translationJson.dict['main.js'].regex = regex;
 
@@ -84,16 +86,17 @@ export function generatePlugin(pluginVersion: string, manifestJSON: PluginManife
  * @returns 一个包含翻译信息的 Theme 对象。
  */
 export function generateTheme(themeManifest: OBThemeManifest, themeStr: string, settings: any): ThemeTranslationV1 {
+    const effectiveSettings = getEffectiveExtractionSettings(settings);
     const themeJson: ThemeTranslationV1 = {
         schemaVersion: ThemeTranslationSchemaVersion.V1,
         metadata: {
             theme: themeManifest.name,
             language: 'zh-cn', // 默认语言
-            version: '1.0.1',
+            version: effectiveSettings.translationVersion,
             supportedVersions: themeManifest.version,
             title: themeManifest.name,
             description: `${themeManifest.name} Localization & Tweaks`,
-            author: settings.author || '',
+            author: effectiveSettings.author,
         },
         dict: []
     };

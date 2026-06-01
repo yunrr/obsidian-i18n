@@ -217,6 +217,8 @@ export default {
             Import: "导入",
             BatchDelete: "删除",
             SelectUninstalled: "异常项",
+            SelectCurrentVersion: "选择当前版本",
+            SelectCurrentVersionShort: "同版本",
             DeleteConfirm: "确定要删除选中的 {{count}} 项译文吗？此操作不可撤销。",
             ImportSuccess: "成功导入 {{count}} 项译文",
             ExportSuccess: "译文导出成功",
@@ -225,7 +227,9 @@ export default {
         Filters: {
             SearchPlaceholder: "搜索翻译或插件...",
             OriginLocal: "本地提取",
-            OriginCloud: "云端下载"
+            OriginCloud: "云端下载",
+            VersionAll: "全部版本",
+            VersionUnknown: "未索引"
         },
         Stats: {
             Total: "总译文数",

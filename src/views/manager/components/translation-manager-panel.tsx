@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useEffect, useState, useMemo, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
     Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
@@ -6,7 +6,7 @@ import {
     DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger
 } from '~/shadcn';
 import { cn } from '~/shadcn/lib/utils';
-import { Search, Download, Upload, Trash2, MoreVertical, FileJson, Globe, HardDrive, Filter, Info, Puzzle, Palette, AlertCircle, Pen, FolderOpen, MoreHorizontal, CheckSquare } from 'lucide-react';
+import { Search, Download, Upload, Trash2, MoreVertical, FileJson, Globe, HardDrive, Filter, Info, Puzzle, Palette, AlertCircle, Pen, FolderOpen, MoreHorizontal, CheckSquare, Hash } from 'lucide-react';
 import I18N from 'src/main';
 import { TranslationSource } from 'src/types';
 import { Notice } from 'obsidian';
@@ -29,9 +29,38 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
     const [originFilter, setOriginFilter] = useState<'all' | 'local' | 'cloud'>('all');
     const [typeFilter, setTypeFilter] = useState<'all' | 'plugin' | 'theme'>('all');
+    const [versionFilter, setVersionFilter] = useState<string>('all');
+    const metadataIndexAttemptedRef = useRef<Set<string>>(new Set());
 
     // 监听全局更新 Tick 以刷新列表
     const sourceTick = useGlobalStoreInstance((state) => state.sourceUpdateTick);
+
+    useEffect(() => {
+        let cancelled = false;
+        const indexMissingMetadata = async () => {
+            const missing = sourceManager.getAllSources()
+                .filter(source => !source.metadataIndexedAt && !metadataIndexAttemptedRef.current.has(source.id))
+                .map(source => source.id);
+
+            for (let index = 0; index < missing.length && !cancelled; index += 8) {
+                const batch = missing.slice(index, index + 8);
+                batch.forEach(id => metadataIndexAttemptedRef.current.add(id));
+                sourceManager.batchIndexSourceMetadata(batch);
+                await new Promise(resolve => setTimeout(resolve, 25));
+            }
+        };
+
+        void indexMissingMetadata();
+        return () => { cancelled = true; };
+    }, [sourceManager, sourceTick]);
+
+    const versionOptions = useMemo(() => {
+        const versions = new Set<string>();
+        sourceManager.getAllSources().forEach(source => {
+            if (source.translationVersion) versions.add(source.translationVersion);
+        });
+        return Array.from(versions).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+    }, [sourceManager, sourceTick]);
 
     // 获取所有翻译源并应用过滤
     const allSources = useMemo(() => {
@@ -54,6 +83,12 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
             sources = sources.filter(s => s.type === typeFilter);
         }
 
+        if (versionFilter === '__unknown') {
+            sources = sources.filter(s => !s.translationVersion);
+        } else if (versionFilter !== 'all') {
+            sources = sources.filter(s => s.translationVersion === versionFilter);
+        }
+
         sources = sources.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
 
         // @ts-ignore - internal API
@@ -68,7 +103,7 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
             }
             return { ...s, isInstalled };
         });
-    }, [i18n, searchQuery, originFilter, typeFilter, sourceTick, i18n.app.plugins.manifests]);
+    }, [i18n, searchQuery, originFilter, typeFilter, versionFilter, sourceTick, i18n.app.plugins.manifests]);
 
     // 处理全选/反选
     const toggleSelectAll = () => {
@@ -96,6 +131,11 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
             }
         });
         if (changed) setSelectedIds(next);
+    };
+
+    const handleSelectCurrentVersion = () => {
+        if (versionFilter === 'all') return;
+        setSelectedIds(new Set(allSources.map(source => source.id)));
     };
 
     // 格式化日期
@@ -248,6 +288,26 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
                                 <DropdownMenuItem onClick={() => setTypeFilter('theme')}>{t('Common.Labels.Themes')}</DropdownMenuItem>
                             </DropdownMenuContent>
                         </DropdownMenu>
+
+                        <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                                <Button variant="outline" size="sm" className="h-9 shadow-sm gap-1.5 rounded-none border-muted-foreground/20 text-[13px] hover:bg-muted/30">
+                                    <Filter className="w-3.5 h-3.5 text-muted-foreground/70" />
+                                    {versionFilter === 'all'
+                                        ? t('Manager.Sources.Filters.VersionAll')
+                                        : versionFilter === '__unknown'
+                                            ? t('Manager.Sources.Filters.VersionUnknown')
+                                            : `v${versionFilter}`}
+                                </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end" className="w-44 rounded-none max-h-72 overflow-y-auto">
+                                <DropdownMenuItem onClick={() => setVersionFilter('all')}>{t('Manager.Sources.Filters.VersionAll')}</DropdownMenuItem>
+                                <DropdownMenuItem onClick={() => setVersionFilter('__unknown')}>{t('Manager.Sources.Filters.VersionUnknown')}</DropdownMenuItem>
+                                {versionOptions.map(version => (
+                                    <DropdownMenuItem key={version} onClick={() => setVersionFilter(version)}>v{version}</DropdownMenuItem>
+                                ))}
+                            </DropdownMenuContent>
+                        </DropdownMenu>
                     </div>
 
                     <div className="flex items-center ml-auto gap-3">
@@ -260,6 +320,17 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
                             <Button variant="ghost" size="sm" onClick={handleSelectUninstalled} className="gap-1.5 h-9 rounded-none px-3 hover:bg-destructive/10 hover:text-destructive group" title={t('Manager.Sources.Actions.SelectUninstalled')}>
                                 <AlertCircle className="w-4 h-4 text-destructive/80 group-hover:text-destructive" />
                                 <span className="hidden lg:inline text-[13px] text-destructive/90 group-hover:text-destructive">{t('Manager.Sources.Actions.SelectUninstalled')}</span>
+                            </Button>
+                            <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={handleSelectCurrentVersion}
+                                disabled={versionFilter === 'all'}
+                                className="gap-1.5 h-9 rounded-none px-3 hover:bg-primary/10 hover:text-primary group"
+                                title={t('Manager.Sources.Actions.SelectCurrentVersion')}
+                            >
+                                <Hash className="w-4 h-4 text-primary/70 group-hover:text-primary" />
+                                <span className="hidden lg:inline text-[13px] text-primary/90 group-hover:text-primary">{t('Manager.Sources.Actions.SelectCurrentVersionShort')}</span>
                             </Button>
                         </div>
 
@@ -368,6 +439,9 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
                                                         {t('Common.Labels.Plugins')}
                                                     </Badge>
                                                 )}
+                                                <Badge variant="outline" className="text-[9px] px-1.5 py-0 h-[18px] font-mono shrink-0 rounded-none bg-primary/5 text-primary/80 border-primary/20">
+                                                    {source.translationVersion ? `v${source.translationVersion}` : t('Manager.Sources.Filters.VersionUnknown')}
+                                                </Badge>
                                             </div>
 
                                             <div className="hidden md:flex flex-col items-end justify-center px-4 shrink-0 min-w-[120px] tabular-nums">

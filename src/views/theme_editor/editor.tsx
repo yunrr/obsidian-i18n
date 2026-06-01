@@ -20,6 +20,7 @@ import { useGlobalStoreInstance } from '~/utils/store/global';
 import { mountReactView } from '~/utils/core/react';
 import { saveTranslationFile } from '@/src/manager/io-manager';
 import { t as gt } from 'src/locales';
+import { getEffectiveExtractionSettings } from '@/src/utils/translator/config';
 
 import { useThemeEditorStore } from './store';
 import { ThemeTranslationItem } from './types';
@@ -119,11 +120,11 @@ const ReactThemeEditor: React.FC = () => {
             setMetadata({
                 theme: themeName || '',
                 language: 'zh-cn',
-                version: '1.0.1',
+                version: i18n.settings.translationVersion || '1.0.1',
                 supportedVersions: oldManifest.pluginVersion || '0.0.0',
                 title: themeName || '',
                 description: '',
-                author: ''
+                author: i18n.settings.author || ''
             });
         }
 
@@ -181,11 +182,11 @@ const ReactThemeEditor: React.FC = () => {
                 metadata: metadata || {
                     theme: themeName || '',
                     language: 'zh-cn',
-                    version: '1.0.1',
+                    version: i18n.settings.translationVersion || '1.0.1',
                     supportedVersions: '0.0.0',
                     title: themeName || '',
                     description: '',
-                    author: ''
+                    author: i18n.settings.author || ''
                 },
                 dict: cleanDict,
             };
@@ -251,19 +252,8 @@ const ReactThemeEditor: React.FC = () => {
                 themeDir,
                 themeCssPath,
                 settings: {
-                    author: i18n.settings.author,
-                    reFlags: i18n.settings.reFlags,
-                    reLength: i18n.settings.reLength,
-                    reDatas: i18n.settings.reDatas,
-                    reRejectRe: i18n.settings.reRejectRe,
-                    reValidRe: i18n.settings.reValidRe,
+                    ...getEffectiveExtractionSettings(i18n.settings),
                     chineseSkipMode: 'none',
-                    astAssignments: i18n.settings.astAssignments,
-                    astFunctions: i18n.settings.astFunctions,
-                    astKeys: i18n.settings.astKeys,
-                    astMaxLength: i18n.settings.astMaxLength ?? 300,
-                    astRejectRe: i18n.settings.astRejectRe,
-                    astValidRe: i18n.settings.astValidRe,
                 },
             });
             if (extracted.status !== 'success' || !extracted.content) throw new Error(extracted.error || 'Extract failed');

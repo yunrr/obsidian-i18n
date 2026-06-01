@@ -17,6 +17,10 @@ export interface TranslationSource {
     origin: 'cloud' | 'local';     // 来源类型
     isActive: boolean;             // 是否为当前激活的翻译源（UI选中）
     checksum: string;              // 翻译内容的校验值 (本地和云端都有)
+    translationVersion?: string;   // 本地索引：译文版本 metadata.version
+    supportedVersions?: string;    // 本地索引：兼容版本 metadata.supportedVersions
+    language?: string;             // 本地索引：语言 metadata.language
+    metadataIndexedAt?: number;    // 本地索引更新时间
 
     // 云端元数据
     cloud?: {

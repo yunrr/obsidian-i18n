@@ -196,11 +196,13 @@ export interface CompanionCloudResponse {
 
 export interface CompanionExtractionSettings {
     author: string;
+    translationVersion: string;
     reFlags: string;
     reLength: number;
     reDatas: string[];
     reRejectRe: string[];
     reValidRe: string[];
+    reExtractionEnabled: boolean;
     chineseSkipMode: 'none' | 'source' | 'extracted';
     astAssignments: string[];
     astFunctions: string[];
@@ -208,6 +210,7 @@ export interface CompanionExtractionSettings {
     astMaxLength: number;
     astRejectRe: string[];
     astValidRe: string[];
+    astExtractionEnabled: boolean;
 }
 
 export interface CompanionPluginExtractRequest {

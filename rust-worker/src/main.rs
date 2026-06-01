@@ -369,6 +369,8 @@ fn default_branch() -> String {
 struct ExtractionSettings {
     #[serde(default)]
     author: String,
+    #[serde(default = "default_translation_version")]
+    translation_version: String,
     #[serde(default = "default_re_flags")]
     re_flags: String,
     #[serde(default = "default_max_length")]
@@ -379,6 +381,8 @@ struct ExtractionSettings {
     re_reject_re: Vec<String>,
     #[serde(default)]
     re_valid_re: Vec<String>,
+    #[serde(default = "default_enabled")]
+    re_extraction_enabled: bool,
     #[serde(default = "default_chinese_skip_mode")]
     chinese_skip_mode: String,
     #[serde(default)]
@@ -393,6 +397,8 @@ struct ExtractionSettings {
     ast_reject_re: Vec<String>,
     #[serde(default)]
     ast_valid_re: Vec<String>,
+    #[serde(default = "default_enabled")]
+    ast_extraction_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -486,6 +492,14 @@ impl SwcAstConfig {
 
 fn default_re_flags() -> String {
     "gs".to_string()
+}
+
+fn default_translation_version() -> String {
+    "1.0.1".to_string()
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 fn default_max_length() -> usize {
@@ -1497,6 +1511,9 @@ fn extract_ast_items_heuristic(code: &str, settings: &ExtractionSettings) -> Vec
 }
 
 fn extract_ast_items(code: &str, settings: &ExtractionSettings) -> Vec<Value> {
+    if !settings.ast_extraction_enabled {
+        return Vec::new();
+    }
     match extract_ast_items_swc(code, settings) {
         Ok(items) => items,
         Err(error) => {
@@ -1639,6 +1656,9 @@ fn is_default_regex_patterns(patterns: &[String]) -> bool {
 }
 
 fn extract_regex_items(code: &str, settings: &ExtractionSettings) -> Vec<Value> {
+    if !settings.re_extraction_enabled {
+        return Vec::new();
+    }
     let patterns = if settings.re_datas.is_empty() {
         DEFAULT_REGEX_PATTERNS.iter().map(|item| item.to_string()).collect::<Vec<_>>()
     } else {
@@ -3062,6 +3082,7 @@ async fn handle_cloud_publish_source(state: &AppState, payload: Value) -> Result
     updated_source["origin"] = json!("cloud");
     updated_source["cloud"] = json!({ "owner": payload.owner, "repo": payload.repo, "hash": hash });
     updated_source["updatedAt"] = json!(now_ms());
+    merge_metadata_index(&mut updated_source, &content);
     save_source_entry(state, &paths, source_id, updated_source.clone(), false).await?;
     Ok(json!({ "state": true, "manifest": manifest, "source": updated_source }))
 }
@@ -3147,6 +3168,7 @@ async fn handle_cloud_prepare_backup(_state: &AppState, payload: Value) -> Resul
             updated_source["origin"] = json!("cloud");
             updated_source["cloud"] = json!({ "owner": payload.owner, "repo": payload.repo, "hash": hash });
             updated_source["updatedAt"] = json!(now_ms());
+            merge_metadata_index(&mut updated_source, &content);
             sources.push(updated_source);
         }
     }
@@ -3523,7 +3545,7 @@ fn save_source_entry_locked(paths: &PersistencePaths, source_id: &str, source: V
 fn source_from_entry(entry: &Value, content: &Value, owner: &str, repo: &str, existing: Option<&Value>, activate: bool) -> Result<Value> {
     let source_id = entry.get("id").and_then(Value::as_str).unwrap_or_default();
     let now = now_ms();
-    Ok(json!({
+    let mut source = json!({
         "id": source_id,
         "plugin": entry.get("plugin").and_then(Value::as_str).unwrap_or_default(),
         "title": entry.get("title").and_then(Value::as_str).unwrap_or("未命名翻译"),
@@ -3534,7 +3556,9 @@ fn source_from_entry(entry: &Value, content: &Value, owner: &str, repo: &str, ex
         "cloud": { "owner": owner, "repo": repo, "hash": entry.get("hash").and_then(Value::as_str).unwrap_or_default() },
         "updatedAt": now,
         "createdAt": existing.and_then(|source| source.get("createdAt")).and_then(Value::as_u64).unwrap_or(now),
-    }))
+    });
+    merge_metadata_index(&mut source, content);
+    Ok(source)
 }
 
 fn has_any_sources_for_plugin(paths: &PersistencePaths, plugin_id: &str) -> bool {
@@ -3947,7 +3971,8 @@ fn handle_plugin_extract_blocking(payload: Value) -> Result<CompanionExtractResu
                 error: None,
             });
         }
-        if !has_extracted_translation_content(&sources) {
+        let extraction_enabled = payload.settings.ast_extraction_enabled || payload.settings.re_extraction_enabled;
+        if extraction_enabled && !has_extracted_translation_content(&sources) {
             return Ok(CompanionExtractResult {
                 status: "skipped".to_string(),
                 resource_id: payload.resource_id.clone(),
@@ -3964,7 +3989,7 @@ fn handle_plugin_extract_blocking(payload: Value) -> Result<CompanionExtractResu
             "schemaVersion": 1,
             "metadata": {
                 "plugin": plugin_id,
-                "version": "1.0.1",
+                "version": payload.settings.translation_version.clone(),
                 "title": plugin_name,
                 "description": format!("{} Localization & Tweaks", plugin_name),
                 "language": payload.language.clone(),
@@ -4085,7 +4110,7 @@ fn handle_theme_extract_blocking(payload: Value) -> Result<CompanionExtractResul
             "metadata": {
                 "theme": theme_name,
                 "language": "zh-cn",
-                "version": "1.0.1",
+                "version": payload.settings.translation_version.clone(),
                 "supportedVersions": version,
                 "title": theme_name,
                 "description": format!("{} Localization & Tweaks", theme_name),
@@ -4232,6 +4257,7 @@ fn source_import_blocking(payload: SourceManagerPayload) -> Result<SourceImportE
                 source["createdAt"] = json!(now);
             }
             source["updatedAt"] = json!(now);
+            merge_metadata_index(&mut source, &content);
             save_translation(&paths, &source_id, &content)?;
             sources.insert(source_id, source);
         }
@@ -4353,6 +4379,24 @@ fn save_translation(paths: &PersistencePaths, source_id: &str, content: &Value) 
     Ok(())
 }
 
+fn metadata_index(content: &Value) -> Value {
+    json!({
+        "translationVersion": content.pointer("/metadata/version").and_then(Value::as_str).unwrap_or_default(),
+        "supportedVersions": content.pointer("/metadata/supportedVersions").and_then(Value::as_str).unwrap_or_default(),
+        "language": content.pointer("/metadata/language").and_then(Value::as_str).unwrap_or_default(),
+        "metadataIndexedAt": now_ms(),
+    })
+}
+
+fn merge_metadata_index(source: &mut Value, content: &Value) {
+    let index = metadata_index(content);
+    if let Some(obj) = index.as_object() {
+        for (key, value) in obj {
+            source[key] = value.clone();
+        }
+    }
+}
+
 async fn save_translated_source(
     state: &AppState,
     paths: &PersistencePaths,
@@ -4373,6 +4417,7 @@ async fn save_translated_source(
                     .unwrap_or(Value::String(String::new()))
             });
         source["origin"] = json!("local");
+        merge_metadata_index(source, content);
         if let Some(obj) = source.as_object_mut() {
             obj.remove("cloud");
             obj.insert(
@@ -4403,19 +4448,21 @@ async fn save_extracted_source(
                 source["isActive"] = json!(false);
             }
         }
+        let mut source = json!({
+            "id": source_id,
+            "plugin": plugin_id,
+            "title": title,
+            "type": source_type,
+            "origin": "local",
+            "isActive": true,
+            "checksum": calculate_checksum(content)?,
+            "createdAt": now_ms(),
+            "updatedAt": now_ms(),
+        });
+        merge_metadata_index(&mut source, content);
         sources.insert(
             source_id.clone(),
-            json!({
-                "id": source_id,
-                "plugin": plugin_id,
-                "title": title,
-                "type": source_type,
-                "origin": "local",
-                "isActive": true,
-                "checksum": calculate_checksum(content)?,
-                "createdAt": now_ms(),
-                "updatedAt": now_ms(),
-            }),
+            source,
         );
     }
     save_translation(paths, &source_id, content)?;

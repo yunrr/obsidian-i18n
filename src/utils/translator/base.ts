@@ -4,21 +4,23 @@ import { OBThemeManifest, ITheme, PluginTranslationV1, PluginTranslationSchemaVe
 import { AstTranslator } from '~/utils/translator/core-ast-translator';
 import { RegexTranslator } from '~/utils/translator/core-regex-translator';
 import { useGlobalStoreInstance } from '~/utils/store/global';
+import { getEffectiveExtractionSettings } from './config';
 
 /**
  * 生成插件的翻译 JSON 对象。
  */
 export function generatePlugin(pluginVersion: string, manifestJSON: PluginManifest, mainStr: string, language: string, settings: any): PluginTranslationV1 {
+    const effectiveSettings = getEffectiveExtractionSettings(settings);
     const translationJson: PluginTranslationV1 = {
         schemaVersion: PluginTranslationSchemaVersion.V1,
         metadata: {
             plugin: manifestJSON.id,
-            version: '1.0.0',
+            version: effectiveSettings.translationVersion,
             title: manifestJSON.name,
             description: `${manifestJSON.name} Localization & Tweaks`,
             language: language,
             supportedVersions: pluginVersion,
-            author: '',
+            author: effectiveSettings.author,
         },
         dict: {
             'main.js': {
@@ -28,11 +30,11 @@ export function generatePlugin(pluginVersion: string, manifestJSON: PluginManife
         }
     };
 
-    const astTranslator = new AstTranslator(settings);
+    const astTranslator = new AstTranslator(effectiveSettings as any);
     const ast = astTranslator.loadCode(mainStr);
     if (ast) translationJson.dict['main.js'].ast = astTranslator.extract(ast);
 
-    const regexTranslator = new RegexTranslator(settings);
+    const regexTranslator = new RegexTranslator(effectiveSettings as any);
     const regex = regexTranslator.loadCode(mainStr);
     if (regex) translationJson.dict['main.js'].regex = regex;
 

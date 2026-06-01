@@ -66,6 +66,8 @@ export class AstTranslator {
      * 2. 只提取通过 isValidText 校验的内容
      */
     public extract(ast: t.Node): PluginTranslationV1Ast[] {
+        if (this.settings?.astExtractionEnabled === false) return [];
+
         const results: PluginTranslationV1Ast[] = [];
 
         this.traverseWhitelist(ast, (type, name, valueNode) => {

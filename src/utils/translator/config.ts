@@ -82,3 +82,129 @@ export const REGEX_DEFAULT_CONFIG = {
         "\\s", "[^\\x00-\\x7F]", "[!?,;:。！？，；：]\\s*$"
     ]
 };
+
+export interface EffectiveExtractionSettings {
+    author: string;
+    translationVersion: string;
+    reFlags: string;
+    reLength: number;
+    reDatas: string[];
+    reRejectRe: string[];
+    reValidRe: string[];
+    reExtractionEnabled: boolean;
+    chineseSkipMode: 'none' | 'source' | 'extracted';
+    astAssignments: string[];
+    astFunctions: string[];
+    astKeys: string[];
+    astMaxLength: number;
+    astRejectRe: string[];
+    astValidRe: string[];
+    astExtractionEnabled: boolean;
+}
+
+function pickActiveProfile<T extends { id: string }>(profiles: T[] | undefined, activeId: string | undefined): T | undefined {
+    if (!profiles || profiles.length === 0) return undefined;
+    return profiles.find(profile => profile.id === activeId) || profiles[0];
+}
+
+export function getEffectiveExtractionSettings(settings: any): EffectiveExtractionSettings {
+    const reProfile = pickActiveProfile<any>(settings?.reProfiles, settings?.activeReProfileId);
+    const astProfile = pickActiveProfile<any>(settings?.astProfiles, settings?.activeAstProfileId);
+
+    return {
+        author: settings?.author || '',
+        translationVersion: settings?.translationVersion || '1.0.1',
+        reFlags: reProfile?.reFlags ?? settings?.reFlags ?? 'gs',
+        reLength: reProfile?.reLength ?? settings?.reLength ?? 300,
+        reDatas: reProfile?.reDatas ?? settings?.reDatas ?? REGEX_DEFAULT_CONFIG.patterns,
+        reRejectRe: reProfile?.reRejectRe ?? settings?.reRejectRe ?? REGEX_DEFAULT_CONFIG.rejectPatterns,
+        reValidRe: reProfile?.reValidRe ?? settings?.reValidRe ?? REGEX_DEFAULT_CONFIG.validPatterns,
+        reExtractionEnabled: settings?.reExtractionEnabled !== false,
+        chineseSkipMode: settings?.chineseSkipMode || 'source',
+        astAssignments: astProfile?.astAssignments ?? settings?.astAssignments ?? AST_DEFAULT_CONFIG.assignments,
+        astFunctions: astProfile?.astFunctions ?? settings?.astFunctions ?? AST_DEFAULT_CONFIG.functions,
+        astKeys: astProfile?.astKeys ?? settings?.astKeys ?? AST_DEFAULT_CONFIG.keys,
+        astMaxLength: astProfile?.astMaxLength ?? settings?.astMaxLength ?? 300,
+        astRejectRe: astProfile?.astRejectRe ?? settings?.astRejectRe ?? REGEX_DEFAULT_CONFIG.rejectPatterns,
+        astValidRe: astProfile?.astValidRe ?? settings?.astValidRe ?? REGEX_DEFAULT_CONFIG.validPatterns,
+        astExtractionEnabled: settings?.astExtractionEnabled !== false,
+    };
+}
+
+export function syncExtractionProfileFields(settings: any): boolean {
+    let modified = false;
+
+    if (!settings.translationVersion) {
+        settings.translationVersion = '1.0.1';
+        modified = true;
+    }
+
+    if (!Array.isArray(settings.reProfiles) || settings.reProfiles.length === 0) {
+        settings.reProfiles = [{
+            id: 'default',
+            name: 'Default',
+            reFlags: settings.reFlags || 'gs',
+            reLength: settings.reLength ?? 300,
+            reDatas: settings.reDatas || REGEX_DEFAULT_CONFIG.patterns,
+            reRejectRe: settings.reRejectRe || REGEX_DEFAULT_CONFIG.rejectPatterns,
+            reValidRe: settings.reValidRe || REGEX_DEFAULT_CONFIG.validPatterns,
+        }];
+        settings.activeReProfileId = 'default';
+        modified = true;
+    }
+    if (!settings.activeReProfileId || !settings.reProfiles.some((profile: any) => profile.id === settings.activeReProfileId)) {
+        settings.activeReProfileId = settings.reProfiles[0].id;
+        modified = true;
+    }
+    if (settings.reExtractionEnabled === undefined) {
+        settings.reExtractionEnabled = true;
+        modified = true;
+    }
+
+    if (!Array.isArray(settings.astProfiles) || settings.astProfiles.length === 0) {
+        settings.astProfiles = [{
+            id: 'default',
+            name: 'Default',
+            astAssignments: settings.astAssignments || AST_DEFAULT_CONFIG.assignments,
+            astFunctions: settings.astFunctions || AST_DEFAULT_CONFIG.functions,
+            astKeys: settings.astKeys || AST_DEFAULT_CONFIG.keys,
+            astMaxLength: settings.astMaxLength ?? 300,
+            astRejectRe: settings.astRejectRe || REGEX_DEFAULT_CONFIG.rejectPatterns,
+            astValidRe: settings.astValidRe || REGEX_DEFAULT_CONFIG.validPatterns,
+        }];
+        settings.activeAstProfileId = 'default';
+        modified = true;
+    }
+    if (!settings.activeAstProfileId || !settings.astProfiles.some((profile: any) => profile.id === settings.activeAstProfileId)) {
+        settings.activeAstProfileId = settings.astProfiles[0].id;
+        modified = true;
+    }
+    if (settings.astExtractionEnabled === undefined) {
+        settings.astExtractionEnabled = true;
+        modified = true;
+    }
+
+    const effective = getEffectiveExtractionSettings(settings);
+    const legacyFields: Record<string, any> = {
+        reFlags: effective.reFlags,
+        reLength: effective.reLength,
+        reDatas: effective.reDatas,
+        reRejectRe: effective.reRejectRe,
+        reValidRe: effective.reValidRe,
+        astAssignments: effective.astAssignments,
+        astFunctions: effective.astFunctions,
+        astKeys: effective.astKeys,
+        astMaxLength: effective.astMaxLength,
+        astRejectRe: effective.astRejectRe,
+        astValidRe: effective.astValidRe,
+    };
+
+    for (const [key, value] of Object.entries(legacyFields)) {
+        if (settings[key] !== value) {
+            settings[key] = value;
+            modified = true;
+        }
+    }
+
+    return modified;
+}

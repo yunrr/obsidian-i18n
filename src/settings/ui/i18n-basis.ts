@@ -81,6 +81,18 @@ export default class I18nBasis extends BaseSetting {
                 })
             );
 
+        new Setting(this.containerEl)
+            .setName(t('Settings.Basis.TranslationVersionTitle'))
+            .setDesc(t('Settings.Basis.TranslationVersionDesc'))
+            .addText(cb => cb
+                .setPlaceholder('1.0.1')
+                .setValue(this.settings.translationVersion || '1.0.1')
+                .onChange(async (value) => {
+                    this.settings.translationVersion = value.trim() || '1.0.1';
+                    await this.i18n.saveSettings();
+                })
+            );
+
 
         // 3. 网络
         new Setting(this.containerEl).setHeading().setName(t('Settings.Basis.CloudHeader'));

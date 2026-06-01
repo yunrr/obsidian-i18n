@@ -983,6 +983,16 @@ async function readTranslationFile<T>(paths: WorkerPersistencePaths, sourceId: s
     }
 }
 
+function getTranslationMetadataIndex(content: any): Pick<TranslationSource, 'translationVersion' | 'supportedVersions' | 'language' | 'metadataIndexedAt'> {
+    const metadata = content?.metadata || {};
+    return {
+        translationVersion: metadata.version ? String(metadata.version) : '',
+        supportedVersions: metadata.supportedVersions ? String(metadata.supportedVersions) : '',
+        language: metadata.language ? String(metadata.language) : '',
+        metadataIndexedAt: Date.now(),
+    };
+}
+
 async function hasExistingExtractedSource(paths: WorkerPersistencePaths, pluginId: string, type: 'plugin' | 'theme'): Promise<boolean> {
     const meta = await loadMeta(paths);
     for (const source of Object.values(meta.sources)) {
@@ -1013,6 +1023,7 @@ async function saveExtractedSource(paths: WorkerPersistencePaths, pluginId: stri
             origin: 'local',
             isActive: true,
             checksum: calculateChecksum(content),
+            ...getTranslationMetadataIndex(content),
             createdAt: now,
             updatedAt: now,
         };
@@ -1034,6 +1045,7 @@ async function saveTranslatedSource(paths: WorkerPersistencePaths, sourceId: str
                 origin: 'local',
                 cloud: undefined,
                 checksum: calculateChecksum(content),
+                ...getTranslationMetadataIndex(content),
                 updatedAt: Date.now(),
             };
             await saveMeta(paths, meta);

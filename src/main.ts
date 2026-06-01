@@ -5,6 +5,7 @@ import './locales';     // 引入i18n配置
 import { App, Plugin, PluginManifest } from 'obsidian';
 import { DEFAULT_SETTINGS, I18nSettings, LLMProfile } from './settings/data';
 import { LLM_PROVIDERS } from './ai/constants';
+import { syncExtractionProfileFields } from './utils/translator/config';
 import { I18nSettingTab } from './settings';
 import { t } from './locales';
 
@@ -125,6 +126,10 @@ export default class I18N extends Plugin {
             settingsModified = true;
         }
 
+        if (syncExtractionProfileFields(this.settings)) {
+            settingsModified = true;
+        }
+
         // 旧版数字 ID 升级迁移
         if (typeof this.settings.llmApi === 'number') {
             const legacyApiMap: Record<number, string> = {
@@ -142,6 +147,7 @@ export default class I18N extends Plugin {
     }
     // [配置类] 保存
     public async saveSettings() {
+        syncExtractionProfileFields(this.settings);
         await this.saveData(this.settings);
         useGlobalStoreInstance.getState().triggerSettingsUpdate();
     }

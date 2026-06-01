@@ -1,11 +1,108 @@
-import { Setting } from "obsidian"
+import { Notice, Setting } from "obsidian"
 import BaseSetting from "../base-setting"
 import { t } from "src/locales";
+import { RegexExtractionProfile } from "../data";
+import { InputModal } from "./input-modal";
 
 export default class I18nRE extends BaseSetting {
+    private get activeProfile(): RegexExtractionProfile {
+        return this.settings.reProfiles.find(profile => profile.id === this.settings.activeReProfileId) || this.settings.reProfiles[0];
+    }
+
+    private makeProfile(name: string, source?: RegexExtractionProfile): RegexExtractionProfile {
+        const base = source || this.activeProfile;
+        return {
+            id: `re-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            name,
+            reFlags: base.reFlags,
+            reLength: base.reLength,
+            reDatas: [...base.reDatas],
+            reRejectRe: [...base.reRejectRe],
+            reValidRe: [...base.reValidRe],
+        };
+    }
+
+    private openNameModal(title: string, initialValue: string, onSubmit: (value: string) => Promise<void>) {
+        new InputModal(this.app, title, t('Settings.Re.ProfileNamePlaceholder'), initialValue, async (value) => {
+            const name = value.trim();
+            if (!name) return;
+            await onSubmit(name);
+            this.main();
+        }).open();
+    }
+
     main(): void {
         const { containerEl } = this;
         containerEl.empty();
+        const profile = this.activeProfile;
+
+        new Setting(containerEl)
+            .setName(t('Settings.Re.ProfileHeader'))
+            .setHeading();
+
+        new Setting(containerEl)
+            .setName(t('Settings.Re.EnableTitle'))
+            .setDesc(t('Settings.Re.EnableDesc'))
+            .addToggle(toggle => toggle
+                .setValue(this.settings.reExtractionEnabled !== false)
+                .onChange(async (value) => {
+                    this.settings.reExtractionEnabled = value;
+                    await this.i18n.saveSettings();
+                })
+            );
+
+        new Setting(containerEl)
+            .setName(t('Settings.Re.ProfileSelectTitle'))
+            .setDesc(t('Settings.Re.ProfileSelectDesc'))
+            .addDropdown(dropdown => {
+                this.settings.reProfiles.forEach(item => dropdown.addOption(item.id, item.name));
+                dropdown.setValue(this.settings.activeReProfileId)
+                    .onChange(async (value) => {
+                        this.settings.activeReProfileId = value;
+                        await this.i18n.saveSettings();
+                        this.main();
+                    });
+            })
+            .addButton(button => button
+                .setButtonText(t('Settings.Re.ProfileAddBtn'))
+                .onClick(() => this.openNameModal(t('Settings.Re.ProfileAddTitle'), '', async (name) => {
+                    const next = this.makeProfile(name);
+                    this.settings.reProfiles.push(next);
+                    this.settings.activeReProfileId = next.id;
+                    await this.i18n.saveSettings();
+                    new Notice(t('Settings.Re.ProfileAddNotice'));
+                }))
+            )
+            .addButton(button => button
+                .setButtonText(t('Settings.Re.ProfileCopyBtn'))
+                .onClick(() => this.openNameModal(t('Settings.Re.ProfileCopyTitle'), `${profile.name} Copy`, async (name) => {
+                    const next = this.makeProfile(name, profile);
+                    this.settings.reProfiles.push(next);
+                    this.settings.activeReProfileId = next.id;
+                    await this.i18n.saveSettings();
+                    new Notice(t('Settings.Re.ProfileAddNotice'));
+                }))
+            )
+            .addButton(button => button
+                .setButtonText(t('Settings.Re.ProfileRenameBtn'))
+                .onClick(() => this.openNameModal(t('Settings.Re.ProfileRenameTitle'), profile.name, async (name) => {
+                    profile.name = name;
+                    await this.i18n.saveSettings();
+                }))
+            )
+            .addButton(button => button
+                .setButtonText(t('Settings.Re.ProfileDelBtn'))
+                .setWarning()
+                .setDisabled(profile.id === 'default' || this.settings.reProfiles.length <= 1)
+                .onClick(async () => {
+                    if (profile.id === 'default' || this.settings.reProfiles.length <= 1) return;
+                    if (!window.confirm(t('Settings.Re.ProfileDelConfirm'))) return;
+                    this.settings.reProfiles = this.settings.reProfiles.filter(item => item.id !== profile.id);
+                    this.settings.activeReProfileId = this.settings.reProfiles[0].id;
+                    await this.i18n.saveSettings();
+                    this.main();
+                })
+            );
 
         // ==============================
         // 1. 正则参数配置
@@ -19,10 +116,10 @@ export default class I18nRE extends BaseSetting {
             .setName(t('Settings.Re.FlagTitle'))
             .setDesc(t('Settings.Re.FlagDesc'))
             .addText(cb => cb
-                .setValue(this.settings.reFlags)
+                .setValue(profile.reFlags)
                 .setPlaceholder(t('Settings.Re.FlagPlaceholder'))
                 .onChange(async (value) => {
-                    this.settings.reFlags = value;
+                    profile.reFlags = value;
                     await this.i18n.saveSettings();
                 })
             );
@@ -34,9 +131,9 @@ export default class I18nRE extends BaseSetting {
             .addSlider(cb => cb
                 .setDynamicTooltip()
                 .setLimits(0, 3000, 100)
-                .setValue(this.settings.reLength)
+                .setValue(profile.reLength)
                 .onChange(async (value) => {
-                    this.settings.reLength = value
+                    profile.reLength = value
                     await this.i18n.saveSettings();
                 })
             );
@@ -52,10 +149,10 @@ export default class I18nRE extends BaseSetting {
             .setName(t('Settings.Re.DataEditTitle'))
             .setDesc(t('Settings.Re.DataEditDesc'))
             .addTextArea(text => {
-                text.setValue((this.settings.reDatas || []).join('\n'))
+                text.setValue((profile.reDatas || []).join('\n'))
                     .setPlaceholder(t('Settings.Re.DataPlaceholder'))
                     .onChange(async (value) => {
-                        this.settings.reDatas = value.split('\n').map(s => s.trim()).filter(s => s !== '');
+                        profile.reDatas = value.split('\n').map(s => s.trim()).filter(s => s !== '');
                         await this.i18n.saveSettings();
                     });
                 text.inputEl.rows = 10;
@@ -73,10 +170,10 @@ export default class I18nRE extends BaseSetting {
             .setName(t('Settings.Re.RejectReTitle'))
             .setDesc(t('Settings.Re.RejectReDesc'))
             .addTextArea(text => {
-                text.setValue((this.settings.reRejectRe || []).join('\n'))
+                text.setValue((profile.reRejectRe || []).join('\n'))
                     .setPlaceholder(t('Settings.Re.RejectPlaceholder'))
                     .onChange(async (value) => {
-                        this.settings.reRejectRe = value.split('\n').map(s => s.trim()).filter(s => s !== '');
+                        profile.reRejectRe = value.split('\n').map(s => s.trim()).filter(s => s !== '');
                         await this.i18n.saveSettings();
                     });
                 text.inputEl.rows = 6;
@@ -87,10 +184,10 @@ export default class I18nRE extends BaseSetting {
             .setName(t('Settings.Re.ValidReTitle'))
             .setDesc(t('Settings.Re.ValidReDesc'))
             .addTextArea(text => {
-                text.setValue((this.settings.reValidRe || []).join('\n'))
+                text.setValue((profile.reValidRe || []).join('\n'))
                     .setPlaceholder(t('Settings.Re.ValidPlaceholder'))
                     .onChange(async (value) => {
-                        this.settings.reValidRe = value.split('\n').map(s => s.trim()).filter(s => s !== '');
+                        profile.reValidRe = value.split('\n').map(s => s.trim()).filter(s => s !== '');
                         await this.i18n.saveSettings();
                     });
                 text.inputEl.rows = 6;

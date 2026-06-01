@@ -24,6 +24,27 @@ export interface GitHubProfile {
     repo: string;
 }
 
+export interface RegexExtractionProfile {
+    id: string;
+    name: string;
+    reFlags: string;
+    reLength: number;
+    reDatas: string[];
+    reRejectRe: string[];
+    reValidRe: string[];
+}
+
+export interface AstExtractionProfile {
+    id: string;
+    name: string;
+    astAssignments: string[];
+    astFunctions: string[];
+    astKeys: string[];
+    astMaxLength: number;
+    astRejectRe: string[];
+    astValidRe: string[];
+}
+
 export interface I18nSettings {
     // ==============================
     // 基础设置
@@ -34,6 +55,7 @@ export interface I18nSettings {
     searchText: string;       // 网络文件配置：搜索文本
     sort: string;              // 列表排序方式 (0: 正序, 1: 倒序)
     author: string;            // 默认作者署名
+    translationVersion: string; // 默认译文版本
     mode: number;              // 插件运行模式 (待定/保留字段)
 
     // ==============================
@@ -204,6 +226,9 @@ export interface I18nSettings {
     reRejectRe: string[];    // 正则提取排除正则
     reValidRe: string[];     // 正则提取有效正则
     chineseSkipMode: 'none' | 'source' | 'extracted'; // 中文资源跳过策略
+    reProfiles: RegexExtractionProfile[]; // 正则提取配置组
+    activeReProfileId: string; // 当前正则提取配置组
+    reExtractionEnabled: boolean; // 是否启用正则提取
 
     // ==============================
     // AST 提取规则
@@ -214,6 +239,9 @@ export interface I18nSettings {
     astMaxLength: number;     // AST 提取文本最大长度限制，0 为不限制
     astRejectRe: string[];   // 排除正则 (字符串形式)
     astValidRe: string[];    // 有效正则 (字符串形式)
+    astProfiles: AstExtractionProfile[]; // AST 提取配置组
+    activeAstProfileId: string; // 当前 AST 提取配置组
+    astExtractionEnabled: boolean; // 是否启用 AST 提取
 
     // ==============================
     // 网络配置
@@ -257,6 +285,7 @@ export const DEFAULT_SETTINGS: I18nSettings = {
     searchText: '',           // 默认无搜索文本
     sort: '0',                 // 默认按正序排列
     author: '',                // 默认作者署名
+    translationVersion: '1.0.1', // 默认译文版本
     mode: 0,                   // 默认模式: 0
 
     // ==============================
@@ -565,6 +594,17 @@ export const DEFAULT_SETTINGS: I18nSettings = {
     reRejectRe: REGEX_DEFAULT_CONFIG.rejectPatterns,
     reValidRe: REGEX_DEFAULT_CONFIG.validPatterns,
     chineseSkipMode: 'source',
+    reProfiles: [{
+        id: 'default',
+        name: 'Default',
+        reFlags: 'gs',
+        reLength: 300,
+        reDatas: REGEX_DEFAULT_CONFIG.patterns,
+        reRejectRe: REGEX_DEFAULT_CONFIG.rejectPatterns,
+        reValidRe: REGEX_DEFAULT_CONFIG.validPatterns,
+    }],
+    activeReProfileId: 'default',
+    reExtractionEnabled: true,
 
     // ==============================
     // AST 提取规则
@@ -575,6 +615,18 @@ export const DEFAULT_SETTINGS: I18nSettings = {
     astMaxLength: 300,
     astRejectRe: REGEX_DEFAULT_CONFIG.rejectPatterns, // Regex defaults are used as strings for UI
     astValidRe: REGEX_DEFAULT_CONFIG.validPatterns,
+    astProfiles: [{
+        id: 'default',
+        name: 'Default',
+        astAssignments: AST_DEFAULT_CONFIG.assignments,
+        astFunctions: AST_DEFAULT_CONFIG.functions,
+        astKeys: AST_DEFAULT_CONFIG.keys,
+        astMaxLength: 300,
+        astRejectRe: REGEX_DEFAULT_CONFIG.rejectPatterns,
+        astValidRe: REGEX_DEFAULT_CONFIG.validPatterns,
+    }],
+    activeAstProfileId: 'default',
+    astExtractionEnabled: true,
 
     // ==============================
     // 网络配置

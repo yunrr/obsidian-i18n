@@ -53,8 +53,8 @@ export class SourceManager {
                             delete source.pluginId;
                             needsSave = true;
                         }
-                        // 清理已废弃的字段
-                        for (const field of ['language', 'version', 'supportedVersions']) {
+                        // 清理旧版字段；language/supportedVersions 现在作为本地索引保留。
+                        for (const field of ['version']) {
                             if (field in source) {
                                 delete source[field];
                                 needsSave = true;
@@ -86,6 +86,16 @@ export class SourceManager {
             console.error('[SourceManager] Failed to save meta:', error);
             throw error;
         }
+    }
+
+    private getMetadataIndex(content: any): Pick<TranslationSource, 'translationVersion' | 'supportedVersions' | 'language' | 'metadataIndexedAt'> {
+        const metadata = content?.metadata || {};
+        return {
+            translationVersion: metadata.version ? String(metadata.version) : '',
+            supportedVersions: metadata.supportedVersions ? String(metadata.supportedVersions) : '',
+            language: metadata.language ? String(metadata.language) : '',
+            metadataIndexedAt: Date.now(),
+        };
     }
 
     private loadBatchTaskRecord(): BatchTaskRecordMeta {
@@ -252,6 +262,10 @@ export class SourceManager {
      * 添加/更新翻译源
      */
     saveSource(source: TranslationSource, options?: { activate?: boolean }): void {
+        const content = this.readSourceFile(source.id);
+        if (content?.metadata) {
+            source = { ...source, ...this.getMetadataIndex(content) };
+        }
         this.upsertSourceInMemory(source);
         if (options?.activate) {
             this.setActiveInMemory(source.id, true);
@@ -377,6 +391,16 @@ export class SourceManager {
     saveSourceFile(sourceId: string, content: any): void {
         const filePath = path.join(this.sourcesDir, `${sourceId}.${TRANSLATION_FILE_EXTENSION}`);
         saveTranslationFile(filePath, content);
+        const source = this.meta.sources[sourceId];
+        if (source) {
+            this.meta.sources[sourceId] = {
+                ...source,
+                ...this.getMetadataIndex(content),
+                checksum: calculateChecksum(content),
+                updatedAt: Date.now(),
+            };
+            this.saveMeta();
+        }
     }
 
     /**
@@ -399,6 +423,36 @@ export class SourceManager {
         }
     }
 
+    indexSourceMetadata(sourceId: string): boolean {
+        const source = this.meta.sources[sourceId];
+        if (!source) return false;
+        const content = this.readSourceFile(sourceId);
+        if (!content?.metadata) return false;
+        this.meta.sources[sourceId] = {
+            ...source,
+            ...this.getMetadataIndex(content),
+        };
+        this.saveMeta();
+        return true;
+    }
+
+    batchIndexSourceMetadata(sourceIds: string[]): number {
+        let count = 0;
+        for (const sourceId of sourceIds) {
+            const source = this.meta.sources[sourceId];
+            if (!source) continue;
+            const content = this.readSourceFile(sourceId);
+            if (!content?.metadata) continue;
+            this.meta.sources[sourceId] = {
+                ...source,
+                ...this.getMetadataIndex(content),
+            };
+            count++;
+        }
+        if (count > 0) this.saveMeta();
+        return count;
+    }
+
     /**
      * 执行提取流程 (始终新建)
      */
@@ -413,6 +467,7 @@ export class SourceManager {
             origin: 'local',
             isActive: true,
             checksum: calculateChecksum(content),
+            ...this.getMetadataIndex(content),
             updatedAt: Date.now(),
             createdAt: Date.now()
         };
@@ -442,6 +497,7 @@ export class SourceManager {
                 origin: 'local',
                 isActive: true,
                 checksum: calculateChecksum(entry.content),
+                ...this.getMetadataIndex(entry.content),
                 updatedAt: Date.now(),
                 createdAt: Date.now()
             };

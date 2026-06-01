@@ -42,7 +42,8 @@ export async function handlePluginExtractCore(payload: CompanionPluginExtractPay
         if (shouldSkipByExtracted(payload.settings, metadataText, extractedSources)) {
             return { status: 'skipped', resourceId: payload.resourceId, label: payload.label, reason: 'chinese' };
         }
-        if (!hasExtractedTranslationContent(extractedSources)) {
+        const extractionEnabled = payload.settings?.astExtractionEnabled !== false || payload.settings?.reExtractionEnabled !== false;
+        if (extractionEnabled && !hasExtractedTranslationContent(extractedSources)) {
             return { status: 'skipped', resourceId: payload.resourceId, label: payload.label, reason: 'empty' };
         }
 

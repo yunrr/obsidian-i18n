@@ -18,6 +18,7 @@ import { useGlobalStoreInstance } from '~/utils/store/global';
 import { mountReactView } from '~/utils/core/react';
 import { StringPicker } from '~/utils/ui/string-picker';
 import { calculateChecksum, mergeAstItems, mergeRegexItems } from '@/src/utils/translator/light';
+import { getEffectiveExtractionSettings } from '@/src/utils/translator/config';
 import { saveTranslationFile } from '@/src/manager/io-manager';
 import { createTranslationProvider } from '~/ai/provider-factory';
 
@@ -132,21 +133,7 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
     const [isAddPathDialogOpen, setIsAddPathDialogOpen] = useState(false);
     const [newPathInput, setNewPathInput] = useState('');
 
-    const getExtractionSettings = React.useCallback(() => ({
-        author: i18n.settings.author,
-        reFlags: i18n.settings.reFlags,
-        reLength: i18n.settings.reLength,
-        reDatas: i18n.settings.reDatas,
-        reRejectRe: i18n.settings.reRejectRe,
-        reValidRe: i18n.settings.reValidRe,
-        chineseSkipMode: i18n.settings.chineseSkipMode || 'source',
-        astAssignments: i18n.settings.astAssignments,
-        astFunctions: i18n.settings.astFunctions,
-        astKeys: i18n.settings.astKeys,
-        astMaxLength: i18n.settings.astMaxLength ?? 300,
-        astRejectRe: i18n.settings.astRejectRe,
-        astValidRe: i18n.settings.astValidRe,
-    }), [i18n.settings]);
+    const getExtractionSettings = React.useCallback(() => getEffectiveExtractionSettings(i18n.settings), [i18n.settings]);
 
     const applyRegexItems = React.useCallback((code: string, items: any[]) => {
         let result = code;

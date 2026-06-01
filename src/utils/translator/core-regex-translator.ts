@@ -206,6 +206,8 @@ export class RegexTranslator {
     }
 
     public extractTranslationsByRegex(code: string): PluginTranslationV1Regex[] {
+        if (this.settings?.reExtractionEnabled === false) return [];
+
         const translations: PluginTranslationV1Regex[] = [];
         // 用Set存储已添加的source，优化去重效率（O(1)查找）
         const seenSources = new Set<string>();
