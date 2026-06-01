@@ -1055,15 +1055,15 @@ async function hasExistingExtractedSource(paths: WorkerPersistencePaths, pluginI
     return false;
 }
 
-async function saveExtractedSource(paths: WorkerPersistencePaths, pluginId: string, content: PluginTranslationV1 | ThemeTranslationV1, options: { title: string; type?: 'theme' }) {
-    await withPersistenceLock(async () => {
+async function saveExtractedSource(paths: WorkerPersistencePaths, pluginId: string, content: PluginTranslationV1 | ThemeTranslationV1, options: { title: string; type?: 'theme' }): Promise<boolean> {
+    return withPersistenceLock(async () => {
         const meta = await loadMeta(paths);
         const type = options.type || 'plugin';
         const translationVersion = content.metadata?.version || '';
         for (const source of Object.values(meta.sources)) {
             if (source.plugin !== pluginId || source.type !== type) continue;
             if (translationVersion && source.translationVersion !== translationVersion) continue;
-            if (await fs.pathExists(path.join(paths.sourcesDir, `${source.id}.json`))) return;
+            if (await fs.pathExists(path.join(paths.sourcesDir, `${source.id}.json`))) return false;
         }
         const now = Date.now();
         const sourceId = nanoid(32);
@@ -1087,6 +1087,7 @@ async function saveExtractedSource(paths: WorkerPersistencePaths, pluginId: stri
         };
         meta.sources[sourceId] = source;
         await saveMeta(paths, meta);
+        return true;
     });
 }
 
@@ -1459,9 +1460,13 @@ async function handlePluginBatchExtract(task: CompanionTaskRuntime, payload: Com
         if (!isTaskActive(task)) return;
         const index = requestIndexes[requestIndex];
         if (result.status === 'success') {
-            await saveExtractedSource(paths, result.pluginId, result.content, result.options);
-            bumpSourceRevision(task);
-            task.progress.successCount++;
+            const saved = await saveExtractedSource(paths, result.pluginId, result.content, result.options);
+            if (saved) {
+                bumpSourceRevision(task);
+                task.progress.successCount++;
+            } else {
+                task.progress.skippedCount++;
+            }
         } else if (result.status === 'skipped') {
             task.progress.skippedCount++;
         } else {
@@ -1514,9 +1519,13 @@ async function handleThemeBatchExtract(task: CompanionTaskRuntime, payload: Comp
         if (!isTaskActive(task)) return;
         const index = requestIndexes[requestIndex];
         if (result.status === 'success') {
-            await saveExtractedSource(paths, result.pluginId, result.content, { title: result.options.title, type: 'theme' });
-            bumpSourceRevision(task);
-            task.progress.successCount++;
+            const saved = await saveExtractedSource(paths, result.pluginId, result.content, { title: result.options.title, type: 'theme' });
+            if (saved) {
+                bumpSourceRevision(task);
+                task.progress.successCount++;
+            } else {
+                task.progress.skippedCount++;
+            }
         } else if (result.status === 'skipped') {
             task.progress.skippedCount++;
         } else {

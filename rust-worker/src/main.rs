@@ -4684,7 +4684,7 @@ async fn save_extracted_source(
     content: &Value,
     title: &str,
     source_type: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let _guard = state.persistence_lock.lock().await;
     let mut meta = load_meta(paths);
     let source_id = nanoid!(32);
@@ -4699,7 +4699,7 @@ async fn save_extracted_source(
                     .and_then(Value::as_str)
                     .is_some_and(|existing_source_id| paths.sources_dir.join(format!("{existing_source_id}.json")).exists())
         }) {
-            return Ok(());
+            return Ok(false);
         }
         for source in sources.values_mut() {
             if source.get("plugin").and_then(Value::as_str) == Some(plugin_id) {
@@ -4723,7 +4723,7 @@ async fn save_extracted_source(
         sources.insert(source_id.clone(), source);
     }
     write_json_pretty(&paths.meta_path, &meta)?;
-    Ok(())
+    Ok(true)
 }
 
 async fn update_record<F>(state: &AppState, paths: &PersistencePaths, updater: F) -> Result<()>
@@ -4931,10 +4931,12 @@ async fn handle_extract_batch(
                         .and_then(Value::as_str)
                         .unwrap_or("plugin");
                     let content = result.content.unwrap_or(Value::Null);
-                    save_extracted_source(&state, &paths, plugin_id, &content, title, source_type)
-                        .await?;
-                    bump_source_revision(&task).await;
-                    increment_progress(&task, "successCount", 1).await;
+                    if save_extracted_source(&state, &paths, plugin_id, &content, title, source_type).await? {
+                        bump_source_revision(&task).await;
+                        increment_progress(&task, "successCount", 1).await;
+                    } else {
+                        increment_progress(&task, "skippedCount", 1).await;
+                    }
                 }
                 Ok(result) if result.status == "skipped" => {
                     increment_progress(&task, "skippedCount", 1).await;
