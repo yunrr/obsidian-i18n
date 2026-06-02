@@ -1181,6 +1181,7 @@ function isTaskActive(task: CompanionTaskRuntime) {
 
 async function requestTaskCancel(task: CompanionTaskRuntime) {
     task.cancelRequested = true;
+    touchProgress(task, { currentLabel: '正在停止' });
     const cleanup = task.extractCleanup;
     task.extractCleanup = null;
     if (cleanup) void cleanup().catch(error => console.warn('[i18n] Failed to cleanup extract workers:', error));
@@ -1940,7 +1941,6 @@ if (process.argv[2] === 'stdio-task') {
                 const payload = JSON.parse(body || '{}');
                 const task = getTask(payload.taskId || '');
                 void requestTaskCancel(task);
-                touchProgress(task, { status: 'cancelled', currentLabel: '' });
                 send(res, 200, { ok: true, progress: task.progress });
                 return;
             }

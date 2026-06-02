@@ -856,7 +856,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                 .then(({ progress }) => syncWorkerProgress(progress))
                 .catch(error => console.warn('[i18n] Failed to cancel companion task:', error));
         }
-        setBatchTask(prev => ({ ...prev, isRunning: false, currentLabel: t('Manager.Common.Status.Stopping', '正在停止') }));
+        setBatchTask(prev => ({ ...prev, isRunning: true, currentLabel: t('Manager.Common.Status.Stopping', '正在停止') }));
     }, [i18n, syncWorkerProgress, t]);
 
     const handleRetryThemeFailures = useCallback(async () => {

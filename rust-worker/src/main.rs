@@ -1869,8 +1869,7 @@ async fn task_cancel_route(
         .unwrap_or_default();
     match get_task(&state, task_id).await {
         Some(task) => {
-            *task.cancel_requested.lock().await = true;
-            touch_progress(&task, json!({ "status": "cancelled", "currentLabel": "" })).await;
+            request_task_cancel(&task).await;
             Json(json!({ "ok": true, "progress": task.progress.lock().await.clone() }))
                 .into_response()
         }
@@ -2048,6 +2047,11 @@ async fn ensure_not_cancelled(task: &TaskRuntime) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+async fn request_task_cancel(task: &TaskRuntime) {
+    *task.cancel_requested.lock().await = true;
+    touch_progress(task, json!({ "currentLabel": "正在停止" })).await;
 }
 
 async fn touch_progress(task: &TaskRuntime, updates: Value) {
@@ -5293,7 +5297,19 @@ async fn handle_batch_translate(
     let mut next_resource_index = 0usize;
 
     while next_resource_index < batch.resources.len() {
-        ensure_not_cancelled(&task).await?;
+        if let Err(error) = ensure_not_cancelled(&task).await {
+            save_batch_translate_checkpoint(
+                state,
+                &paths,
+                &batch.checkpoint_key,
+                scope,
+                &resources_value,
+                &completed,
+                &task,
+            )
+            .await?;
+            return Err(error);
+        }
         let mut resource_states = Vec::<BatchResourceState>::new();
         let mut ast_items = Vec::<Value>::new();
         let mut regex_items = Vec::<Value>::new();
@@ -5309,7 +5325,19 @@ async fn handle_batch_translate(
             let index = next_resource_index;
             next_resource_index += 1;
             let resource = batch.resources[index].clone();
-            ensure_not_cancelled(&task).await?;
+            if let Err(error) = ensure_not_cancelled(&task).await {
+                save_batch_translate_checkpoint(
+                    state,
+                    &paths,
+                    &batch.checkpoint_key,
+                    scope,
+                    &resources_value,
+                    &completed,
+                    &task,
+                )
+                .await?;
+                return Err(error);
+            }
             touch_progress(&task, json!({ "currentLabel": resource.label })).await;
 
             let Some(source_id) = resource.source_id.clone() else {
@@ -5431,7 +5459,7 @@ async fn handle_batch_translate(
             continue;
         }
 
-        process_batch_translate_window(
+        let window_result = process_batch_translate_window(
             state,
             &task,
             &paths,
@@ -5445,7 +5473,22 @@ async fn handle_batch_translate(
             theme_items,
             is_plugin,
         )
-        .await?;
+        .await;
+        if let Err(error) = window_result {
+            if error.to_string().contains(MANUAL_STOP) {
+                save_batch_translate_checkpoint(
+                    state,
+                    &paths,
+                    &batch.checkpoint_key,
+                    scope,
+                    &resources_value,
+                    &completed,
+                    &task,
+                )
+                .await?;
+            }
+            return Err(error);
+        }
     }
 
     if *task.cancel_requested.lock().await {
@@ -5453,6 +5496,27 @@ async fn handle_batch_translate(
     }
     clear_checkpoint(state, &paths, &batch.checkpoint_key).await?;
     bump_record_revision(&task).await;
+    Ok(())
+}
+
+async fn save_batch_translate_checkpoint(
+    state: &AppState,
+    paths: &PersistencePaths,
+    checkpoint_key: &str,
+    scope: &str,
+    resources: &[Value],
+    completed: &HashSet<usize>,
+    task: &TaskRuntime,
+) -> Result<()> {
+    let progress = task.progress.lock().await.clone();
+    save_checkpoint(
+        state,
+        paths,
+        checkpoint_key,
+        create_checkpoint(scope, "translate", resources, completed, &progress),
+    )
+    .await?;
+    bump_record_revision(task).await;
     Ok(())
 }
 
@@ -7261,7 +7325,6 @@ mod tests {
         assert_eq!(progress.status, "running");
         assert_eq!(progress.current_label, "正在停止");
     }
-
     #[test]
     fn translate_checkpoint_keeps_unfinished_resources_when_stopped_mid_window() {
         let resources = vec![
