@@ -22,6 +22,17 @@ interface TranslationManagerPanelProps {
 }
 
 type ManagedTranslationSource = TranslationSource & { isInstalled: boolean };
+type SourceStatusFilter = 'all' | 'translated' | 'untranslated' | 'partialFailed' | 'error' | 'unindexed';
+
+const getSourceTranslationStatus = (source: TranslationSource, failedSourceIds: Set<string>): Exclude<SourceStatusFilter, 'all'> => {
+    if (source.translationFormatValid === false) return 'error';
+    if (failedSourceIds.has(source.id)) return 'partialFailed';
+
+    const hasCounts = typeof source.pendingTranslationCount === 'number' && typeof source.totalTranslationCount === 'number';
+    if (!hasCounts) return 'unindexed';
+
+    return source.pendingTranslationCount === 0 ? 'translated' : 'untranslated';
+};
 
 export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = ({ i18n }) => {
     const { t } = useTranslation();
@@ -31,6 +42,7 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
     const [originFilter, setOriginFilter] = useState<'all' | 'local' | 'cloud'>('all');
     const [typeFilter, setTypeFilter] = useState<'all' | 'plugin' | 'theme'>('all');
+    const [statusFilter, setStatusFilter] = useState<SourceStatusFilter>('all');
     const [versionFilter, setVersionFilter] = useState<string>('all');
     const deferredSearchQuery = useDeferredValue(searchQuery);
     const parentRef = useRef<HTMLDivElement>(null);
@@ -61,6 +73,42 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
         return sourceManager.getIndexedTranslationVersions();
     }, [sourceManager, sourceTick]);
 
+    const failedSourceIds = useMemo(() => {
+        return new Set(sourceManager.getBatchTaskFailures().map(record => record.sourceId));
+    }, [sourceManager, sourceTick]);
+
+    const statusFilterLabel = useCallback((status: SourceStatusFilter) => {
+        switch (status) {
+            case 'translated':
+                return t('Manager.Plugins.Filters.Translated');
+            case 'untranslated':
+                return t('Manager.Plugins.Filters.Untranslated');
+            case 'partialFailed':
+                return t('Manager.Plugins.Filters.PartialFailed', '部分失败');
+            case 'error':
+                return t('Manager.Common.Errors.Error');
+            case 'unindexed':
+                return t('Manager.Sources.Filters.StatusUnindexed', '未索引');
+            default:
+                return t('Manager.Common.Filters.All');
+        }
+    }, [t]);
+
+    const statusBadgeClass = useCallback((status: Exclude<SourceStatusFilter, 'all'>) => {
+        switch (status) {
+            case 'translated':
+                return 'bg-blue-500/10 text-blue-600 border-blue-500/20';
+            case 'untranslated':
+                return 'bg-amber-500/10 text-amber-600 border-amber-500/20';
+            case 'partialFailed':
+                return 'bg-orange-500/10 text-orange-600 border-orange-500/20';
+            case 'error':
+                return 'bg-destructive/10 text-destructive border-destructive/20';
+            case 'unindexed':
+                return 'bg-muted text-muted-foreground border-border';
+        }
+    }, []);
+
     // 获取所有翻译源并应用过滤
     const allSources = useMemo<ManagedTranslationSource[]>(() => {
         let sources = sourceManager.getAllSources();
@@ -82,6 +130,10 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
             sources = sources.filter(s => s.type === typeFilter);
         }
 
+        if (statusFilter !== 'all') {
+            sources = sources.filter(s => getSourceTranslationStatus(s, failedSourceIds) === statusFilter);
+        }
+
         if (versionFilter === '__unknown') {
             sources = sources.filter(s => !s.translationVersion);
         } else if (versionFilter !== 'all') {
@@ -94,7 +146,7 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
             const isInstalled = s.isInstalled ?? (s.type === 'plugin' ? !!i18n.app.plugins.manifests[s.plugin] : true);
             return { ...s, isInstalled };
         });
-    }, [sourceManager, deferredSearchQuery, originFilter, typeFilter, versionFilter, sourceTick, i18n.app.plugins.manifests]);
+    }, [sourceManager, deferredSearchQuery, originFilter, typeFilter, statusFilter, failedSourceIds, versionFilter, sourceTick, i18n.app.plugins.manifests]);
 
     const sourceOriginCounts = useMemo(() => {
         let local = 0;
@@ -304,6 +356,20 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
                             <DropdownMenuTrigger asChild>
                                 <Button variant="outline" size="sm" className="h-9 shadow-sm gap-1.5 rounded-none border-muted-foreground/20 text-[13px] hover:bg-muted/30">
                                     <Filter className="w-3.5 h-3.5 text-muted-foreground/70" />
+                                    {statusFilterLabel(statusFilter)}
+                                </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end" className="w-40 rounded-none">
+                                {(['all', 'untranslated', 'translated', 'partialFailed', 'error', 'unindexed'] as SourceStatusFilter[]).map(status => (
+                                    <DropdownMenuItem key={status} onClick={() => setStatusFilter(status)}>{statusFilterLabel(status)}</DropdownMenuItem>
+                                ))}
+                            </DropdownMenuContent>
+                        </DropdownMenu>
+
+                        <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                                <Button variant="outline" size="sm" className="h-9 shadow-sm gap-1.5 rounded-none border-muted-foreground/20 text-[13px] hover:bg-muted/30">
+                                    <Filter className="w-3.5 h-3.5 text-muted-foreground/70" />
                                     {versionFilter === 'all'
                                         ? t('Manager.Sources.Filters.VersionAll')
                                         : versionFilter === '__unknown'
@@ -396,6 +462,7 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
                                 if (!source) return null;
                                 const isUninstalled = !source.isInstalled;
                                 const isCloud = source.origin === 'cloud';
+                                const translationStatus = getSourceTranslationStatus(source, failedSourceIds);
 
                                 // Special color system for Manager (Management / Data layer)
                                 let statusColor = "bg-primary";
@@ -466,6 +533,9 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
                                                 )}
                                                 <Badge variant="outline" className="text-[9px] px-1.5 py-0 h-[18px] font-mono shrink-0 rounded-none bg-primary/5 text-primary/80 border-primary/20">
                                                     {source.translationVersion ? `v${source.translationVersion}` : t('Manager.Sources.Filters.VersionUnknown')}
+                                                </Badge>
+                                                <Badge variant="outline" className={cn("text-[9px] px-1.5 py-0 h-[18px] font-medium shrink-0 rounded-none", statusBadgeClass(translationStatus))}>
+                                                    {statusFilterLabel(translationStatus)}
                                                 </Badge>
                                             </div>
 

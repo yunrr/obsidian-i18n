@@ -229,7 +229,8 @@ export default {
             OriginLocal: "本地提取",
             OriginCloud: "云端下载",
             VersionAll: "全部版本",
-            VersionUnknown: "未索引"
+            VersionUnknown: "未索引",
+            StatusUnindexed: "未索引"
         },
         Stats: {
             Total: "总译文数",
