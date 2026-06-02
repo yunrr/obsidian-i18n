@@ -859,7 +859,7 @@ type CompanionTaskRuntime = {
     cancelRequested: boolean;
     promise: Promise<void> | null;
     aiQueue: Promise<unknown>;
-    extractCleanup?: (() => Promise<void>) | null;
+    extractCleanup?: (() => void | Promise<void>) | null;
 };
 
 const tasks = new Map<string, CompanionTaskRuntime>();
@@ -1184,7 +1184,7 @@ async function requestTaskCancel(task: CompanionTaskRuntime) {
     touchProgress(task, { currentLabel: '正在停止' });
     const cleanup = task.extractCleanup;
     task.extractCleanup = null;
-    if (cleanup) void cleanup().catch(error => console.warn('[i18n] Failed to cleanup extract workers:', error));
+    if (cleanup) void Promise.resolve(cleanup()).catch((error: unknown) => console.warn('[i18n] Failed to cleanup extract workers:', error));
 }
 
 async function runConcurrentCancellable<T>(items: T[], limit: number, task: CompanionTaskRuntime, worker: (item: T, index: number) => Promise<void>) {
@@ -1213,6 +1213,14 @@ type ExtractThreadResult = CompanionPluginExtractResult | CompanionThemeExtractR
 type WeightedExtractThreadRequest = ExtractThreadRequest & {
     index: number;
     weight: number;
+};
+
+type ExtractCheckpointState<T extends CompanionBatchResource> = {
+    scope: BatchTaskScope;
+    mode: 'extract';
+    resources: T[];
+    completedIndexes: Set<number>;
+    lastCheckpointAt: { value: number };
 };
 
 async function getExtractRequestSize(request: ExtractThreadRequest) {
@@ -1262,27 +1270,30 @@ async function runExtractThreadPool(
     let activeCount = 0;
     let completedCount = 0;
 
-    const cleanupWorkers = async () => {
+    const cleanupWorkers = () => {
         const workers = Array.from(runningWorkers);
         runningWorkers.clear();
-        await Promise.all(workers.map(worker => worker.terminate().catch(() => undefined)));
+        for (const worker of workers) {
+            void worker.terminate().catch(() => undefined);
+        }
     };
 
     task.extractCleanup = cleanupWorkers;
 
     const runRequestInWorker = async (request: WeightedExtractThreadRequest) => {
         const worker = new Worker(extractThreadScript);
+        worker.unref();
         runningWorkers.add(worker);
         const pending = new Map<number, {
             resolve: (result: ExtractThreadResult) => void;
             reject: (error: Error) => void;
         }>();
 
-        const cleanup = async () => {
+        const cleanup = () => {
             pending.forEach(({ reject }) => reject(new Error('CJS extract thread stopped')));
             pending.clear();
             runningWorkers.delete(worker);
-            await worker.terminate().catch(() => undefined);
+            void worker.terminate().catch(() => undefined);
         };
 
         worker.on('message', message => {
@@ -1320,7 +1331,7 @@ async function runExtractThreadPool(
             const result = await runRequest(request);
             await onComplete(result, request.index);
         } finally {
-            await cleanup();
+            cleanup();
         }
     };
 
@@ -1330,14 +1341,30 @@ async function runExtractThreadPool(
         const settleReject = (error: unknown) => {
             if (settled) return;
             settled = true;
-            cleanupWorkers().finally(() => reject(error));
+            cleanupWorkers();
+            reject(error);
+        };
+
+        const finishOne = (request: WeightedExtractThreadRequest) => {
+            activeCount--;
+            activeWeight -= request.weight;
+            completedCount++;
+            if (completedCount >= weightedRequests.length) {
+                settled = true;
+                task.extractCleanup = null;
+                cleanupWorkers();
+                resolve();
+                return;
+            }
+            schedule();
         };
 
         const schedule = () => {
             if (settled) return;
             if (!isTaskActive(task)) {
                 settled = true;
-                cleanupWorkers().then(resolve, reject);
+                cleanupWorkers();
+                resolve();
                 return;
             }
 
@@ -1350,18 +1377,7 @@ async function runExtractThreadPool(
                 activeCount++;
                 activeWeight += request.weight;
                 runRequestInWorker(request)
-                    .then(() => {
-                        activeCount--;
-                        activeWeight -= request.weight;
-                        completedCount++;
-                        if (completedCount >= weightedRequests.length) {
-                            settled = true;
-                            task.extractCleanup = null;
-                            cleanupWorkers().then(resolve, reject);
-                            return;
-                        }
-                        schedule();
-                    })
+                    .then(() => finishOne(request))
                     .catch(error => {
                         activeCount--;
                         activeWeight -= request.weight;
@@ -1374,12 +1390,7 @@ async function runExtractThreadPool(
                 activeCount++;
                 activeWeight += request.weight;
                 runRequestInWorker(request)
-                    .then(() => {
-                        activeCount--;
-                        activeWeight -= request.weight;
-                        completedCount++;
-                        schedule();
-                    })
+                    .then(() => finishOne(request))
                     .catch(error => {
                         activeCount--;
                         activeWeight -= request.weight;
@@ -1425,7 +1436,7 @@ function createCheckpoint<T extends CompanionBatchResource>(scope: BatchTaskScop
 }
 
 function shouldSaveExtractCheckpoint(progress: CompanionTaskProgress, lastCheckpointAt: { value: number }) {
-    if (progress.processedResources === progress.totalResources) return true;
+    if (progress.processedResources === progress.totalResources) return false;
     if (progress.processedResources % extractCheckpointEveryResources === 0) return true;
     const now = Date.now();
     if (now - lastCheckpointAt.value < extractCheckpointEveryMs) return false;
@@ -1433,22 +1444,37 @@ function shouldSaveExtractCheckpoint(progress: CompanionTaskProgress, lastCheckp
     return true;
 }
 
+async function saveExtractCheckpointIfNeeded<T extends CompanionBatchResource>(
+    paths: WorkerPersistencePaths,
+    key: string,
+    progress: CompanionTaskProgress,
+    state: ExtractCheckpointState<T>,
+) {
+    if (!shouldSaveExtractCheckpoint(progress, state.lastCheckpointAt)) return false;
+    await saveCheckpoint(paths, key, createCheckpoint(state.scope, state.mode, state.resources, state.completedIndexes, progress));
+    return true;
+}
+
 async function handlePluginBatchExtract(task: CompanionTaskRuntime, payload: CompanionPluginBatchExtractPayload) {
     const paths = getPersistencePaths(payload.persistence.basePath);
     const translationVersion = payload.translationVersion || payload.settings.translationVersion || '1.0.1';
-    const completedIndexes = new Set<number>();
+    const checkpointState: ExtractCheckpointState<CompanionBatchResource> = {
+        scope: 'plugin',
+        mode: 'extract',
+        resources: payload.resources,
+        completedIndexes: new Set<number>(),
+        lastCheckpointAt: { value: Date.now() },
+    };
     const requests: ExtractThreadRequest[] = [];
     const requestIndexes: number[] = [];
-    const lastCheckpointAt = { value: Date.now() };
     for (const [index, resource] of payload.resources.entries()) {
         if (await hasExistingExtractedSource(paths, resource.resourceId, 'plugin', translationVersion)) {
-            completedIndexes.add(index);
+            checkpointState.completedIndexes.add(index);
             task.progress.processedResources++;
             task.progress.skippedCount++;
             if (task.progress.processedResources === task.progress.totalResources) touchProgress(task, { currentLabel: '' });
             touchProgress(task);
-            if (shouldSaveExtractCheckpoint(task.progress, lastCheckpointAt)) {
-                await saveCheckpoint(paths, payload.checkpointKey, createCheckpoint('plugin', 'extract', payload.resources, completedIndexes, task.progress));
+            if (await saveExtractCheckpointIfNeeded(paths, payload.checkpointKey, task.progress, checkpointState)) {
                 bumpRecordRevision(task);
             }
             continue;
@@ -1477,12 +1503,11 @@ async function handlePluginBatchExtract(task: CompanionTaskRuntime, payload: Com
             task.progress.failedCount++;
             console.error(`[i18n] Failed to batch extract plugin ${result.resourceId}:`, result.error);
         }
-        completedIndexes.add(index);
+        checkpointState.completedIndexes.add(index);
         task.progress.processedResources++;
         if (task.progress.processedResources === task.progress.totalResources) touchProgress(task, { currentLabel: '' });
         touchProgress(task);
-        if (shouldSaveExtractCheckpoint(task.progress, lastCheckpointAt)) {
-            await saveCheckpoint(paths, payload.checkpointKey, createCheckpoint('plugin', 'extract', payload.resources, completedIndexes, task.progress));
+        if (await saveExtractCheckpointIfNeeded(paths, payload.checkpointKey, task.progress, checkpointState)) {
             bumpRecordRevision(task);
         }
     });
@@ -1495,19 +1520,23 @@ async function handlePluginBatchExtract(task: CompanionTaskRuntime, payload: Com
 async function handleThemeBatchExtract(task: CompanionTaskRuntime, payload: CompanionThemeBatchExtractPayload) {
     const paths = getPersistencePaths(payload.persistence.basePath);
     const translationVersion = payload.translationVersion || payload.settings.translationVersion || '1.0.1';
-    const completedIndexes = new Set<number>();
+    const checkpointState: ExtractCheckpointState<CompanionBatchResource> = {
+        scope: 'theme',
+        mode: 'extract',
+        resources: payload.resources,
+        completedIndexes: new Set<number>(),
+        lastCheckpointAt: { value: Date.now() },
+    };
     const requests: ExtractThreadRequest[] = [];
     const requestIndexes: number[] = [];
-    const lastCheckpointAt = { value: Date.now() };
     for (const [index, resource] of payload.resources.entries()) {
         if (await hasExistingExtractedSource(paths, resource.resourceId, 'theme', translationVersion)) {
-            completedIndexes.add(index);
+            checkpointState.completedIndexes.add(index);
             task.progress.processedResources++;
             task.progress.skippedCount++;
             if (task.progress.processedResources === task.progress.totalResources) touchProgress(task, { currentLabel: '' });
             touchProgress(task);
-            if (shouldSaveExtractCheckpoint(task.progress, lastCheckpointAt)) {
-                await saveCheckpoint(paths, payload.checkpointKey, createCheckpoint('theme', 'extract', payload.resources, completedIndexes, task.progress));
+            if (await saveExtractCheckpointIfNeeded(paths, payload.checkpointKey, task.progress, checkpointState)) {
                 bumpRecordRevision(task);
             }
             continue;
@@ -1536,12 +1565,11 @@ async function handleThemeBatchExtract(task: CompanionTaskRuntime, payload: Comp
             task.progress.failedCount++;
             console.error(`[i18n] Failed to batch extract theme ${result.resourceId}:`, result.error);
         }
-        completedIndexes.add(index);
+        checkpointState.completedIndexes.add(index);
         task.progress.processedResources++;
         if (task.progress.processedResources === task.progress.totalResources) touchProgress(task, { currentLabel: '' });
         touchProgress(task);
-        if (shouldSaveExtractCheckpoint(task.progress, lastCheckpointAt)) {
-            await saveCheckpoint(paths, payload.checkpointKey, createCheckpoint('theme', 'extract', payload.resources, completedIndexes, task.progress));
+        if (await saveExtractCheckpointIfNeeded(paths, payload.checkpointKey, task.progress, checkpointState)) {
             bumpRecordRevision(task);
         }
     });
@@ -1821,7 +1849,7 @@ async function runAsyncTask(task: CompanionTaskRuntime, type: CompanionAsyncTask
     } finally {
         const cleanup = task.extractCleanup;
         task.extractCleanup = null;
-        if (cleanup) await cleanup().catch(error => console.warn('[i18n] Failed to cleanup extract workers:', error));
+        if (cleanup) await Promise.resolve(cleanup()).catch((error: unknown) => console.warn('[i18n] Failed to cleanup extract workers:', error));
     }
 }
 
