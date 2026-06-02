@@ -88,7 +88,8 @@ const EMPTY_BATCH_TASK_STATE: BatchTaskState = {
     skippedCount: 0,
 };
 
-const SOURCE_SYNC_THROTTLE_MS = 250;
+const SOURCE_SYNC_THROTTLE_MS = 750;
+const BATCH_PROGRESS_POLL_MS = 120;
 
 const shouldTranslateText = (target?: string, source?: string) => !target || target.trim() === '' || target === source;
 const getPositiveInt = (value: unknown, fallback: number) => {
@@ -185,6 +186,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
     const taskIdRef = useRef<string | null>(null);
     const syncRevisionRef = useRef({ sourceRevision: 0, recordRevision: 0 });
     const lastSourceSyncAtRef = useRef(0);
+    const sourceSyncTimerRef = useRef<number | null>(null);
     const metadataIndexAttemptedRef = useRef<Set<string>>(new Set());
 
     const setViewMode = useCallback((mode: 'list' | 'grid') => {
@@ -626,10 +628,24 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
     }, []);
 
     const syncSourceStateFromDisk = useCallback(() => {
+        if (sourceSyncTimerRef.current !== null) {
+            window.clearTimeout(sourceSyncTimerRef.current);
+            sourceSyncTimerRef.current = null;
+        }
         lastSourceSyncAtRef.current = Date.now();
         i18n.sourceManager.reloadFromDisk();
         handleRefresh();
     }, [handleRefresh, i18n]);
+
+    const requestSourceStateSync = useCallback(() => {
+        const elapsed = Date.now() - lastSourceSyncAtRef.current;
+        if (elapsed >= SOURCE_SYNC_THROTTLE_MS) {
+            syncSourceStateFromDisk();
+            return;
+        }
+        if (sourceSyncTimerRef.current !== null) return;
+        sourceSyncTimerRef.current = window.setTimeout(syncSourceStateFromDisk, SOURCE_SYNC_THROTTLE_MS - elapsed);
+    }, [syncSourceStateFromDisk]);
 
     const syncWorkerProgress = useCallback((progress: CompanionTaskProgress) => {
         setBatchTask(prev => ({
@@ -652,10 +668,10 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
 
         revisions.sourceRevision = progress.sourceRevision;
         revisions.recordRevision = progress.recordRevision;
-        if (hasSourceRevisionChange || Date.now() - lastSourceSyncAtRef.current >= SOURCE_SYNC_THROTTLE_MS) {
-            syncSourceStateFromDisk();
+        if (hasSourceRevisionChange || hasRecordRevisionChange) {
+            requestSourceStateSync();
         }
-    }, [syncSourceStateFromDisk]);
+    }, [requestSourceStateSync]);
 
     const runWorkerTask = useCallback(async (type: 'plugin-batch-extract' | 'plugin-batch-translate' | 'plugin-failure-retry', payload: unknown) => {
         const started = await i18n.companionWorkerManager.startTask(type, payload);
@@ -666,7 +682,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
 
         let progress = started.progress;
         while (progress.status === 'queued' || progress.status === 'running') {
-            await new Promise(resolve => window.setTimeout(resolve, 80));
+            await new Promise(resolve => window.setTimeout(resolve, BATCH_PROGRESS_POLL_MS));
             const status = await i18n.companionWorkerManager.getTaskStatus(started.taskId);
             progress = status.progress;
             syncWorkerProgress(progress);

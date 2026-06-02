@@ -51,7 +51,7 @@ import { handlePluginExtractCore, handleThemeExtractCore } from './companion-ext
 const port = Number(process.argv[2]) || 18743;
 const host = '127.0.0.1';
 const maxBodyBytes = 100 * 1024 * 1024;
-const maxExtractThreadConcurrency = 20;
+const maxExtractThreadConcurrency = 8;
 const extractCheckpointEveryResources = 100;
 const extractCheckpointEveryMs = 10_000;
 const extractThreadScript = path.join(__dirname, 'i18n-companion-extract-thread.cjs');
