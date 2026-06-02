@@ -32,6 +32,7 @@ use tokio::{
     io::AsyncReadExt,
     sync::{oneshot, Mutex, Semaphore},
     task::JoinSet,
+    time::timeout as tokio_timeout,
 };
 use url::Url;
 
@@ -6286,21 +6287,24 @@ async fn call_chat_completion(
     }
 
     let client = reqwest::Client::new();
-    let response = client
+    let request = client
         .post(&config.chat_completions_url)
-        .timeout(Duration::from_millis(timeout_ms))
         .header("content-type", "application/json")
         .bearer_auth(&config.api_key)
-        .body(request.to_string())
-        .send()
+        .body(request.to_string());
+    let mut response = tokio_timeout(Duration::from_millis(timeout_ms), request.send())
         .await
+        .map_err(|_| {
+            anyhow!(
+                "AI 首字响应超时（耗时 {}，超时 {}）",
+                format_duration(now_ms() - started),
+                format_duration(timeout_ms)
+            )
+        })?
         .map_err(|error| normalize_ai_error(error, started, timeout_ms))?;
     let status = response.status();
     let status_text = status.canonical_reason().unwrap_or_default().to_string();
-    let text = response
-        .text()
-        .await
-        .map_err(|error| normalize_ai_error(error, started, timeout_ms))?;
+    let text = read_response_text_with_first_chunk_timeout(&mut response, started, timeout_ms).await?;
     let body = normalize_streaming_response_text(&text);
     if !status.is_success() {
         let mut message = format!(
@@ -6384,6 +6388,99 @@ async fn call_chat_completion(
             error
         )
     })
+}
+
+async fn read_response_text_with_first_chunk_timeout(
+    response: &mut reqwest::Response,
+    started: u64,
+    timeout_ms: u64,
+) -> Result<String> {
+    let mut bytes = Vec::new();
+    let first_content_deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= first_content_deadline {
+            return Err(anyhow!(
+                "AI 首个内容响应超时（耗时 {}，超时 {}）",
+                format_duration(now_ms() - started),
+                format_duration(timeout_ms)
+            ));
+        }
+        let remaining = first_content_deadline.saturating_duration_since(now);
+        let chunk = tokio_timeout(remaining, response.chunk())
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "AI 首个内容响应超时（耗时 {}，超时 {}）",
+                    format_duration(now_ms() - started),
+                    format_duration(timeout_ms)
+                )
+            })?
+            .map_err(|error| normalize_ai_error(error, started, timeout_ms))?;
+
+        let Some(chunk) = chunk else {
+            return Ok(String::from_utf8(bytes).map_err(|error| {
+                anyhow!(
+                    "AI 返回非 UTF-8 响应（耗时 {}）：{}",
+                    format_duration(now_ms() - started),
+                    error
+                )
+            })?);
+        };
+        bytes.extend_from_slice(&chunk);
+        if response_text_has_activity_delta(&bytes) {
+            break;
+        }
+    }
+
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| normalize_ai_error(error, started, timeout_ms))?
+    {
+        bytes.extend_from_slice(&chunk);
+    }
+
+    String::from_utf8(bytes)
+        .map_err(|error| anyhow!("AI 返回非 UTF-8 响应（耗时 {}）：{}", format_duration(now_ms() - started), error))
+}
+
+fn response_text_has_activity_delta(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with("data:") {
+        return !trimmed.is_empty();
+    }
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.starts_with("data:") {
+            continue;
+        }
+        let payload = line.trim_start_matches("data:").trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<Value>(payload) {
+            if event
+                .pointer("/choices/0/delta/content")
+                .or_else(|| event.pointer("/choices/0/message/content"))
+                .or_else(|| event.pointer("/choices/0/delta/reasoning_content"))
+                .or_else(|| event.pointer("/choices/0/message/reasoning_content"))
+                .or_else(|| event.pointer("/choices/0/delta/reasoning"))
+                .or_else(|| event.pointer("/choices/0/message/reasoning"))
+                .or_else(|| event.get("reasoning_content"))
+                .or_else(|| event.get("reasoning"))
+                .and_then(Value::as_str)
+                .map(|content| !content.is_empty())
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn normalize_ai_error(error: reqwest::Error, started: u64, timeout_ms: u64) -> anyhow::Error {
@@ -7092,6 +7189,11 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::{
+        io::AsyncWriteExt,
+        net::TcpListener,
+        time::{sleep, Duration as TokioDuration},
+    };
 
     #[test]
     fn translate_window_item_limit_feeds_concurrency_without_scaling_to_resources() {
@@ -7127,5 +7229,190 @@ mod tests {
         assert_eq!(failed_items, 2);
         assert!(report.failures.iter().any(|failure| failure.resource_state_index == 0));
         assert!(report.failures.iter().any(|failure| failure.resource_state_index == 1));
+    }
+    #[tokio::test]
+    async fn requesting_cancel_keeps_task_running_until_worker_exits() {
+        let task = Arc::new(TaskRuntime {
+            progress: Mutex::new(CompanionTaskProgress {
+                task_id: "task".to_string(),
+                scope: "plugin".to_string(),
+                mode: "translate".to_string(),
+                status: "running".to_string(),
+                current_label: "Batch".to_string(),
+                processed_resources: 0,
+                total_resources: 1,
+                processed_items: 0,
+                total_items: 1,
+                success_count: 0,
+                failed_count: 0,
+                skipped_count: 0,
+                source_revision: 0,
+                record_revision: 0,
+                updated_at: 0,
+                error: None,
+            }),
+            cancel_requested: Mutex::new(false),
+        });
+
+        request_task_cancel(&task).await;
+
+        assert!(*task.cancel_requested.lock().await);
+        let progress = task.progress.lock().await.clone();
+        assert_eq!(progress.status, "running");
+        assert_eq!(progress.current_label, "正在停止");
+    }
+
+    #[test]
+    fn translate_checkpoint_keeps_unfinished_resources_when_stopped_mid_window() {
+        let resources = vec![
+            json!({ "resourceId": "done", "label": "Done", "sourceId": "source-done" }),
+            json!({ "resourceId": "pending-a", "label": "Pending A", "sourceId": "source-a" }),
+            json!({ "resourceId": "pending-b", "label": "Pending B", "sourceId": "source-b" }),
+        ];
+        let completed = HashSet::from([0usize]);
+        let progress = CompanionTaskProgress {
+            task_id: "task".to_string(),
+            scope: "plugin".to_string(),
+            mode: "translate".to_string(),
+            status: "running".to_string(),
+            current_label: "正在停止".to_string(),
+            processed_resources: 1,
+            total_resources: 3,
+            processed_items: 2,
+            total_items: 6,
+            success_count: 1,
+            failed_count: 0,
+            skipped_count: 0,
+            source_revision: 0,
+            record_revision: 0,
+            updated_at: 0,
+            error: None,
+        };
+
+        let checkpoint = create_checkpoint("plugin", "translate", &resources, &completed, &progress);
+
+        assert_eq!(checkpoint.completed_resources, 1);
+        assert_eq!(checkpoint.processed_items, 2);
+        assert_eq!(checkpoint.resources.len(), 2);
+        assert_eq!(checkpoint.resources[0].resource_id, "pending-a");
+        assert_eq!(checkpoint.resources[1].resource_id, "pending-b");
+    }
+
+    #[tokio::test]
+    async fn ai_timeout_allows_body_to_finish_after_first_chunk() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request_buffer = vec![0u8; 4096];
+            let _ = stream.read(&mut request_buffer).await.unwrap();
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let first_event = json!({
+                "choices": [{ "delta": { "content": "{\"items\":[" } }]
+            });
+            stream
+                .write_all(format!("data: {}\n\n", first_event).as_bytes())
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+
+            sleep(TokioDuration::from_millis(1_100)).await;
+
+            let second_event = json!({
+                "choices": [{ "delta": { "content": "{\"i\":1,\"t\":\"甲\"}]}" }, "finish_reason": "stop" }]
+            });
+            stream
+                .write_all(format!("data: {}\n\ndata: [DONE]\n\n", second_event).as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let config = CompanionTranslationConfig {
+            chat_completions_url: format!("http://{addr}/v1/chat/completions"),
+            api_key: "test-key".to_string(),
+            model: "test-model".to_string(),
+            timeout_ms: 80,
+            response_format: "json_object".to_string(),
+            batch_size: 1,
+            overwrite_existing_translations: false,
+            concurrency: 1,
+            prompts: PromptConfig {
+                ast: String::new(),
+                regex: String::new(),
+                theme: String::new(),
+            },
+        };
+
+        let translated = call_chat_completion(&[json!({ "i": 1, "s": "A" })], "prompt", &config)
+            .await
+            .unwrap();
+
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].i, 1);
+        assert_eq!(translated[0].t, "甲");
+    }
+
+    #[tokio::test]
+    async fn ai_timeout_treats_reasoning_as_activity_before_content() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request_buffer = vec![0u8; 4096];
+            let _ = stream.read(&mut request_buffer).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let reasoning_event = json!({
+                "choices": [{ "delta": { "reasoning_content": "thinking" } }]
+            });
+            stream
+                .write_all(format!("data: {}\n\n", reasoning_event).as_bytes())
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+
+            sleep(TokioDuration::from_millis(1_100)).await;
+
+            let content_event = json!({
+                "choices": [{ "delta": { "content": "{\"items\":[{\"i\":1,\"t\":\"甲\"}]}" }, "finish_reason": "stop" }]
+            });
+            let _ = stream
+                .write_all(format!("data: {}\n\ndata: [DONE]\n\n", content_event).as_bytes())
+                .await;
+        });
+
+        let config = CompanionTranslationConfig {
+            chat_completions_url: format!("http://{addr}/v1/chat/completions"),
+            api_key: "test-key".to_string(),
+            model: "test-model".to_string(),
+            timeout_ms: 80,
+            response_format: "json_object".to_string(),
+            batch_size: 1,
+            overwrite_existing_translations: false,
+            concurrency: 1,
+            prompts: PromptConfig {
+                ast: String::new(),
+                regex: String::new(),
+                theme: String::new(),
+            },
+        };
+
+        let translated = call_chat_completion(&[json!({ "i": 1, "s": "A" })], "prompt", &config)
+            .await
+            .unwrap();
+
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].i, 1);
+        assert_eq!(translated[0].t, "甲");
     }
 }
