@@ -4,7 +4,7 @@ import * as fs from 'fs-extra';
 import { useTranslation } from 'react-i18next';
 import { Notice } from 'obsidian';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { Search, LayoutGrid, List, FileOutput, Languages, Loader2, RotateCcw, Square, AlertTriangle } from 'lucide-react';
+import { Search, LayoutGrid, List, FileOutput, Languages, Loader2, RotateCcw, Square, AlertTriangle, Trash2 } from 'lucide-react';
 
 import I18N from 'src/main';
 import { OBThemeManifest, BatchTaskFailureRecord } from 'src/types';
@@ -550,6 +550,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             const source = i18n.sourceManager.getSourceForPluginVersion(theme.name, 'theme', batchTranslationVersion);
             const counts = getThemeTranslationCounts(source?.id);
             if (!source || !counts) continue;
+            if (i18n.settings.llmOverwriteExistingTranslations !== true && !failedSourceIds.has(source.id) && counts.pendingTranslationCount === 0) continue;
             const itemCount = i18n.settings.llmOverwriteExistingTranslations === true
                 ? counts.totalTranslationCount
                 : counts.pendingTranslationCount;
@@ -562,7 +563,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             });
         }
         return resources;
-    }, [batchTranslationVersion, displayThemes, getThemeTranslationCounts, i18n.settings.llmOverwriteExistingTranslations, i18n.sourceManager, sourceTick]);
+    }, [batchTranslationVersion, displayThemes, failedSourceIds, getThemeTranslationCounts, i18n.settings.llmOverwriteExistingTranslations, i18n.sourceManager, sourceTick]);
 
     const translatableThemes = useMemo(() => {
         return displayThemes.filter(theme => themeTranslateResourcesById.has(theme.name));
@@ -755,6 +756,19 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
 
     const handleBatchExtract = useCallback(() => startThemeBatchExtract(false), [startThemeBatchExtract]);
     const handleResumeExtract = useCallback(() => startThemeBatchExtract(true), [startThemeBatchExtract]);
+
+    const hasThemeBatchRecords = !!themeExtractCheckpoint || !!themeTranslateCheckpoint || themeFailureRecords.length > 0;
+
+    const handleClearThemeBreakpoints = useCallback(async () => {
+        await i18n.companionWorkerManager.clearBatchRecords({
+            persistence: { basePath: i18n.sourceManager.getBasePath() },
+            checkpointKeys: [THEME_EXTRACT_CHECKPOINT_KEY, THEME_TRANSLATE_CHECKPOINT_KEY],
+            scope: 'theme',
+        });
+        i18n.sourceManager.reloadFromDisk();
+        handleRefresh();
+        new Notice(t('Manager.Common.Notices.ClearBreakpointComplete', '断点和失败记录已清除'));
+    }, [handleRefresh, i18n, t]);
 
     const startThemeBatchTranslate = useCallback(async (resume: boolean) => {
         const resources: ThemeBatchResource[] = resume && resumableThemeTranslateResources.length
@@ -1015,6 +1029,17 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                                 <RotateCcw className="w-4 h-4" />
                                 {t('Manager.Common.Actions.ResumeTranslate', '继续翻译')}
                                 <span className="text-muted-foreground">{resumableThemeTranslateResources.length}</span>
+                            </Button>
+                        )}
+                        {!batchTask.isRunning && hasThemeBatchRecords && (
+                            <Button
+                                variant="outline"
+                                size="sm"
+                                className="h-9 rounded-none gap-1.5 text-[13px] text-destructive hover:text-destructive hover:bg-destructive/10"
+                                onClick={handleClearThemeBreakpoints}
+                            >
+                                <Trash2 className="w-4 h-4" />
+                                {t('Manager.Common.Actions.ClearBreakpoint', '清除断点')}
                             </Button>
                         )}
                         {!batchTask.isRunning && themeFailureRecords.length > 0 && (

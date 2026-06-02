@@ -128,6 +128,10 @@ struct SourceManagerPayload {
     #[serde(default)]
     source_ids: Vec<String>,
     #[serde(default)]
+    checkpoint_keys: Vec<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
     active: Option<bool>,
     #[serde(default)]
     content_base64: Option<String>,
@@ -3664,7 +3668,7 @@ async fn handle_sync_task(state: &AppState, task_type: &str, payload: Value) -> 
         "code-extract" => handle_code_extract(payload).await,
         "plugin-apply-translation" => handle_plugin_apply_translation(payload).await,
         "theme-apply-translation" => handle_theme_apply_translation(payload).await,
-        "source-export" | "source-import" | "source-remove" | "source-set-active" | "source-index" => handle_source_manager_task(state, task_type, payload).await,
+        "source-export" | "source-import" | "source-remove" | "source-set-active" | "source-index" | "source-clear-batch-records" => handle_source_manager_task(state, task_type, payload).await,
         "plugin-extract" => Ok(serde_json::to_value(handle_plugin_extract(payload).await?)?),
         "theme-extract" => Ok(serde_json::to_value(handle_theme_extract(payload).await?)?),
         "plugin-translate" => {
@@ -3746,6 +3750,7 @@ async fn handle_source_manager_task(state: &AppState, operation: &str, payload: 
             "source-remove" => source_remove_blocking(payload)?,
             "source-set-active" => source_set_active_blocking(payload)?,
             "source-index" => source_index_blocking(&state, payload)?,
+            "source-clear-batch-records" => source_clear_batch_records_blocking(payload)?,
             _ => bail!("未知源管理操作: {operation}"),
         };
         Ok(serde_json::to_value(result)?)
@@ -4418,6 +4423,44 @@ fn source_set_active_blocking(payload: SourceManagerPayload) -> Result<SourceImp
     })
 }
 
+fn source_clear_batch_records_blocking(payload: SourceManagerPayload) -> Result<SourceImportExportResponse> {
+    let paths = paths(&payload.persistence.base_path);
+    let scope = payload.scope.as_deref();
+    let mut record = load_record(&paths);
+    let mut deleted_count = 0usize;
+
+    if let Some(checkpoints) = record.get_mut("checkpoints").and_then(Value::as_object_mut) {
+        for key in &payload.checkpoint_keys {
+            if checkpoints.remove(key).is_some() {
+                deleted_count += 1;
+            }
+        }
+        if payload.checkpoint_keys.is_empty() && scope.is_none() {
+            deleted_count += checkpoints.len();
+            checkpoints.clear();
+        }
+    }
+
+    if let Some(scope) = scope {
+        deleted_count += retain_record_array(&mut record, "failures", |item| {
+            item.get("scope").and_then(Value::as_str) != Some(scope)
+        });
+        deleted_count += retain_record_array(&mut record, "successBatches", |item| {
+            item.get("scope").and_then(Value::as_str) != Some(scope)
+        });
+    }
+
+    save_record(&paths, record)?;
+    Ok(SourceImportExportResponse {
+        state: true,
+        content_base64: None,
+        added_count: 0,
+        updated_count: 0,
+        skipped_count: 0,
+        deleted_count,
+    })
+}
+
 fn load_record(paths: &PersistencePaths) -> Value {
     let raw = load_json_or(
         &paths.batch_task_record_path,
@@ -4427,6 +4470,7 @@ fn load_record(paths: &PersistencePaths) -> Value {
         "schemaVersion": raw.get("schemaVersion").and_then(Value::as_u64).unwrap_or(1),
         "checkpoints": raw.get("checkpoints").cloned().unwrap_or_else(|| json!({})),
         "failures": raw.get("failures").and_then(Value::as_array).cloned().unwrap_or_default(),
+        "successBatches": raw.get("successBatches").and_then(Value::as_array).cloned().unwrap_or_default(),
         "updatedAt": raw.get("updatedAt").and_then(Value::as_u64).unwrap_or(0),
     })
 }
@@ -4434,6 +4478,46 @@ fn load_record(paths: &PersistencePaths) -> Value {
 fn save_record(paths: &PersistencePaths, mut record: Value) -> Result<()> {
     record["updatedAt"] = json!(now_ms());
     write_json_pretty(&paths.batch_task_record_path, &record)
+}
+
+fn retain_record_array<F>(record: &mut Value, key: &str, mut keep: F) -> usize
+where
+    F: FnMut(&Value) -> bool,
+{
+    let existing = record
+        .get(key)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let original_len = existing.len();
+    let retained = existing.into_iter().filter(|item| keep(item)).collect::<Vec<_>>();
+    let removed = original_len.saturating_sub(retained.len());
+    record[key] = Value::Array(retained);
+    removed
+}
+
+fn load_success_item_keys(paths: &PersistencePaths, scope: &str) -> HashMap<String, HashSet<String>> {
+    let mut grouped = HashMap::<String, HashSet<String>>::new();
+    for batch in load_record(paths)
+        .get("successBatches")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        if batch.get("scope").and_then(Value::as_str) != Some(scope) {
+            continue;
+        }
+        let Some(source_id) = batch.get("sourceId").and_then(Value::as_str) else {
+            continue;
+        };
+        let bucket = grouped.entry(source_id.to_string()).or_default();
+        for item in batch.get("itemKeys").and_then(Value::as_array).cloned().unwrap_or_default() {
+            if let Some(key) = item.as_str() {
+                bucket.insert(key.to_string());
+            }
+        }
+    }
+    grouped
 }
 
 fn read_translation(paths: &PersistencePaths, source_id: &str) -> Option<Value> {
@@ -4759,35 +4843,6 @@ async fn clear_checkpoint(state: &AppState, paths: &PersistencePaths, key: &str)
     .await
 }
 
-async fn replace_failures_for_source(
-    state: &AppState,
-    paths: &PersistencePaths,
-    scope: &str,
-    source_id: &str,
-    failures: Vec<CompanionBatchFailure>,
-) -> Result<()> {
-    update_record(state, paths, |record| {
-        let mut existing = record
-            .get("failures")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        existing.retain(|item| {
-            !(item.get("scope").and_then(Value::as_str) == Some(scope)
-                && item.get("sourceId").and_then(Value::as_str) == Some(source_id))
-        });
-        for failure in failures.into_iter().rev() {
-            existing.insert(
-                0,
-                serde_json::to_value(build_failure_record(scope, failure)).unwrap_or(Value::Null),
-            );
-        }
-        existing.truncate(500);
-        record["failures"] = Value::Array(existing);
-    })
-    .await
-}
-
 async fn remove_failures(state: &AppState, paths: &PersistencePaths, ids: &[String]) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
@@ -4803,6 +4858,88 @@ async fn remove_failures(state: &AppState, paths: &PersistencePaths, ids: &[Stri
             !ids.contains(item.get("id").and_then(Value::as_str).unwrap_or_default())
         });
         record["failures"] = Value::Array(existing);
+    })
+    .await
+}
+
+async fn replace_or_clear_completed_failures_for_source(
+    state: &AppState,
+    paths: &PersistencePaths,
+    scope: &str,
+    source_id: &str,
+    all_items: Vec<String>,
+    pending_items: Vec<String>,
+    overwrite_existing: bool,
+    failures: Vec<CompanionBatchFailure>,
+    success_items: Vec<String>,
+) -> Result<()> {
+    update_record(state, paths, |record| {
+        let historical_success = record
+            .get("successBatches")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|item| {
+                item.get("scope").and_then(Value::as_str) == Some(scope)
+                    && item.get("sourceId").and_then(Value::as_str) == Some(source_id)
+            })
+            .flat_map(|item| {
+                item.get("itemKeys")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .filter_map(|item| item.as_str().map(str::to_string));
+        let mut combined_success = historical_success.chain(success_items).collect::<Vec<_>>();
+        combined_success.sort_unstable();
+        combined_success.dedup();
+        let success_set: HashSet<&str> = combined_success.iter().map(String::as_str).collect();
+        let resource_completed = if overwrite_existing {
+            failures.is_empty() && !all_items.is_empty() && all_items.iter().all(|item| success_set.contains(item.as_str()))
+        } else {
+            pending_items.iter().all(|item| success_set.contains(item.as_str()))
+        };
+
+        let mut existing_failures = record
+            .get("failures")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        existing_failures.retain(|item| {
+            !(item.get("scope").and_then(Value::as_str) == Some(scope)
+                && item.get("sourceId").and_then(Value::as_str) == Some(source_id))
+        });
+        if !resource_completed {
+            for failure in failures.into_iter().rev() {
+                existing_failures.insert(
+                    0,
+                    serde_json::to_value(build_failure_record(scope, failure)).unwrap_or(Value::Null),
+                );
+            }
+        }
+        existing_failures.truncate(500);
+        record["failures"] = Value::Array(existing_failures);
+
+        let mut success_batches = record
+            .get("successBatches")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        success_batches.retain(|item| {
+            !(item.get("scope").and_then(Value::as_str) == Some(scope)
+                && item.get("sourceId").and_then(Value::as_str) == Some(source_id))
+        });
+        if !resource_completed && !combined_success.is_empty() {
+            success_batches.insert(0, json!({
+                "scope": scope,
+                "sourceId": source_id,
+                "itemKeys": combined_success,
+                "updatedAt": now_ms(),
+            }));
+            success_batches.truncate(500);
+        }
+        record["successBatches"] = Value::Array(success_batches);
     })
     .await
 }
@@ -5093,6 +5230,11 @@ async fn handle_batch_translate(
         .map(|resource| serde_json::to_value(resource).unwrap_or(Value::Null))
         .collect();
     let mut completed = HashSet::<usize>::new();
+    let success_item_keys = if batch.config.overwrite_existing_translations {
+        HashMap::new()
+    } else {
+        load_success_item_keys(&paths, scope)
+    };
     let window_item_limit = translate_window_item_limit(batch.config.batch_size, batch.config.concurrency);
     let mut next_resource_index = 0usize;
 
@@ -5168,20 +5310,26 @@ async fn handle_batch_translate(
             }
 
             let state_index = resource_states.len();
-            let resource_state = BatchResourceState {
+            let mut resource_state = BatchResourceState {
                 original_index: index,
                 resource,
                 source_id,
                 translation_json,
                 processed_items: 0,
+                all_items: Vec::new(),
+                pending_items: Vec::new(),
+                success_items: Vec::new(),
                 failures: Vec::new(),
             };
-            let before_items = ast_items.len() + regex_items.len() + theme_items.len();
+            let before_ast_items = ast_items.len();
+            let before_regex_items = regex_items.len();
+            let before_theme_items = theme_items.len();
             if is_plugin {
                 collect_plugin_packed_items(
                     state_index,
                     &resource_state,
                     batch.config.overwrite_existing_translations,
+                    success_item_keys.get(&resource_state.source_id),
                     &mut ast_id,
                     &mut regex_id,
                     &mut ast_items,
@@ -5192,11 +5340,13 @@ async fn handle_batch_translate(
                     state_index,
                     &resource_state,
                     batch.config.overwrite_existing_translations,
+                    success_item_keys.get(&resource_state.source_id),
                     &mut theme_id,
                     &mut theme_items,
                 );
             }
-            let added_items = ast_items.len() + regex_items.len() + theme_items.len() - before_items;
+            let added_items = ast_items.len() + regex_items.len() + theme_items.len()
+                - before_ast_items - before_regex_items - before_theme_items;
             if added_items == 0 {
                 mark_batch_translate_resource_completed(
                     state,
@@ -5212,6 +5362,15 @@ async fn handle_batch_translate(
                 .await?;
                 continue;
             }
+            resource_state.all_items = collect_all_item_keys(&resource_state.translation_json, is_plugin);
+            resource_state.pending_items = if is_plugin {
+                ast_items[before_ast_items..].iter()
+                    .map(|item| compact_success_item_key(item, "ast", true))
+                    .chain(regex_items[before_regex_items..].iter().map(|item| compact_success_item_key(item, "regex", true)))
+                    .collect()
+            } else {
+                theme_items[before_theme_items..].iter().map(|item| compact_success_item_key(item, "theme", false)).collect()
+            };
             pending_items_in_window += added_items;
             resource_states.push(resource_state);
         }
@@ -5304,12 +5463,16 @@ async fn process_batch_translate_window(
             &resource_state.translation_json,
         )
         .await?;
-        replace_failures_for_source(
+        replace_or_clear_completed_failures_for_source(
             state,
             paths,
             scope,
             &resource_state.source_id,
+            resource_state.all_items,
+            resource_state.pending_items,
+            batch.config.overwrite_existing_translations,
             resource_state.failures,
+            resource_state.success_items,
         )
         .await?;
         increment_progress(task, "successCount", 1).await;
@@ -5342,6 +5505,9 @@ struct BatchResourceState {
     source_id: String,
     translation_json: Value,
     processed_items: usize,
+    all_items: Vec<String>,
+    pending_items: Vec<String>,
+    success_items: Vec<String>,
     failures: Vec<CompanionBatchFailure>,
 }
 
@@ -5390,6 +5556,7 @@ fn collect_plugin_packed_items(
     resource_state_index: usize,
     resource_state: &BatchResourceState,
     overwrite_existing: bool,
+    success_item_keys: Option<&HashSet<String>>,
     ast_id: &mut u64,
     regex_id: &mut u64,
     ast_items: &mut Vec<Value>,
@@ -5403,7 +5570,10 @@ fn collect_plugin_packed_items(
         for (file, file_dict) in dict {
             if let Some(ast) = file_dict.get("ast").and_then(Value::as_array) {
                 for (index, item) in ast.iter().enumerate() {
-                    if should_translate(item.get("target"), item.get("source"), overwrite_existing) {
+                    let item_key = format!("{file}\tast\t{index}");
+                    if should_translate(item.get("target"), item.get("source"), overwrite_existing)
+                        && (overwrite_existing || !success_item_keys.is_some_and(|keys| keys.contains(&item_key)))
+                    {
                         ast_items.push(json!({
                             "id": *ast_id,
                             "resourceStateIndex": resource_state_index,
@@ -5420,7 +5590,10 @@ fn collect_plugin_packed_items(
             }
             if let Some(regex) = file_dict.get("regex").and_then(Value::as_array) {
                 for (index, item) in regex.iter().enumerate() {
-                    if should_translate(item.get("target"), item.get("source"), overwrite_existing) {
+                    let item_key = format!("{file}\tregex\t{index}");
+                    if should_translate(item.get("target"), item.get("source"), overwrite_existing)
+                        && (overwrite_existing || !success_item_keys.is_some_and(|keys| keys.contains(&item_key)))
+                    {
                         regex_items.push(json!({
                             "id": *regex_id,
                             "resourceStateIndex": resource_state_index,
@@ -5441,6 +5614,7 @@ fn collect_theme_packed_items(
     resource_state_index: usize,
     resource_state: &BatchResourceState,
     overwrite_existing: bool,
+    success_item_keys: Option<&HashSet<String>>,
     theme_id: &mut u64,
     theme_items: &mut Vec<Value>,
 ) {
@@ -5450,7 +5624,10 @@ fn collect_theme_packed_items(
         .and_then(Value::as_array)
     {
         for (index, item) in dict.iter().enumerate() {
-            if should_translate(item.get("target"), item.get("source"), overwrite_existing) {
+            let item_key = index.to_string();
+            if should_translate(item.get("target"), item.get("source"), overwrite_existing)
+                && (overwrite_existing || !success_item_keys.is_some_and(|keys| keys.contains(&item_key)))
+            {
                 theme_items.push(json!({
                     "id": *theme_id,
                     "resourceStateIndex": resource_state_index,
@@ -5463,6 +5640,25 @@ fn collect_theme_packed_items(
             }
         }
     }
+}
+
+fn collect_all_item_keys(translation_json: &Value, is_plugin: bool) -> Vec<String> {
+    let mut keys = Vec::new();
+    if is_plugin {
+        if let Some(dict) = translation_json.get("dict").and_then(Value::as_object) {
+            for (file, file_dict) in dict {
+                if let Some(ast) = file_dict.get("ast").and_then(Value::as_array) {
+                    keys.extend((0..ast.len()).map(|index| format!("{file}\tast\t{index}")));
+                }
+                if let Some(regex) = file_dict.get("regex").and_then(Value::as_array) {
+                    keys.extend((0..regex.len()).map(|index| format!("{file}\tregex\t{index}")));
+                }
+            }
+        }
+    } else if let Some(dict) = translation_json.get("dict").and_then(Value::as_array) {
+        keys.extend((0..dict.len()).map(|index| index.to_string()));
+    }
+    keys
 }
 
 async fn translate_packed_batches<F>(
@@ -5622,6 +5818,7 @@ fn apply_packed_translation_report(
         if let Some(target_slot) = resource_state.translation_json.pointer_mut(&pointer) {
             *target_slot = Value::String(target.to_string());
             resource_state.processed_items += 1;
+            resource_state.success_items.push(compact_success_item_key(&item, batch_type, is_plugin));
         }
     }
 
@@ -5637,6 +5834,16 @@ fn apply_packed_translation_report(
             error_message: failure.error_message,
             items: failure.items,
         });
+    }
+}
+
+fn compact_success_item_key(item: &Value, batch_type: &str, is_plugin: bool) -> String {
+    let index = item.get("dictIndex").and_then(Value::as_u64).unwrap_or(usize::MAX as u64);
+    if is_plugin {
+        let file = item.get("file").and_then(Value::as_str).unwrap_or_default();
+        format!("{file}\t{batch_type}\t{index}")
+    } else {
+        index.to_string()
     }
 }
 

@@ -168,6 +168,8 @@ export interface CompanionSourceManagerRequest {
     persistence: CompanionWorkerPersistenceConfig;
     sourceId?: string;
     sourceIds?: string[];
+    checkpointKeys?: string[];
+    scope?: 'plugin' | 'theme';
     active?: boolean;
     contentBase64?: string;
     fileName?: string;
@@ -468,4 +470,4 @@ export interface CompanionThemeFailureRetryPayload {
 
 export type CompanionAsyncTaskType = 'plugin-batch-extract' | 'theme-batch-extract' | 'plugin-batch-translate' | 'theme-batch-translate' | 'plugin-failure-retry' | 'theme-failure-retry' | 'cloud-backup-all';
 
-export type CompanionBatchTaskType = 'plugin-extract' | 'theme-extract' | 'plugin-translate' | 'theme-translate' | 'plugin-retry' | 'theme-retry' | 'ast-replace' | 'code-extract' | 'plugin-apply-translation' | 'theme-apply-translation' | 'source-export' | 'source-import' | 'source-remove' | 'source-set-active' | 'source-index' | CompanionCloudTaskType;
+export type CompanionBatchTaskType = 'plugin-extract' | 'theme-extract' | 'plugin-translate' | 'theme-translate' | 'plugin-retry' | 'theme-retry' | 'ast-replace' | 'code-extract' | 'plugin-apply-translation' | 'theme-apply-translation' | 'source-export' | 'source-import' | 'source-remove' | 'source-set-active' | 'source-index' | 'source-clear-batch-records' | CompanionCloudTaskType;

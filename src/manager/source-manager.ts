@@ -172,6 +172,7 @@ export class SourceManager {
                     schemaVersion: raw?.schemaVersion || 1,
                     checkpoints: raw?.checkpoints || {},
                     failures: Array.isArray(raw?.failures) ? raw.failures : [],
+                    successBatches: Array.isArray(raw?.successBatches) ? raw.successBatches : [],
                     updatedAt: raw?.updatedAt || 0,
                 };
             }

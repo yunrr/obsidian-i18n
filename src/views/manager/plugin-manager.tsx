@@ -3,7 +3,7 @@ import { PluginManifest, Notice } from 'obsidian';
 import * as path from 'path';
 import { useTranslation } from 'react-i18next';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { Search, LayoutGrid, List, FileOutput, Languages, Loader2, RotateCcw, Square, AlertTriangle } from 'lucide-react';
+import { Search, LayoutGrid, List, FileOutput, Languages, Loader2, RotateCcw, Square, AlertTriangle, Trash2 } from 'lucide-react';
 
 import I18N from 'src/main';
 import { BatchTaskFailureRecord } from 'src/types';
@@ -500,6 +500,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             const source = i18n.sourceManager.getSourceForPluginVersion(plugin.id, 'plugin', batchTranslationVersion);
             const counts = getPluginTranslationCounts(source?.id);
             if (!source || !counts) continue;
+            if (settings.llmOverwriteExistingTranslations !== true && !failedSourceIds.has(source.id) && counts.pendingTranslationCount === 0) continue;
             const itemCount = settings.llmOverwriteExistingTranslations === true
                 ? counts.totalTranslationCount
                 : counts.pendingTranslationCount;
@@ -512,7 +513,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             });
         }
         return resources;
-    }, [batchTranslationVersion, displayPlugins, getPluginTranslationCounts, i18n.sourceManager, settings.llmOverwriteExistingTranslations, sourceTick]);
+    }, [batchTranslationVersion, displayPlugins, failedSourceIds, getPluginTranslationCounts, i18n.sourceManager, settings.llmOverwriteExistingTranslations, sourceTick]);
 
     const translatablePlugins = useMemo(() => {
         return displayPlugins.filter(plugin => pluginTranslateResourcesById.has(plugin.id));
@@ -772,6 +773,19 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
     const handleBatchExtract = useCallback(() => startPluginBatchExtract(false), [startPluginBatchExtract]);
     const handleResumeExtract = useCallback(() => startPluginBatchExtract(true), [startPluginBatchExtract]);
 
+    const hasPluginBatchRecords = !!pluginExtractCheckpoint || !!pluginTranslateCheckpoint || pluginFailureRecords.length > 0;
+
+    const handleClearPluginBreakpoints = useCallback(async () => {
+        await i18n.companionWorkerManager.clearBatchRecords({
+            persistence: { basePath: i18n.sourceManager.getBasePath() },
+            checkpointKeys: [PLUGIN_EXTRACT_CHECKPOINT_KEY, PLUGIN_TRANSLATE_CHECKPOINT_KEY],
+            scope: 'plugin',
+        });
+        i18n.sourceManager.reloadFromDisk();
+        handleRefresh();
+        new Notice(t('Manager.Common.Notices.ClearBreakpointComplete', '断点和失败记录已清除'));
+    }, [handleRefresh, i18n, t]);
+
     const startPluginBatchTranslate = useCallback(async (resume: boolean) => {
         const resources: PluginBatchResource[] = resume && resumablePluginTranslateResources.length
             ? resumablePluginTranslateResources
@@ -995,6 +1009,17 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                                 <RotateCcw className="w-4 h-4" />
                                 {t('Manager.Common.Actions.ResumeTranslate', '继续翻译')}
                                 <span className="text-muted-foreground">{resumablePluginTranslateResources.length}</span>
+                            </Button>
+                        )}
+                        {!batchTask.isRunning && hasPluginBatchRecords && (
+                            <Button
+                                variant="outline"
+                                size="sm"
+                                className="h-9 rounded-none gap-1.5 text-[13px] text-destructive hover:text-destructive hover:bg-destructive/10"
+                                onClick={handleClearPluginBreakpoints}
+                            >
+                                <Trash2 className="w-4 h-4" />
+                                {t('Manager.Common.Actions.ClearBreakpoint', '清除断点')}
                             </Button>
                         )}
                         {!batchTask.isRunning && pluginFailureRecords.length > 0 && (

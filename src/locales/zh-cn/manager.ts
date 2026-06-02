@@ -25,7 +25,8 @@ export default {
             StopTask: "停止任务",
             ResumeExtract: "继续提取",
             ResumeTranslate: "继续翻译",
-            RetryFailures: "重试失败批次"
+            RetryFailures: "重试失败批次",
+            ClearBreakpoint: "清除断点"
         },
         Placeholders: {
             SearchPlaceholder: "输入搜索关键词..."
@@ -78,7 +79,8 @@ export default {
             ApplySuccess: "翻译应用成功",
             CopySuccess: "Registry JSON 已复制到剪贴板",
             SyncSuccess: "中心库注册表同步成功！",
-            RetryFailuresComplete: "失败批次重试完成：成功 {{success}}，失败 {{fail}}"
+            RetryFailuresComplete: "失败批次重试完成：成功 {{success}}，失败 {{fail}}",
+            ClearBreakpointComplete: "断点和失败记录已清除"
         }
     },
     Plugins: {

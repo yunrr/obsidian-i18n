@@ -193,6 +193,10 @@ export class CompanionWorkerManager {
         return this.runTask<CompanionSourceManagerResponse>('source-index', request);
     }
 
+    public async clearBatchRecords(request: CompanionSourceManagerRequest): Promise<CompanionSourceManagerResponse> {
+        return this.runTask<CompanionSourceManagerResponse>('source-clear-batch-records', request);
+    }
+
     public async runCloudTask(type: CompanionCloudTaskType, payload: unknown): Promise<CompanionCloudResponse> {
         return this.runTask<CompanionCloudResponse>(type, payload);
     }

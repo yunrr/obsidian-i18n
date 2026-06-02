@@ -96,6 +96,12 @@ export interface BatchTaskRecordMeta {
     schemaVersion: number;
     checkpoints: Record<string, BatchTaskCheckpoint>;
     failures: BatchTaskFailureRecord[];
+    successBatches?: Array<{
+        scope: BatchTaskScope;
+        sourceId: string;
+        itemKeys: string[];
+        updatedAt: number;
+    }>;
     updatedAt: number;
 }
 
@@ -108,5 +114,6 @@ export const EMPTY_BATCH_TASK_RECORD: BatchTaskRecordMeta = {
     schemaVersion: 1,
     checkpoints: {},
     failures: [],
+    successBatches: [],
     updatedAt: 0
 };
