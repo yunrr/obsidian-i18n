@@ -31,6 +31,7 @@ use swc_ecma_visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 use tokio::{
     io::AsyncReadExt,
     sync::{oneshot, Mutex, Semaphore},
+    task::JoinSet,
 };
 use url::Url;
 
@@ -40,6 +41,7 @@ const EXTRACT_CHECKPOINT_EVERY_RESOURCES: usize = 100;
 const EXTRACT_CHECKPOINT_EVERY_MS: u64 = 10_000;
 const MAX_EXTRACT_CPU_CONCURRENCY: usize = 32;
 const CLOUD_BACKUP_CHUNK_SIZE: usize = 20;
+const TRANSLATE_WINDOW_BATCH_MULTIPLIER: usize = 4;
 
 #[derive(Clone)]
 struct AppState {
@@ -5091,102 +5093,174 @@ async fn handle_batch_translate(
         .map(|resource| serde_json::to_value(resource).unwrap_or(Value::Null))
         .collect();
     let mut completed = HashSet::<usize>::new();
-    let mut resource_states = Vec::<BatchResourceState>::new();
-    let mut ast_items = Vec::<Value>::new();
-    let mut regex_items = Vec::<Value>::new();
-    let mut theme_items = Vec::<Value>::new();
-    let mut ast_id = 0u64;
-    let mut regex_id = 0u64;
-    let mut theme_id = 0u64;
+    let window_item_limit = translate_window_item_limit(batch.config.batch_size, batch.config.concurrency);
+    let mut next_resource_index = 0usize;
 
-    for (index, resource) in batch.resources.iter().cloned().enumerate() {
+    while next_resource_index < batch.resources.len() {
         ensure_not_cancelled(&task).await?;
-        touch_progress(&task, json!({ "currentLabel": resource.label })).await;
+        let mut resource_states = Vec::<BatchResourceState>::new();
+        let mut ast_items = Vec::<Value>::new();
+        let mut regex_items = Vec::<Value>::new();
+        let mut theme_items = Vec::<Value>::new();
+        let mut pending_items_in_window = 0usize;
+        let mut ast_id = 0u64;
+        let mut regex_id = 0u64;
+        let mut theme_id = 0u64;
 
-        let Some(source_id) = resource.source_id.clone() else {
-            mark_batch_translate_resource_completed(
-                state,
-                &task,
-                &paths,
-                &batch.checkpoint_key,
-                scope,
-                &resources_value,
-                &mut completed,
-                index,
-                true,
-            )
-            .await?;
-            continue;
-        };
-        let Some(translation_json) = read_translation(&paths, &source_id) else {
-            mark_batch_translate_resource_completed(
-                state,
-                &task,
-                &paths,
-                &batch.checkpoint_key,
-                scope,
-                &resources_value,
-                &mut completed,
-                index,
-                true,
-            )
-            .await?;
-            continue;
-        };
-        let pending = if is_plugin {
-            count_pending_plugin_items(&translation_json, batch.config.overwrite_existing_translations)
-        } else {
-            count_pending_theme_items(&translation_json, batch.config.overwrite_existing_translations)
-        };
-        if pending == 0 {
-            mark_batch_translate_resource_completed(
-                state,
-                &task,
-                &paths,
-                &batch.checkpoint_key,
-                scope,
-                &resources_value,
-                &mut completed,
-                index,
-                true,
-            )
-            .await?;
+        while next_resource_index < batch.resources.len()
+            && (resource_states.is_empty() || pending_items_in_window < window_item_limit)
+        {
+            let index = next_resource_index;
+            next_resource_index += 1;
+            let resource = batch.resources[index].clone();
+            ensure_not_cancelled(&task).await?;
+            touch_progress(&task, json!({ "currentLabel": resource.label })).await;
+
+            let Some(source_id) = resource.source_id.clone() else {
+                mark_batch_translate_resource_completed(
+                    state,
+                    &task,
+                    &paths,
+                    &batch.checkpoint_key,
+                    scope,
+                    &resources_value,
+                    &mut completed,
+                    index,
+                    true,
+                )
+                .await?;
+                continue;
+            };
+            let Some(translation_json) = read_translation(&paths, &source_id) else {
+                mark_batch_translate_resource_completed(
+                    state,
+                    &task,
+                    &paths,
+                    &batch.checkpoint_key,
+                    scope,
+                    &resources_value,
+                    &mut completed,
+                    index,
+                    true,
+                )
+                .await?;
+                continue;
+            };
+            let pending = if is_plugin {
+                count_pending_plugin_items(&translation_json, batch.config.overwrite_existing_translations)
+            } else {
+                count_pending_theme_items(&translation_json, batch.config.overwrite_existing_translations)
+            };
+            if pending == 0 {
+                mark_batch_translate_resource_completed(
+                    state,
+                    &task,
+                    &paths,
+                    &batch.checkpoint_key,
+                    scope,
+                    &resources_value,
+                    &mut completed,
+                    index,
+                    true,
+                )
+                .await?;
+                continue;
+            }
+
+            let state_index = resource_states.len();
+            let resource_state = BatchResourceState {
+                original_index: index,
+                resource,
+                source_id,
+                translation_json,
+                processed_items: 0,
+                failures: Vec::new(),
+            };
+            let before_items = ast_items.len() + regex_items.len() + theme_items.len();
+            if is_plugin {
+                collect_plugin_packed_items(
+                    state_index,
+                    &resource_state,
+                    batch.config.overwrite_existing_translations,
+                    &mut ast_id,
+                    &mut regex_id,
+                    &mut ast_items,
+                    &mut regex_items,
+                );
+            } else {
+                collect_theme_packed_items(
+                    state_index,
+                    &resource_state,
+                    batch.config.overwrite_existing_translations,
+                    &mut theme_id,
+                    &mut theme_items,
+                );
+            }
+            let added_items = ast_items.len() + regex_items.len() + theme_items.len() - before_items;
+            if added_items == 0 {
+                mark_batch_translate_resource_completed(
+                    state,
+                    &task,
+                    &paths,
+                    &batch.checkpoint_key,
+                    scope,
+                    &resources_value,
+                    &mut completed,
+                    index,
+                    true,
+                )
+                .await?;
+                continue;
+            }
+            pending_items_in_window += added_items;
+            resource_states.push(resource_state);
+        }
+
+        if resource_states.is_empty() {
             continue;
         }
 
-        let state_index = resource_states.len();
-        let resource_state = BatchResourceState {
-            original_index: index,
-            resource,
-            source_id,
-            translation_json,
-            processed_items: 0,
-            failures: Vec::new(),
-        };
-        if is_plugin {
-            collect_plugin_packed_items(
-                state_index,
-                &resource_state,
-                batch.config.overwrite_existing_translations,
-                &mut ast_id,
-                &mut regex_id,
-                &mut ast_items,
-                &mut regex_items,
-            );
-        } else {
-            collect_theme_packed_items(
-                state_index,
-                &resource_state,
-                batch.config.overwrite_existing_translations,
-                &mut theme_id,
-                &mut theme_items,
-            );
-        }
-        resource_states.push(resource_state);
+        process_batch_translate_window(
+            state,
+            &task,
+            &paths,
+            &batch,
+            scope,
+            &resources_value,
+            &mut completed,
+            resource_states,
+            ast_items,
+            regex_items,
+            theme_items,
+            is_plugin,
+        )
+        .await?;
     }
 
+    if *task.cancel_requested.lock().await {
+        return Ok(());
+    }
+    clear_checkpoint(state, &paths, &batch.checkpoint_key).await?;
+    bump_record_revision(&task).await;
+    Ok(())
+}
+
+async fn process_batch_translate_window(
+    state: &AppState,
+    task: &Arc<TaskRuntime>,
+    paths: &PersistencePaths,
+    batch: &PluginBatchTranslatePayload,
+    scope: &str,
+    resources_value: &[Value],
+    completed: &mut HashSet<usize>,
+    mut resource_states: Vec<BatchResourceState>,
+    ast_items: Vec<Value>,
+    regex_items: Vec<Value>,
+    theme_items: Vec<Value>,
+    is_plugin: bool,
+) -> Result<()> {
     if is_plugin {
-        touch_progress(&task, json!({ "currentLabel": "AST" })).await;
+        touch_progress(task, json!({ "currentLabel": "AST" })).await;
         let ast_report = translate_packed_batches(
             &ast_items,
             &batch.config.prompts.ast,
@@ -5197,7 +5271,7 @@ async fn handle_batch_translate(
         .await?;
         apply_packed_translation_report(&mut resource_states, ast_report, "ast", true);
 
-        touch_progress(&task, json!({ "currentLabel": "Regex" })).await;
+        touch_progress(task, json!({ "currentLabel": "Regex" })).await;
         let regex_report = translate_packed_batches(
             &regex_items,
             &batch.config.prompts.regex,
@@ -5208,7 +5282,7 @@ async fn handle_batch_translate(
         .await?;
         apply_packed_translation_report(&mut resource_states, regex_report, "regex", true);
     } else {
-        touch_progress(&task, json!({ "currentLabel": "Theme" })).await;
+        touch_progress(task, json!({ "currentLabel": "Theme" })).await;
         let theme_report = translate_packed_batches(
             &theme_items,
             &batch.config.prompts.theme,
@@ -5221,49 +5295,44 @@ async fn handle_batch_translate(
     }
 
     for resource_state in resource_states {
-        ensure_not_cancelled(&task).await?;
-        touch_progress(
-            &task,
-            json!({ "currentLabel": resource_state.resource.label }),
-        )
-        .await;
+        ensure_not_cancelled(task).await?;
+        touch_progress(task, json!({ "currentLabel": resource_state.resource.label })).await;
         save_translated_source(
             state,
-            &paths,
+            paths,
             &resource_state.source_id,
             &resource_state.translation_json,
         )
         .await?;
         replace_failures_for_source(
             state,
-            &paths,
+            paths,
             scope,
             &resource_state.source_id,
             resource_state.failures,
         )
         .await?;
-        increment_progress(&task, "successCount", 1).await;
-        bump_source_revision(&task).await;
+        increment_progress(task, "successCount", 1).await;
+        bump_source_revision(task).await;
         mark_batch_translate_resource_completed(
             state,
-            &task,
-            &paths,
+            task,
+            paths,
             &batch.checkpoint_key,
             scope,
-            &resources_value,
-            &mut completed,
+            resources_value,
+            completed,
             resource_state.original_index,
             false,
         )
         .await?;
     }
 
-    if *task.cancel_requested.lock().await {
-        return Ok(());
-    }
-    clear_checkpoint(state, &paths, &batch.checkpoint_key).await?;
-    bump_record_revision(&task).await;
     Ok(())
+}
+
+fn translate_window_item_limit(batch_size: usize, concurrency: usize) -> usize {
+    batch_size.max(1) * concurrency.max(1) * TRANSLATE_WINDOW_BATCH_MULTIPLIER
 }
 
 #[derive(Debug, Clone)]
@@ -5420,20 +5489,20 @@ where
         .map(|batch| batch.to_vec())
         .collect();
     let concurrency = config.concurrency.max(1).min(batches.len().max(1));
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-    let mut handles = Vec::new();
+    let mut handles = JoinSet::new();
+    let mut next_batch = 0usize;
 
-    for batch in batches {
+    while next_batch < batches.len() && handles.len() < concurrency {
         if let Some(task) = &task {
             ensure_not_cancelled(task).await?;
         }
+        let batch = batches[next_batch].clone();
+        next_batch += 1;
         let simplified: Vec<Value> = batch.iter().map(&simplify).collect();
         let prompt = prompt.to_string();
         let config = config.clone();
         let task = task.clone();
-        let permit = semaphore.clone().acquire_owned().await?;
-        handles.push(tokio::spawn(async move {
-            let _permit = permit;
+        handles.spawn(async move {
             if let Some(task) = &task {
                 ensure_not_cancelled(task).await?;
             }
@@ -5442,14 +5511,14 @@ where
                 ensure_not_cancelled(task).await?;
             }
             Ok::<_, anyhow::Error>((batch, result))
-        }));
+        });
     }
 
-    for handle in handles {
+    while let Some(handle) = handles.join_next().await {
         if let Some(task) = &task {
             ensure_not_cancelled(task).await?;
         }
-        let (batch, result) = handle.await??;
+        let (batch, result) = handle??;
         if let Some(task) = &task {
             increment_progress(task, "processedItems", batch.len()).await;
         }
@@ -5490,6 +5559,28 @@ where
                     });
                 }
             }
+        }
+
+        while next_batch < batches.len() && handles.len() < concurrency {
+            if let Some(task) = &task {
+                ensure_not_cancelled(task).await?;
+            }
+            let batch = batches[next_batch].clone();
+            next_batch += 1;
+            let simplified: Vec<Value> = batch.iter().map(&simplify).collect();
+            let prompt = prompt.to_string();
+            let config = config.clone();
+            let task = task.clone();
+            handles.spawn(async move {
+                if let Some(task) = &task {
+                    ensure_not_cancelled(task).await?;
+                }
+                let result = call_chat_completion(&simplified, &prompt, &config).await;
+                if let Some(task) = &task {
+                    ensure_not_cancelled(task).await?;
+                }
+                Ok::<_, anyhow::Error>((batch, result))
+            });
         }
     }
 
@@ -6712,4 +6803,16 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translate_window_item_limit_feeds_concurrency_without_scaling_to_resources() {
+        assert_eq!(translate_window_item_limit(5, 3), 60);
+        assert_eq!(translate_window_item_limit(1, 3), 12);
+        assert_eq!(translate_window_item_limit(10, 0), 40);
+    }
 }
