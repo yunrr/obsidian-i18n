@@ -232,6 +232,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
     const currentExtractionVersion = i18n.settings.translationVersion || '1.0.1';
 
     useEffect(() => {
+        if (batchTask.isRunning) return;
         let cancelled = false;
         const indexMissingMetadata = async () => {
             const missing = i18n.sourceManager.getMissingMetadataIndexSourceIds('theme')
@@ -245,7 +246,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
         };
         void indexMissingMetadata();
         return () => { cancelled = true; };
-    }, [i18n.sourceManager, sourceTick]);
+    }, [batchTask.isRunning, i18n.sourceManager, sourceTick]);
 
     const translationVersionOptions = useMemo(() => {
         return i18n.sourceManager.getIndexedTranslationVersions('theme');

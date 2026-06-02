@@ -230,6 +230,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
     const currentExtractionVersion = settings.translationVersion || '1.0.1';
 
     useEffect(() => {
+        if (batchTask.isRunning) return;
         let cancelled = false;
         const indexMissingMetadata = async () => {
             const missing = i18n.sourceManager.getMissingMetadataIndexSourceIds('plugin')
@@ -243,7 +244,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         };
         void indexMissingMetadata();
         return () => { cancelled = true; };
-    }, [i18n.sourceManager, sourceTick]);
+    }, [batchTask.isRunning, i18n.sourceManager, sourceTick]);
 
     const translationVersionOptions = useMemo(() => {
         return i18n.sourceManager.getIndexedTranslationVersions('plugin');
