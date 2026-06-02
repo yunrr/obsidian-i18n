@@ -211,6 +211,7 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
 
             if (i18n.sourceManager) {
                 await i18n.sourceManager.extractAndSaveSource(theme.name, themeTranslation, { title: theme.name, type: 'theme' });
+                i18n.sourceManager.reloadFromDisk();
                 i18n.notice.successPrefix(t('Manager.Themes.Notices.ThemeExtractPrefix'), t('Manager.Plugins.Hints.ExtractSuccessDesc'));
             }
             refreshParent();

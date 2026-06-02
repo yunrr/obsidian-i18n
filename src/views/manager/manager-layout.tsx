@@ -14,6 +14,7 @@ import Url from 'src/constants/url';
 import { WIZARD_VIEW_TYPE } from '../../views';
 import { CLOUD_VIEW_TYPE } from '../cloud';
 import { AdminPanel } from './components/admin-panel';
+import { useGlobalStoreInstance } from '~/utils/store/global';
 
 interface ManagerLayoutProps {
     i18n: I18N;
@@ -23,6 +24,7 @@ interface ManagerLayoutProps {
 export const ManagerLayout: React.FC<ManagerLayoutProps> = ({ i18n, close }) => {
     const { t } = useTranslation();
     const app = i18n.app;
+    const triggerSourceUpdate = useGlobalStoreInstance((state) => state.triggerSourceUpdate);
 
     // 管理员状态
     const isAdmin = useCloudStore.use.isAdmin();
@@ -36,10 +38,16 @@ export const ManagerLayout: React.FC<ManagerLayoutProps> = ({ i18n, close }) => 
         }
     }, [i18n.settings.shareToken, githubUser, fetchGithubUser, i18n]);
 
+    const handleManagerTabChange = useCallback((val: string) => {
+        i18n.settings.managerTab = val;
+        i18n.saveSettings();
+        i18n.sourceManager.reloadFromDisk();
+        triggerSourceUpdate();
+    }, [i18n, triggerSourceUpdate]);
 
     return (
         <div className="flex flex-col h-full bg-background overflow-hidden">
-            <Tabs defaultValue={i18n.settings.managerTab || 'plugins'} onValueChange={(val) => { i18n.settings.managerTab = val; i18n.saveSettings(); }} className="flex flex-col h-full gap-0"   >
+            <Tabs defaultValue={i18n.settings.managerTab || 'plugins'} onValueChange={handleManagerTabChange} className="flex flex-col h-full gap-0"   >
                 {/* 顶部工具栏：左侧 Tab 切换 + 右侧功能按钮 */}
                 <div className="flex items-center justify-between px-4 py-2 border-b shrink-0">
                     {/* 左侧：Tab 切换器 */}

@@ -78,6 +78,7 @@ interface ThemeBatchResource {
     label: string;
     sourceId?: string | null;
     pendingTranslationCount?: number;
+    unprocessedTranslationCount?: number;
     totalTranslationCount?: number;
 }
 
@@ -101,6 +102,17 @@ const SOURCE_SYNC_THROTTLE_MS = 750;
 const BATCH_PROGRESS_POLL_MS = 120;
 
 const shouldTranslateText = (target?: string, source?: string) => !target || target.trim() === '' || target === source;
+const getUnprocessedTranslationCount = (source: Pick<ThemeBatchResource, 'pendingTranslationCount' | 'unprocessedTranslationCount'> | null | undefined) => {
+    if (!source) return 0;
+    return typeof source.unprocessedTranslationCount === 'number'
+        ? source.unprocessedTranslationCount
+        : source.pendingTranslationCount || 0;
+};
+const isTranslationProcessingComplete = (source: any) => {
+    if (!source) return false;
+    if (typeof source.translationProcessingComplete === 'boolean') return source.translationProcessingComplete;
+    return typeof source.pendingTranslationCount === 'number' && typeof source.totalTranslationCount === 'number' && source.pendingTranslationCount === 0;
+};
 const getPositiveInt = (value: unknown, fallback: number) => {
     const parsed = typeof value === 'number' ? value : Number.parseInt(String(value), 10);
     return Number.isFinite(parsed) ? Math.max(1, Math.floor(parsed)) : fallback;
@@ -434,7 +446,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             const pendingTranslationCount = activeSource?.pendingTranslationCount || 0;
             const totalTranslationCount = activeSource?.totalTranslationCount || 0;
             const hasTranslationCounts = typeof activeSource?.pendingTranslationCount === 'number' && typeof activeSource?.totalTranslationCount === 'number';
-            const isTranslated = !!(hasTranslation && activeSourceId && activeSource?.translationFormatValid !== false && hasTranslationCounts && !failedSourceIds.has(activeSourceId) && pendingTranslationCount === 0);
+            const isTranslated = !!(hasTranslation && activeSourceId && activeSource?.translationFormatValid !== false && hasTranslationCounts && isTranslationProcessingComplete(activeSource));
             const translationVersion = activeSource?.translationVersion || '';
             const supportedVersion = activeSource?.supportedVersions || '';
             const description = activeSource?.description || '';
@@ -443,7 +455,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             let statusText: string = t('Manager.Themes.Status.ToExtract');
             let statusDesc: string = t('Manager.Plugins.Hints.NoTransDesc');
             const isApplied = !!(state && state.isApplied);
-            const hasFailedBatches = !!activeSourceId && failedSourceIds.has(activeSourceId);
+            const hasFailedBatches = !!activeSourceId && failedSourceIds.has(activeSourceId) && !isTranslated;
 
             if (isApplied && isTranslated) {
                 statusColor = 'bg-green-500 dark:bg-green-600';
@@ -539,6 +551,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
         if (!source || source.translationFormatValid === false) return null;
         return {
             pendingTranslationCount: source.pendingTranslationCount || 0,
+            unprocessedTranslationCount: getUnprocessedTranslationCount(source),
             totalTranslationCount: source.totalTranslationCount || 0,
         };
     }, [i18n.sourceManager]);
@@ -550,10 +563,10 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             const source = i18n.sourceManager.getSourceForPluginVersion(theme.name, 'theme', batchTranslationVersion);
             const counts = getThemeTranslationCounts(source?.id);
             if (!source || !counts) continue;
-            if (i18n.settings.llmOverwriteExistingTranslations !== true && !failedSourceIds.has(source.id) && counts.pendingTranslationCount === 0) continue;
+            if (i18n.settings.llmOverwriteExistingTranslations !== true && !failedSourceIds.has(source.id) && counts.unprocessedTranslationCount === 0) continue;
             const itemCount = i18n.settings.llmOverwriteExistingTranslations === true
                 ? counts.totalTranslationCount
-                : counts.pendingTranslationCount;
+                : counts.unprocessedTranslationCount;
             if ((itemCount || 0) <= 0) continue;
             resources.set(theme.name, {
                 resourceId: theme.name,
@@ -596,7 +609,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                 if (!counts) return [];
                 const itemCount = i18n.settings.llmOverwriteExistingTranslations === true
                     ? counts.totalTranslationCount
-                    : counts.pendingTranslationCount;
+                    : counts.unprocessedTranslationCount;
                 const remainingCount = itemCount || 0;
                 if (remainingCount <= 0) return [];
                 return [{
@@ -654,9 +667,13 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
         revisions.sourceRevision = progress.sourceRevision;
         revisions.recordRevision = progress.recordRevision;
         if (hasSourceRevisionChange || hasRecordRevisionChange) {
-            requestSourceStateSync();
+            if (progress.mode === 'extract' && hasSourceRevisionChange) {
+                syncSourceStateFromDisk();
+            } else {
+                requestSourceStateSync();
+            }
         }
-    }, [requestSourceStateSync]);
+    }, [requestSourceStateSync, syncSourceStateFromDisk]);
 
     const runWorkerTask = useCallback(async (type: 'theme-batch-extract' | 'theme-batch-translate' | 'theme-failure-retry', payload: unknown) => {
         const started = await i18n.companionWorkerManager.startTask(type, payload);
@@ -784,9 +801,9 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
         const totalResources = resume ? themeTranslateCheckpoint?.totalResources || resources.length : resources.length;
         const processedItems = resume ? themeTranslateCheckpoint?.processedItems || 0 : 0;
         const totalItems = resume ? themeTranslateCheckpoint?.totalItems || resources.reduce((sum, resource) => {
-            return sum + (i18n.settings.llmOverwriteExistingTranslations === true ? resource.totalTranslationCount || 0 : resource.pendingTranslationCount || 0);
+            return sum + (i18n.settings.llmOverwriteExistingTranslations === true ? resource.totalTranslationCount || 0 : getUnprocessedTranslationCount(resource));
         }, 0) : resources.reduce((sum, resource) => {
-            return sum + (i18n.settings.llmOverwriteExistingTranslations === true ? resource.totalTranslationCount || 0 : resource.pendingTranslationCount || 0);
+            return sum + (i18n.settings.llmOverwriteExistingTranslations === true ? resource.totalTranslationCount || 0 : getUnprocessedTranslationCount(resource));
         }, 0);
 
         setBatchTask({

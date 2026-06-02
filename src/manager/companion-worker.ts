@@ -318,9 +318,9 @@ async function callChatCompletion(items: JsonRecord[], systemPrompt: string, con
 function mapResultsBack<T extends { id: number; source: string; target: string }>(items: T[], simplifiedResults: Array<{ i: number; t: string }>): T[] {
     return items.map(item => {
         const result = simplifiedResults.find(r => r.i === item.id);
-        let target = result ? result.t : undefined;
+        const target = result ? result.t : undefined;
         if (!target || target.trim() === '' || target.trim() === '空') {
-            target = item.target || item.source;
+            throw new Error('翻译返回缺少部分条目或包含空译文');
         }
         return { ...item, target };
     });
@@ -986,7 +986,7 @@ async function readTranslationFile<T>(paths: WorkerPersistencePaths, sourceId: s
     }
 }
 
-function getTranslationMetadataIndex(content: any): Pick<TranslationSource, 'translationVersion' | 'supportedVersions' | 'language' | 'description' | 'totalTranslationCount' | 'pendingTranslationCount' | 'translationFormatValid' | 'metadataIndexedAt'> {
+function getTranslationMetadataIndex(content: any): Pick<TranslationSource, 'translationVersion' | 'supportedVersions' | 'language' | 'description' | 'totalTranslationCount' | 'pendingTranslationCount' | 'processedTranslationCount' | 'unprocessedTranslationCount' | 'translationProcessingComplete' | 'translationFormatValid' | 'metadataIndexedAt'> {
     const metadata = content?.metadata || {};
     const sourceMatches = (item: any) => {
         const source = String(item?.source || '').trim();
@@ -1020,6 +1020,9 @@ function getTranslationMetadataIndex(content: any): Pick<TranslationSource, 'tra
         description: metadata.description ? String(metadata.description) : '',
         totalTranslationCount,
         pendingTranslationCount,
+        processedTranslationCount: Math.max(0, totalTranslationCount - pendingTranslationCount),
+        unprocessedTranslationCount: pendingTranslationCount,
+        translationProcessingComplete: translationFormatValid && pendingTranslationCount === 0,
         translationFormatValid,
         metadataIndexedAt: Date.now(),
     };
@@ -1573,7 +1576,11 @@ async function handlePluginBatchTranslate(task: CompanionTaskRuntime, payload: C
                     await saveTranslatedSource(paths, sourceId, result.translationJson);
                     await replaceFailuresForSource(paths, 'plugin', sourceId, result.failures);
                     task.progress.processedItems += result.processedItems;
-                    task.progress.successCount++;
+                    if (result.failures.length === 0) {
+                        task.progress.successCount++;
+                    } else {
+                        task.progress.failedCount++;
+                    }
                     bumpSourceRevision(task);
                     bumpRecordRevision(task);
                 } catch (error) {
@@ -1622,7 +1629,11 @@ async function handleThemeBatchTranslate(task: CompanionTaskRuntime, payload: Co
                     await saveTranslatedSource(paths, sourceId, result.translationJson);
                     await replaceFailuresForSource(paths, 'theme', sourceId, result.failures);
                     task.progress.processedItems += result.processedItems;
-                    task.progress.successCount++;
+                    if (result.failures.length === 0) {
+                        task.progress.successCount++;
+                    } else {
+                        task.progress.failedCount++;
+                    }
                     bumpSourceRevision(task);
                     bumpRecordRevision(task);
                 } catch (error) {

@@ -225,6 +225,7 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
 
             if (sourceManager) {
                 await sourceManager.extractAndSaveSource(plugin.id, translationJson, { title: plugin.name });
+                sourceManager.reloadFromDisk();
                 i18n.notice.successPrefix(t('Manager.Plugins.Notices.ExtractSuccess'), t('Manager.Plugins.Hints.ExtractSuccessDesc'));
             }
             refreshParent();

@@ -105,7 +105,7 @@ export default {
         Overview: "正则统计",
         TotalItems: "匹配总数",
         Translated: "已处理项",
-        Untranslated: "待处理项",
+        Untranslated: "未翻译项",
         AddRule: "新增正则规则",
         InputRegexPlaceholder: "输入正则表达式",
         InputTargetPlaceholder: "输入替换目标",

@@ -3136,7 +3136,7 @@ async fn handle_cloud_publish_source(state: &AppState, payload: Value) -> Result
     updated_source["origin"] = json!("cloud");
     updated_source["cloud"] = json!({ "owner": payload.owner, "repo": payload.repo, "hash": hash });
     updated_source["updatedAt"] = json!(now_ms());
-    merge_metadata_index(&mut updated_source, &content);
+    merge_metadata_index(&mut updated_source, &content, true);
     save_source_entry(state, &paths, source_id, updated_source.clone(), false).await?;
     Ok(json!({ "state": true, "manifest": manifest, "source": updated_source }))
 }
@@ -3222,7 +3222,7 @@ async fn handle_cloud_prepare_backup(_state: &AppState, payload: Value) -> Resul
             updated_source["origin"] = json!("cloud");
             updated_source["cloud"] = json!({ "owner": payload.owner, "repo": payload.repo, "hash": hash });
             updated_source["updatedAt"] = json!(now_ms());
-            merge_metadata_index(&mut updated_source, &content);
+            merge_metadata_index(&mut updated_source, &content, true);
             sources.push(updated_source);
         }
     }
@@ -3611,7 +3611,7 @@ fn source_from_entry(entry: &Value, content: &Value, owner: &str, repo: &str, ex
         "updatedAt": now,
         "createdAt": existing.and_then(|source| source.get("createdAt")).and_then(Value::as_u64).unwrap_or(now),
     });
-    merge_metadata_index(&mut source, content);
+    merge_metadata_index(&mut source, content, false);
     Ok(source)
 }
 
@@ -4334,7 +4334,7 @@ fn source_import_blocking(payload: SourceManagerPayload) -> Result<SourceImportE
                 source["createdAt"] = json!(now);
             }
             source["updatedAt"] = json!(now);
-            merge_metadata_index(&mut source, &content);
+            merge_metadata_index(&mut source, &content, false);
             save_translation(&paths, &source_id, &content)?;
             merge_source_file_mtime(&mut source, &paths, &source_id);
             sources.insert(source_id, source);
@@ -4496,30 +4496,6 @@ where
     removed
 }
 
-fn load_success_item_keys(paths: &PersistencePaths, scope: &str) -> HashMap<String, HashSet<String>> {
-    let mut grouped = HashMap::<String, HashSet<String>>::new();
-    for batch in load_record(paths)
-        .get("successBatches")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-    {
-        if batch.get("scope").and_then(Value::as_str) != Some(scope) {
-            continue;
-        }
-        let Some(source_id) = batch.get("sourceId").and_then(Value::as_str) else {
-            continue;
-        };
-        let bucket = grouped.entry(source_id.to_string()).or_default();
-        for item in batch.get("itemKeys").and_then(Value::as_array).cloned().unwrap_or_default() {
-            if let Some(key) = item.as_str() {
-                bucket.insert(key.to_string());
-            }
-        }
-    }
-    grouped
-}
-
 fn read_translation(paths: &PersistencePaths, source_id: &str) -> Option<Value> {
     let file_path = paths.sources_dir.join(format!("{source_id}.json"));
     fs::read_to_string(file_path)
@@ -4581,15 +4557,26 @@ fn metadata_index(content: &Value) -> Value {
         "description": content.pointer("/metadata/description").and_then(Value::as_str).unwrap_or_default(),
         "totalTranslationCount": total_count,
         "pendingTranslationCount": pending_count,
+        "processedTranslationCount": total_count.saturating_sub(pending_count),
+        "unprocessedTranslationCount": pending_count,
+        "translationProcessingComplete": format_valid && pending_count == 0,
         "translationFormatValid": format_valid,
         "metadataIndexedAt": now_ms(),
     })
 }
 
-fn merge_metadata_index(source: &mut Value, content: &Value) {
+fn merge_metadata_index(source: &mut Value, content: &Value, preserve_processing_state: bool) {
     let index = metadata_index(content);
     if let Some(obj) = index.as_object() {
         for (key, value) in obj {
+            if preserve_processing_state
+                && matches!(
+                key.as_str(),
+                "processedTranslationCount" | "unprocessedTranslationCount" | "translationProcessingComplete"
+            ) && source.get(key).is_some()
+            {
+                continue;
+            }
             source[key] = value.clone();
         }
     }
@@ -4706,7 +4693,7 @@ fn source_index_blocking(state: &AppState, payload: SourceManagerPayload) -> Res
                 skipped_count += 1;
                 continue;
             };
-            merge_metadata_index(source, &content);
+            merge_metadata_index(source, &content, true);
             source["sourceFileExists"] = json!(true);
             source["sourceFileMtime"] = json!(source_file_mtime);
             merge_source_install_state(source, &installed_plugins, &installed_themes);
@@ -4728,16 +4715,38 @@ fn source_index_blocking(state: &AppState, payload: SourceManagerPayload) -> Res
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SavedTranslationIndex {
+    total_count: u64,
+    format_valid: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SourceProcessingState {
+    complete: bool,
+    processed_count: u64,
+    unprocessed_count: u64,
+}
+
 async fn save_translated_source(
     state: &AppState,
     paths: &PersistencePaths,
     source_id: &str,
     content: &Value,
-) -> Result<()> {
+) -> Result<SavedTranslationIndex> {
     let _guard = state.persistence_lock.lock().await;
     let mut meta = load_meta(paths);
     save_translation(paths, source_id, content)?;
-    if let Some(source) = meta.pointer_mut(&format!("/sources/{source_id}")) {
+    let mut saved_index = SavedTranslationIndex {
+        total_count: 0,
+        format_valid: false,
+    };
+    let active_scope = {
+        let Some(source) = meta.pointer_mut(&format!("/sources/{source_id}")) else {
+            return Ok(saved_index);
+        };
+        let plugin = source.get("plugin").and_then(Value::as_str).unwrap_or_default().to_string();
+        let source_type = source.get("type").and_then(Value::as_str).unwrap_or("plugin").to_string();
         source["title"] = content
             .pointer("/metadata/title")
             .cloned()
@@ -4748,7 +4757,11 @@ async fn save_translated_source(
                     .unwrap_or(Value::String(String::new()))
         });
         source["origin"] = json!("local");
-        merge_metadata_index(source, content);
+        merge_metadata_index(source, content, false);
+        saved_index = SavedTranslationIndex {
+            total_count: source.get("totalTranslationCount").and_then(Value::as_u64).unwrap_or(0),
+            format_valid: source.get("translationFormatValid").and_then(Value::as_bool).unwrap_or(false),
+        };
         merge_source_file_mtime(source, paths, source_id);
         if let Some(obj) = source.as_object_mut() {
             obj.remove("cloud");
@@ -4758,9 +4771,20 @@ async fn save_translated_source(
             );
             obj.insert("updatedAt".to_string(), json!(now_ms()));
         }
-        write_json_pretty(&paths.meta_path, &meta)?;
+        (plugin, source_type)
+    };
+    let (plugin, source_type) = active_scope;
+    if let Some(sources) = meta.get_mut("sources").and_then(Value::as_object_mut) {
+        for existing in sources.values_mut() {
+            if existing.get("plugin").and_then(Value::as_str) == Some(plugin.as_str())
+                && existing.get("type").and_then(Value::as_str).unwrap_or("plugin") == source_type
+            {
+                existing["isActive"] = json!(existing.get("id").and_then(Value::as_str) == Some(source_id));
+            }
+        }
     }
-    Ok(())
+    write_json_pretty(&paths.meta_path, &meta)?;
+    Ok(saved_index)
 }
 
 async fn save_extracted_source(
@@ -4804,7 +4828,7 @@ async fn save_extracted_source(
             "updatedAt": now_ms(),
         });
         save_translation(paths, &source_id, content)?;
-        merge_metadata_index(&mut source, content);
+        merge_metadata_index(&mut source, content, false);
         merge_source_file_mtime(&mut source, paths, &source_id);
         sources.insert(source_id.clone(), source);
     }
@@ -4872,7 +4896,12 @@ async fn replace_or_clear_completed_failures_for_source(
     overwrite_existing: bool,
     failures: Vec<CompanionBatchFailure>,
     success_items: Vec<String>,
-) -> Result<()> {
+) -> Result<SourceProcessingState> {
+    let mut processing_state = SourceProcessingState {
+        complete: false,
+        processed_count: 0,
+        unprocessed_count: all_items.len() as u64,
+    };
     update_record(state, paths, |record| {
         let historical_success = record
             .get("successBatches")
@@ -4895,10 +4924,20 @@ async fn replace_or_clear_completed_failures_for_source(
         combined_success.sort_unstable();
         combined_success.dedup();
         let success_set: HashSet<&str> = combined_success.iter().map(String::as_str).collect();
-        let resource_completed = if overwrite_existing {
-            failures.is_empty() && !all_items.is_empty() && all_items.iter().all(|item| success_set.contains(item.as_str()))
+        let required_items = if overwrite_existing {
+            all_items.as_slice()
         } else {
-            pending_items.iter().all(|item| success_set.contains(item.as_str()))
+            pending_items.as_slice()
+        };
+        let unprocessed_count = required_items
+            .iter()
+            .filter(|item| !success_set.contains(item.as_str()))
+            .count() as u64;
+        let resource_completed = failures.is_empty() && unprocessed_count == 0;
+        processing_state = SourceProcessingState {
+            complete: resource_completed,
+            processed_count: all_items.len().saturating_sub(unprocessed_count as usize) as u64,
+            unprocessed_count,
         };
 
         let mut existing_failures = record
@@ -4941,7 +4980,26 @@ async fn replace_or_clear_completed_failures_for_source(
         }
         record["successBatches"] = Value::Array(success_batches);
     })
-    .await
+    .await?;
+    Ok(processing_state)
+}
+
+async fn update_source_processing_state(
+    state: &AppState,
+    paths: &PersistencePaths,
+    source_id: &str,
+    processing_state: SourceProcessingState,
+) -> Result<()> {
+    let _guard = state.persistence_lock.lock().await;
+    let mut meta = load_meta(paths);
+    if let Some(source) = meta.pointer_mut(&format!("/sources/{source_id}")) {
+        source["processedTranslationCount"] = json!(processing_state.processed_count);
+        source["unprocessedTranslationCount"] = json!(processing_state.unprocessed_count);
+        source["translationProcessingComplete"] = json!(processing_state.complete);
+        source["updatedAt"] = json!(now_ms());
+        write_json_pretty(&paths.meta_path, &meta)?;
+    }
+    Ok(())
 }
 
 fn build_failure_record(scope: &str, failure: CompanionBatchFailure) -> BatchTaskFailureRecord {
@@ -5230,11 +5288,6 @@ async fn handle_batch_translate(
         .map(|resource| serde_json::to_value(resource).unwrap_or(Value::Null))
         .collect();
     let mut completed = HashSet::<usize>::new();
-    let success_item_keys = if batch.config.overwrite_existing_translations {
-        HashMap::new()
-    } else {
-        load_success_item_keys(&paths, scope)
-    };
     let window_item_limit = translate_window_item_limit(batch.config.batch_size, batch.config.concurrency);
     let mut next_resource_index = 0usize;
 
@@ -5329,7 +5382,6 @@ async fn handle_batch_translate(
                     state_index,
                     &resource_state,
                     batch.config.overwrite_existing_translations,
-                    success_item_keys.get(&resource_state.source_id),
                     &mut ast_id,
                     &mut regex_id,
                     &mut ast_items,
@@ -5340,7 +5392,6 @@ async fn handle_batch_translate(
                     state_index,
                     &resource_state,
                     batch.config.overwrite_existing_translations,
-                    success_item_keys.get(&resource_state.source_id),
                     &mut theme_id,
                     &mut theme_items,
                 );
@@ -5456,14 +5507,14 @@ async fn process_batch_translate_window(
     for resource_state in resource_states {
         ensure_not_cancelled(task).await?;
         touch_progress(task, json!({ "currentLabel": resource_state.resource.label })).await;
-        save_translated_source(
+        let saved_index = save_translated_source(
             state,
             paths,
             &resource_state.source_id,
             &resource_state.translation_json,
         )
         .await?;
-        replace_or_clear_completed_failures_for_source(
+        let processing_state = replace_or_clear_completed_failures_for_source(
             state,
             paths,
             scope,
@@ -5475,8 +5526,13 @@ async fn process_batch_translate_window(
             resource_state.success_items,
         )
         .await?;
-        increment_progress(task, "successCount", 1).await;
-        bump_source_revision(task).await;
+        update_source_processing_state(state, paths, &resource_state.source_id, processing_state)
+            .await?;
+        if saved_index.format_valid && saved_index.total_count > 0 && processing_state.complete {
+            increment_progress(task, "successCount", 1).await;
+        } else {
+            increment_progress(task, "failedCount", 1).await;
+        }
         mark_batch_translate_resource_completed(
             state,
             task,
@@ -5489,6 +5545,7 @@ async fn process_batch_translate_window(
             false,
         )
         .await?;
+        bump_source_revision(task).await;
     }
 
     Ok(())
@@ -5556,7 +5613,6 @@ fn collect_plugin_packed_items(
     resource_state_index: usize,
     resource_state: &BatchResourceState,
     overwrite_existing: bool,
-    success_item_keys: Option<&HashSet<String>>,
     ast_id: &mut u64,
     regex_id: &mut u64,
     ast_items: &mut Vec<Value>,
@@ -5570,10 +5626,7 @@ fn collect_plugin_packed_items(
         for (file, file_dict) in dict {
             if let Some(ast) = file_dict.get("ast").and_then(Value::as_array) {
                 for (index, item) in ast.iter().enumerate() {
-                    let item_key = format!("{file}\tast\t{index}");
-                    if should_translate(item.get("target"), item.get("source"), overwrite_existing)
-                        && (overwrite_existing || !success_item_keys.is_some_and(|keys| keys.contains(&item_key)))
-                    {
+                    if should_translate(item.get("target"), item.get("source"), overwrite_existing) {
                         ast_items.push(json!({
                             "id": *ast_id,
                             "resourceStateIndex": resource_state_index,
@@ -5590,10 +5643,7 @@ fn collect_plugin_packed_items(
             }
             if let Some(regex) = file_dict.get("regex").and_then(Value::as_array) {
                 for (index, item) in regex.iter().enumerate() {
-                    let item_key = format!("{file}\tregex\t{index}");
-                    if should_translate(item.get("target"), item.get("source"), overwrite_existing)
-                        && (overwrite_existing || !success_item_keys.is_some_and(|keys| keys.contains(&item_key)))
-                    {
+                    if should_translate(item.get("target"), item.get("source"), overwrite_existing) {
                         regex_items.push(json!({
                             "id": *regex_id,
                             "resourceStateIndex": resource_state_index,
@@ -5614,7 +5664,6 @@ fn collect_theme_packed_items(
     resource_state_index: usize,
     resource_state: &BatchResourceState,
     overwrite_existing: bool,
-    success_item_keys: Option<&HashSet<String>>,
     theme_id: &mut u64,
     theme_items: &mut Vec<Value>,
 ) {
@@ -5624,10 +5673,7 @@ fn collect_theme_packed_items(
         .and_then(Value::as_array)
     {
         for (index, item) in dict.iter().enumerate() {
-            let item_key = index.to_string();
-            if should_translate(item.get("target"), item.get("source"), overwrite_existing)
-                && (overwrite_existing || !success_item_keys.is_some_and(|keys| keys.contains(&item_key)))
-            {
+            if should_translate(item.get("target"), item.get("source"), overwrite_existing) {
                 theme_items.push(json!({
                     "id": *theme_id,
                     "resourceStateIndex": resource_state_index,
@@ -5721,18 +5767,7 @@ where
 
         match result {
             Ok(translated) => {
-                for item in batch {
-                    let id = item.get("id").and_then(Value::as_u64).unwrap_or(0);
-                    let mut mapped = item.clone();
-                    let target = translated
-                        .iter()
-                        .find(|entry| entry.i == id)
-                        .map(|entry| entry.t.clone())
-                        .filter(|value| !value.trim().is_empty() && value.trim() != "空")
-                        .unwrap_or_else(|| fallback_target(&item));
-                    mapped["target"] = Value::String(target);
-                    report.translated_items.push(mapped);
-                }
+                merge_successful_packed_response(&mut report, batch, translated);
             }
             Err(error) if error.to_string().contains(MANUAL_STOP) => return Err(error),
             Err(error) => {
@@ -5781,6 +5816,46 @@ where
     }
 
     Ok(report)
+}
+
+fn merge_successful_packed_response(
+    report: &mut PackedBatchReport,
+    batch: Vec<Value>,
+    translated: Vec<TranslationPair>,
+) {
+    let translated_by_id = translated
+        .into_iter()
+        .map(|entry| (entry.i, entry.t))
+        .collect::<HashMap<_, _>>();
+    let mut grouped_failures = HashMap::<usize, Vec<BatchTaskFailureItem>>::new();
+    for item in batch {
+        let id = item.get("id").and_then(Value::as_u64).unwrap_or(0);
+        let target = translated_by_id
+            .get(&id)
+            .map(String::as_str)
+            .filter(|value| is_valid_translated_target(value));
+        if let Some(target) = target {
+            let mut mapped = item.clone();
+            mapped["target"] = Value::String(target.to_string());
+            report.translated_items.push(mapped);
+        } else {
+            let resource_state_index = item
+                .get("resourceStateIndex")
+                .and_then(Value::as_u64)
+                .unwrap_or(usize::MAX as u64) as usize;
+            grouped_failures
+                .entry(resource_state_index)
+                .or_default()
+                .push(packed_failure_item(&item));
+        }
+    }
+    for (resource_state_index, items) in grouped_failures {
+        report.failures.push(PackedBatchFailure {
+            resource_state_index,
+            error_message: "翻译返回缺少部分条目或包含空译文".to_string(),
+            items,
+        });
+    }
 }
 
 fn apply_packed_translation_report(
@@ -5853,6 +5928,14 @@ fn fallback_target(item: &Value) -> String {
         .or_else(|| item.get("source").and_then(Value::as_str))
         .unwrap_or_default()
         .to_string()
+}
+
+fn is_valid_translated_target(target: &str) -> bool {
+    let trimmed = target.trim();
+    if trimmed.is_empty() || trimmed == "空" {
+        return false;
+    }
+    true
 }
 
 fn packed_failure_item(item: &Value) -> BatchTaskFailureItem {
@@ -6152,16 +6235,10 @@ where
             let target = translated
                 .iter()
                 .find(|entry| entry.i == id)
-                .map(|entry| entry.t.clone())
-                .filter(|value| !value.trim().is_empty() && value.trim() != "空")
-                .unwrap_or_else(|| {
-                    item.get("target")
-                        .and_then(Value::as_str)
-                        .or_else(|| item.get("source").and_then(Value::as_str))
-                        .unwrap_or_default()
-                        .to_string()
-                });
-            mapped["target"] = Value::String(target);
+                .map(|entry| entry.t.as_str())
+                .filter(|value| is_valid_translated_target(value))
+                .ok_or_else(|| anyhow!("翻译返回缺少部分条目或包含空译文"))?;
+            mapped["target"] = Value::String(target.to_string());
             output.push(mapped);
         }
     }
@@ -7021,5 +7098,34 @@ mod tests {
         assert_eq!(translate_window_item_limit(5, 3), 60);
         assert_eq!(translate_window_item_limit(1, 3), 12);
         assert_eq!(translate_window_item_limit(10, 0), 40);
+    }
+
+    #[test]
+    fn packed_response_marks_non_empty_returned_items_successful_even_if_unchanged() {
+        let batch = vec![
+            json!({ "id": 1, "resourceStateIndex": 0, "dictIndex": 0, "source": "A", "target": "" }),
+            json!({ "id": 2, "resourceStateIndex": 0, "dictIndex": 1, "source": "B", "target": "" }),
+            json!({ "id": 3, "resourceStateIndex": 1, "dictIndex": 2, "source": "C", "target": "" }),
+            json!({ "id": 4, "resourceStateIndex": 1, "dictIndex": 3, "source": "D", "target": "" }),
+        ];
+        let translated = vec![
+            TranslationPair { i: 1, t: "甲".to_string() },
+            TranslationPair { i: 2, t: " ".to_string() },
+            TranslationPair { i: 4, t: "D".to_string() },
+        ];
+        let mut report = PackedBatchReport {
+            translated_items: Vec::new(),
+            failures: Vec::new(),
+        };
+
+        merge_successful_packed_response(&mut report, batch, translated);
+
+        assert_eq!(report.translated_items.len(), 2);
+        assert_eq!(report.translated_items[0].get("target").and_then(Value::as_str), Some("甲"));
+        assert_eq!(report.translated_items[1].get("target").and_then(Value::as_str), Some("D"));
+        let failed_items = report.failures.iter().map(|failure| failure.items.len()).sum::<usize>();
+        assert_eq!(failed_items, 2);
+        assert!(report.failures.iter().any(|failure| failure.resource_state_index == 0));
+        assert!(report.failures.iter().any(|failure| failure.resource_state_index == 1));
     }
 }

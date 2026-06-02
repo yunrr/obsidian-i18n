@@ -26,12 +26,16 @@ type SourceStatusFilter = 'all' | 'translated' | 'untranslated' | 'partialFailed
 
 const getSourceTranslationStatus = (source: TranslationSource, failedSourceIds: Set<string>): Exclude<SourceStatusFilter, 'all'> => {
     if (source.translationFormatValid === false) return 'error';
-    if (failedSourceIds.has(source.id)) return 'partialFailed';
 
     const hasCounts = typeof source.pendingTranslationCount === 'number' && typeof source.totalTranslationCount === 'number';
     if (!hasCounts) return 'unindexed';
 
-    return source.pendingTranslationCount === 0 ? 'translated' : 'untranslated';
+    const isComplete = typeof source.translationProcessingComplete === 'boolean'
+        ? source.translationProcessingComplete
+        : source.pendingTranslationCount === 0;
+    if (isComplete) return 'translated';
+    if (failedSourceIds.has(source.id)) return 'partialFailed';
+    return 'untranslated';
 };
 
 export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = ({ i18n }) => {
