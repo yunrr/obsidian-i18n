@@ -461,16 +461,18 @@ export interface CompanionThemeBatchTranslatePayload {
 
 export interface CompanionPluginFailureRetryPayload {
     persistence: CompanionWorkerPersistenceConfig;
-    failures: BatchTaskFailureRecord[];
     config: CompanionTranslationConfig;
     concurrency: number;
+    totalResources?: number;
+    totalItems?: number;
 }
 
 export interface CompanionThemeFailureRetryPayload {
     persistence: CompanionWorkerPersistenceConfig;
-    failures: BatchTaskFailureRecord[];
     config: CompanionTranslationConfig;
     concurrency: number;
+    totalResources?: number;
+    totalItems?: number;
 }
 
 export type CompanionAsyncTaskType = 'plugin-batch-extract' | 'theme-batch-extract' | 'plugin-batch-translate' | 'theme-batch-translate' | 'plugin-failure-retry' | 'theme-failure-retry' | 'cloud-backup-all';

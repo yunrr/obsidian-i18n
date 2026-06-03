@@ -332,9 +332,12 @@ type ThemeBatchTranslatePayload = PluginBatchTranslatePayload;
 #[serde(rename_all = "camelCase")]
 struct FailureRetryPayload {
     persistence: PersistenceConfig,
-    failures: Vec<BatchTaskFailureRecord>,
     config: CompanionTranslationConfig,
     concurrency: usize,
+    #[serde(default)]
+    total_resources: Option<usize>,
+    #[serde(default)]
+    total_items: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -606,6 +609,14 @@ struct BatchTaskFailureItem {
     r#type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RetryCompletedItemKey {
+    failure_id: String,
+    dict_index: isize,
+    file: Option<String>,
+    batch_type: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1930,11 +1941,7 @@ fn create_initial_progress(
     let is_extract = task_type.ends_with("extract");
     let is_retry = task_type.ends_with("retry");
     let resources = if is_retry {
-        payload
-            .get("failures")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
+        Vec::new()
     } else {
         payload
             .get("resources")
@@ -1943,16 +1950,10 @@ fn create_initial_progress(
             .unwrap_or_default()
     };
     let total_items = if is_retry {
-        resources
-            .iter()
-            .map(|failure| {
-                failure
-                    .get("items")
-                    .and_then(Value::as_array)
-                    .map(|items| items.len())
-                    .unwrap_or(0)
-            })
-            .sum()
+        payload
+            .get("totalItems")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize
     } else {
         payload
             .get("totalItems")
@@ -4937,6 +4938,221 @@ async fn remove_failures(state: &AppState, paths: &PersistencePaths, ids: &[Stri
     .await
 }
 
+fn collect_failure_retry_window(
+    failures: &[BatchTaskFailureRecord],
+    item_limit: usize,
+) -> Vec<BatchTaskFailureRecord> {
+    let item_limit = item_limit.max(1);
+    let mut collected = Vec::new();
+    let mut collected_items = 0usize;
+
+    for failure in failures {
+        if failure.items.is_empty() {
+            collected.push(failure.clone());
+            continue;
+        }
+        if collected_items >= item_limit {
+            break;
+        }
+        let remaining = item_limit - collected_items;
+        let take_count = failure.items.len().min(remaining);
+        let mut sliced = failure.clone();
+        sliced.items = failure.items.iter().take(take_count).cloned().collect();
+        collected_items += sliced.items.len();
+        collected.push(sliced);
+    }
+
+    collected
+}
+
+fn retry_completed_item_key_from_value(value: &Value) -> RetryCompletedItemKey {
+    RetryCompletedItemKey {
+        failure_id: value
+            .get("failureId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        dict_index: value.get("dictIndex").and_then(Value::as_i64).unwrap_or(-1) as isize,
+        file: non_empty_string(value.get("file")),
+        batch_type: value
+            .get("batchType")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    }
+}
+
+fn remove_completed_retry_items_from_record(
+    record: &mut Value,
+    scope: &str,
+    completed_items: &[RetryCompletedItemKey],
+) -> Vec<String> {
+    if completed_items.is_empty() {
+        return Vec::new();
+    }
+    let completed: HashSet<RetryCompletedItemKey> = completed_items.iter().cloned().collect();
+    let existing = record
+        .get("failures")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut retained_failures = Vec::new();
+    let mut removed_failure_ids = Vec::new();
+
+    for mut failure in existing {
+        let failure_scope = failure
+            .get("scope")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let failure_id = failure
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let batch_type = failure
+            .get("batchType")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if failure_scope != scope {
+            retained_failures.push(failure);
+            continue;
+        }
+
+        let items = failure
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|item| {
+                let key = RetryCompletedItemKey {
+                    failure_id: failure_id.clone(),
+                    dict_index: item.get("dictIndex").and_then(Value::as_i64).unwrap_or(-1) as isize,
+                    file: non_empty_string(item.get("file")),
+                    batch_type: batch_type.clone(),
+                };
+                !completed.contains(&key)
+            })
+            .collect::<Vec<_>>();
+        if !items.is_empty() {
+            failure["items"] = Value::Array(items);
+            retained_failures.push(failure);
+        } else {
+            removed_failure_ids.push(failure_id);
+        }
+    }
+
+    record["failures"] = Value::Array(retained_failures);
+    removed_failure_ids
+}
+
+fn load_retry_failures_for_scope(paths: &PersistencePaths, scope: &str) -> Vec<BatchTaskFailureRecord> {
+    load_record(paths)
+        .get("failures")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|failure| serde_json::from_value::<BatchTaskFailureRecord>(failure).ok())
+        .filter(|failure| failure.scope == scope && !failure.items.is_empty())
+        .collect()
+}
+
+fn retry_completed_item_key_from_failure_item(
+    failure: &BatchTaskFailureRecord,
+    item: &BatchTaskFailureItem,
+) -> RetryCompletedItemKey {
+    RetryCompletedItemKey {
+        failure_id: failure.id.clone(),
+        dict_index: item.dict_index,
+        file: item.file.clone(),
+        batch_type: failure.batch_type.clone(),
+    }
+}
+
+fn prune_retry_window_from_queue(
+    queue: &mut Vec<BatchTaskFailureRecord>,
+    window: &[BatchTaskFailureRecord],
+) {
+    let processed = window
+        .iter()
+        .flat_map(|failure| {
+            failure
+                .items
+                .iter()
+                .map(|item| retry_completed_item_key_from_failure_item(failure, item))
+        })
+        .collect::<HashSet<_>>();
+    if processed.is_empty() {
+        return;
+    }
+
+    let mut retained = Vec::new();
+    for mut failure in queue.drain(..) {
+        let failure_id = failure.id.clone();
+        let batch_type = failure.batch_type.clone();
+        failure.items.retain(|item| {
+            !processed.contains(&RetryCompletedItemKey {
+                failure_id: failure_id.clone(),
+                dict_index: item.dict_index,
+                file: item.file.clone(),
+                batch_type: batch_type.clone(),
+            })
+        });
+        if !failure.items.is_empty() {
+            retained.push(failure);
+        }
+    }
+    *queue = retained;
+}
+
+fn apply_retry_updates_to_translation(
+    translation_json: &mut Value,
+    updates: &[Value],
+    is_plugin: bool,
+) {
+    for update in updates {
+        if is_plugin {
+            let batch_type = update
+                .get("batchType")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let file = update
+                .get("file")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let index = update
+                .get("dictIndex")
+                .and_then(Value::as_u64)
+                .unwrap_or(usize::MAX as u64) as usize;
+            if let Some(slot) = translation_json.pointer_mut(&format!(
+                "/dict/{}/{}/{}/target",
+                escape_pointer(file),
+                batch_type,
+                index
+            )) {
+                *slot = update
+                    .get("target")
+                    .cloned()
+                    .unwrap_or(Value::String(String::new()));
+            }
+        } else {
+            let index = update
+                .get("dictIndex")
+                .and_then(Value::as_u64)
+                .unwrap_or(usize::MAX as u64) as usize;
+            if let Some(slot) = translation_json.pointer_mut(&format!("/dict/{}/target", index)) {
+                *slot = update
+                    .get("target")
+                    .cloned()
+                    .unwrap_or(Value::String(String::new()));
+            }
+        }
+    }
+}
+
 async fn replace_or_clear_completed_failures_for_source(
     state: &AppState,
     paths: &PersistencePaths,
@@ -5580,6 +5796,8 @@ async fn process_batch_translate_window(
     theme_items: Vec<Value>,
     is_plugin: bool,
 ) -> Result<()> {
+    let mut failed_items_in_window = 0usize;
+
     if is_plugin {
         touch_progress(task, json!({ "currentLabel": "AST" })).await;
         let ast_report = translate_packed_batches(
@@ -5590,7 +5808,13 @@ async fn process_batch_translate_window(
             Some(task.clone()),
         )
         .await?;
+        failed_items_in_window += packed_report_failed_item_count(&ast_report);
         apply_packed_translation_report(&mut resource_states, ast_report, "ast", true);
+        stop_if_batch_translate_failures_exceed_limit(
+            failed_items_in_window,
+            &batch.config,
+            "AST",
+        )?;
 
         touch_progress(task, json!({ "currentLabel": "Regex" })).await;
         let regex_report = translate_packed_batches(
@@ -5601,7 +5825,13 @@ async fn process_batch_translate_window(
             Some(task.clone()),
         )
         .await?;
+        failed_items_in_window += packed_report_failed_item_count(&regex_report);
         apply_packed_translation_report(&mut resource_states, regex_report, "regex", true);
+        stop_if_batch_translate_failures_exceed_limit(
+            failed_items_in_window,
+            &batch.config,
+            "Regex",
+        )?;
     } else {
         touch_progress(task, json!({ "currentLabel": "Theme" })).await;
         let theme_report = translate_packed_batches(
@@ -5612,7 +5842,13 @@ async fn process_batch_translate_window(
             Some(task.clone()),
         )
         .await?;
+        failed_items_in_window += packed_report_failed_item_count(&theme_report);
         apply_packed_translation_report(&mut resource_states, theme_report, "theme", false);
+        stop_if_batch_translate_failures_exceed_limit(
+            failed_items_in_window,
+            &batch.config,
+            "Theme",
+        )?;
     }
 
     for resource_state in resource_states {
@@ -5666,6 +5902,18 @@ fn translate_window_item_limit(batch_size: usize, concurrency: usize) -> usize {
     batch_size.max(1) * concurrency.max(1) * TRANSLATE_WINDOW_BATCH_MULTIPLIER
 }
 
+fn failed_item_stop_threshold(batch_size: usize, concurrency: usize) -> usize {
+    batch_size.max(1) * concurrency.max(1)
+}
+
+fn should_stop_batch_translate_for_failures(
+    failed_items: usize,
+    batch_size: usize,
+    concurrency: usize,
+) -> bool {
+    failed_items >= failed_item_stop_threshold(batch_size, concurrency)
+}
+
 #[derive(Debug, Clone)]
 struct BatchResourceState {
     original_index: usize,
@@ -5690,6 +5938,32 @@ struct PackedBatchFailure {
     resource_state_index: usize,
     error_message: String,
     items: Vec<BatchTaskFailureItem>,
+}
+
+fn packed_report_failed_item_count(report: &PackedBatchReport) -> usize {
+    report
+        .failures
+        .iter()
+        .map(|failure| failure.items.len())
+        .sum()
+}
+
+fn stop_if_batch_translate_failures_exceed_limit(
+    failed_items: usize,
+    config: &CompanionTranslationConfig,
+    phase: &str,
+) -> Result<()> {
+    if !should_stop_batch_translate_for_failures(failed_items, config.batch_size, config.concurrency) {
+        return Ok(());
+    }
+    bail!(
+        "批量翻译失败条目达到熔断阈值，已停止本次任务（阶段：{}，失败条目：{}，阈值：{} = 每批次条目数 {} × 请求并发数 {}）",
+        phase,
+        failed_items,
+        failed_item_stop_threshold(config.batch_size, config.concurrency),
+        config.batch_size.max(1),
+        config.concurrency.max(1)
+    )
 }
 
 async fn mark_batch_translate_resource_completed(
@@ -6994,7 +7268,7 @@ fn apply_theme_retry_result(
                     .unwrap_or_default()
                     .to_string();
                 *result_counts.entry(failure_id.clone()).or_default() += 1;
-                updates.push(json!({ "failureId": item["failureId"], "dictIndex": item["dictIndex"], "target": item["target"] }));
+                updates.push(json!({ "batchType": "theme", "failureId": item["failureId"], "dictIndex": item["dictIndex"], "target": item["target"] }));
             }
             for (failure_id, expected_count) in failure_item_counts {
                 if result_counts.get(failure_id).copied().unwrap_or(0) == *expected_count {
@@ -7125,115 +7399,107 @@ async fn handle_failure_retry(
 ) -> Result<()> {
     let retry: FailureRetryPayload = serde_json::from_value(payload.clone())?;
     let paths = paths(&retry.persistence.base_path);
-    let mut groups: HashMap<String, Vec<BatchTaskFailureRecord>> = HashMap::new();
-    for failure in retry.failures {
-        groups
-            .entry(failure.source_id.clone())
-            .or_default()
-            .push(failure);
-    }
-    for failures in groups.into_values() {
+    let scope = if is_plugin { "plugin" } else { "theme" };
+    let item_limit = translate_window_item_limit(retry.config.batch_size, retry.config.concurrency);
+    let mut retry_queue = load_retry_failures_for_scope(&paths, scope);
+    let mut failed_retry_ids = HashSet::<String>::new();
+
+    while !retry_queue.is_empty() {
         if !is_task_active(&task).await {
             break;
         }
-        let first = failures.first().cloned().context("empty failure group")?;
-        touch_progress(&task, json!({ "currentLabel": first.resource_label })).await;
-        let Some(mut translation_json) = read_translation(&paths, &first.source_id) else {
-            increment_progress(&task, "skippedCount", failures.len()).await;
-            increment_progress(&task, "processedResources", failures.len()).await;
-            continue;
-        };
-        let payload = json!({ "resourceId": first.resource_id, "resourceLabel": first.resource_label, "sourceId": first.source_id, "failures": failures, "config": retry.config });
-        let result = if is_plugin {
-            handle_plugin_retry(payload, Some(task.clone())).await
-        } else {
-            handle_theme_retry(payload, Some(task.clone())).await
-        }?;
-        if let Some(updates) = result.get("updates").and_then(Value::as_array) {
-            for update in updates {
-                if is_plugin {
-                    let batch_type = update
-                        .get("batchType")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    let file = update
-                        .get("file")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    let index = update
-                        .get("dictIndex")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(usize::MAX as u64) as usize;
-                    if let Some(slot) = translation_json.pointer_mut(&format!(
-                        "/dict/{}/{}/{}/target",
-                        escape_pointer(file),
-                        batch_type,
-                        index
-                    )) {
-                        *slot = update
-                            .get("target")
-                            .cloned()
-                            .unwrap_or(Value::String(String::new()));
-                    }
-                } else {
-                    let index = update
-                        .get("dictIndex")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(usize::MAX as u64) as usize;
-                    if let Some(slot) =
-                        translation_json.pointer_mut(&format!("/dict/{}/target", index))
-                    {
-                        *slot = update
-                            .get("target")
-                            .cloned()
-                            .unwrap_or(Value::String(String::new()));
+        let window = collect_failure_retry_window(&retry_queue, item_limit);
+        if window.is_empty() {
+            break;
+        }
+        let mut groups: HashMap<String, Vec<BatchTaskFailureRecord>> = HashMap::new();
+        for failure in &window {
+            groups
+                .entry(failure.source_id.clone())
+                .or_default()
+                .push(failure.clone());
+        }
+
+        for failures in groups.into_values() {
+            if !is_task_active(&task).await {
+                break;
+            }
+            let first = failures.first().cloned().context("empty failure group")?;
+            touch_progress(&task, json!({ "currentLabel": first.resource_label })).await;
+            let Some(mut translation_json) = read_translation(&paths, &first.source_id) else {
+                let skipped_ids = failures.iter().map(|failure| failure.id.clone()).collect::<Vec<_>>();
+                remove_failures(state, &paths, &skipped_ids).await?;
+                increment_progress(&task, "skippedCount", failures.len()).await;
+                increment_progress(&task, "processedResources", failures.len()).await;
+                bump_record_revision(&task).await;
+                continue;
+            };
+            let payload = json!({ "resourceId": first.resource_id, "resourceLabel": first.resource_label, "sourceId": first.source_id, "failures": failures, "config": retry.config });
+            let result = if is_plugin {
+                handle_plugin_retry(payload, Some(task.clone())).await
+            } else {
+                handle_theme_retry(payload, Some(task.clone())).await
+            }?;
+            let updates = result
+                .get("updates")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            apply_retry_updates_to_translation(&mut translation_json, &updates, is_plugin);
+            save_translated_source(state, &paths, &first.source_id, &translation_json).await?;
+            let completed_items = updates
+                .iter()
+                .map(retry_completed_item_key_from_value)
+                .collect::<Vec<_>>();
+            let mut completed_failure_ids = Vec::new();
+            update_record(state, &paths, |record| {
+                completed_failure_ids =
+                    remove_completed_retry_items_from_record(record, scope, &completed_items);
+            })
+            .await?;
+            for failure_id in &completed_failure_ids {
+                failed_retry_ids.remove(failure_id);
+            }
+            if let Some(failed_ids) = result.get("failedFailureIds").and_then(Value::as_array) {
+                for failure_id in failed_ids.iter().filter_map(Value::as_str) {
+                    if !completed_failure_ids.iter().any(|completed| completed == failure_id) {
+                        failed_retry_ids.insert(failure_id.to_string());
                     }
                 }
             }
+            increment_progress(
+                &task,
+                "processedItems",
+                result
+                    .get("processedItems")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize,
+            )
+            .await;
+            increment_progress(
+                &task,
+                "successCount",
+                completed_failure_ids.len(),
+            )
+            .await;
+            increment_progress(
+                &task,
+                "skippedCount",
+                result
+                    .get("skippedFailureIds")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0),
+            )
+            .await;
+            increment_progress(&task, "processedResources", completed_failure_ids.len()).await;
+            bump_source_revision(&task).await;
+            bump_record_revision(&task).await;
         }
-        save_translated_source(state, &paths, &first.source_id, &translation_json).await?;
-        let completed: Vec<String> = result
-            .get("completedFailureIds")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect();
-        remove_failures(state, &paths, &completed).await?;
-        increment_progress(
-            &task,
-            "processedItems",
-            result
-                .get("processedItems")
-                .and_then(Value::as_u64)
-                .unwrap_or(0) as usize,
-        )
-        .await;
-        increment_progress(&task, "successCount", completed.len()).await;
-        increment_progress(
-            &task,
-            "failedCount",
-            result
-                .get("failedFailureIds")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-                .unwrap_or(0),
-        )
-        .await;
-        increment_progress(
-            &task,
-            "skippedCount",
-            result
-                .get("skippedFailureIds")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-                .unwrap_or(0),
-        )
-        .await;
-        increment_progress(&task, "processedResources", 1).await;
-        bump_source_revision(&task).await;
-        bump_record_revision(&task).await;
+        prune_retry_window_from_queue(&mut retry_queue, &window);
+    }
+    if is_task_active(&task).await {
+        increment_progress(&task, "failedCount", failed_retry_ids.len()).await;
     }
     Ok(())
 }
@@ -7313,6 +7579,13 @@ mod tests {
     }
 
     #[test]
+    fn batch_translate_stops_when_failed_items_reach_request_capacity() {
+        assert!(!should_stop_batch_translate_for_failures(499, 100, 5));
+        assert!(should_stop_batch_translate_for_failures(500, 100, 5));
+        assert!(should_stop_batch_translate_for_failures(1, 0, 0));
+    }
+
+    #[test]
     fn packed_response_marks_non_empty_returned_items_successful_even_if_unchanged() {
         let batch = vec![
             json!({ "id": 1, "resourceStateIndex": 0, "dictIndex": 0, "source": "A", "target": "" }),
@@ -7339,6 +7612,118 @@ mod tests {
         assert_eq!(failed_items, 2);
         assert!(report.failures.iter().any(|failure| failure.resource_state_index == 0));
         assert!(report.failures.iter().any(|failure| failure.resource_state_index == 1));
+    }
+
+    #[test]
+    fn retry_window_collects_only_requested_items_and_keeps_remaining_failures() {
+        let failures = vec![
+            BatchTaskFailureRecord {
+                id: "failure-a".to_string(),
+                scope: "plugin".to_string(),
+                resource_id: "plugin-a".to_string(),
+                resource_label: "Plugin A".to_string(),
+                source_id: "source-a".to_string(),
+                batch_type: "regex".to_string(),
+                error_message: "first".to_string(),
+                items: vec![
+                    BatchTaskFailureItem {
+                        source: "A".to_string(),
+                        target: String::new(),
+                        dict_index: 0,
+                        file: Some("main.js".to_string()),
+                        r#type: None,
+                        name: None,
+                    },
+                    BatchTaskFailureItem {
+                        source: "B".to_string(),
+                        target: String::new(),
+                        dict_index: 1,
+                        file: Some("main.js".to_string()),
+                        r#type: None,
+                        name: None,
+                    },
+                ],
+                failed_at: 1,
+            },
+            BatchTaskFailureRecord {
+                id: "failure-b".to_string(),
+                scope: "plugin".to_string(),
+                resource_id: "plugin-b".to_string(),
+                resource_label: "Plugin B".to_string(),
+                source_id: "source-b".to_string(),
+                batch_type: "regex".to_string(),
+                error_message: "second".to_string(),
+                items: vec![BatchTaskFailureItem {
+                    source: "C".to_string(),
+                    target: String::new(),
+                    dict_index: 0,
+                    file: Some("main.js".to_string()),
+                    r#type: None,
+                    name: None,
+                }],
+                failed_at: 2,
+            },
+        ];
+
+        let window = collect_failure_retry_window(&failures, 2);
+
+        assert_eq!(window.len(), 1);
+        assert_eq!(window[0].id, "failure-a");
+        assert_eq!(window[0].items.len(), 2);
+    }
+
+    #[test]
+    fn removing_retry_success_items_keeps_unfinished_failure_records() {
+        let mut record = json!({
+            "schemaVersion": 1,
+            "checkpoints": {},
+            "failures": [{
+                "id": "failure-a",
+                "scope": "plugin",
+                "resourceId": "plugin-a",
+                "resourceLabel": "Plugin A",
+                "sourceId": "source-a",
+                "batchType": "regex",
+                "errorMessage": "failed",
+                "items": [
+                    { "source": "A", "target": "", "dictIndex": 0, "file": "main.js" },
+                    { "source": "B", "target": "", "dictIndex": 1, "file": "main.js" }
+                ],
+                "failedAt": 1
+            }],
+            "successBatches": [],
+            "updatedAt": 0
+        });
+        let completed = vec![RetryCompletedItemKey {
+            failure_id: "failure-a".to_string(),
+            dict_index: 0,
+            file: Some("main.js".to_string()),
+            batch_type: "regex".to_string(),
+        }];
+
+        let removed_failure_ids =
+            remove_completed_retry_items_from_record(&mut record, "plugin", &completed);
+
+        let failures = record.get("failures").and_then(Value::as_array).unwrap();
+        assert_eq!(failures.len(), 1);
+        assert!(removed_failure_ids.is_empty());
+        let items = failures[0].get("items").and_then(Value::as_array).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].get("dictIndex").and_then(Value::as_i64), Some(1));
+
+        let completed = vec![RetryCompletedItemKey {
+            failure_id: "failure-a".to_string(),
+            dict_index: 1,
+            file: Some("main.js".to_string()),
+            batch_type: "regex".to_string(),
+        }];
+
+        let removed_failure_ids =
+            remove_completed_retry_items_from_record(&mut record, "plugin", &completed);
+
+        assert_eq!(removed_failure_ids, vec!["failure-a".to_string()]);
+        let failures = record.get("failures").and_then(Value::as_array).unwrap();
+        assert!(failures.is_empty());
     }
     #[tokio::test]
     async fn requesting_cancel_keeps_task_running_until_worker_exits() {

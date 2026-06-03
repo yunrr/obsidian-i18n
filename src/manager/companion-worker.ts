@@ -1701,7 +1701,9 @@ async function handleThemeBatchTranslate(task: CompanionTaskRuntime, payload: Co
 
 async function handlePluginFailureRetry(task: CompanionTaskRuntime, payload: CompanionPluginFailureRetryPayload) {
     const paths = getPersistencePaths(payload.persistence.basePath);
-    const groups = Array.from(payload.failures.reduce((map, failure) => {
+    const record = await loadBatchTaskRecord(paths);
+    const failuresForScope = record.failures.filter(failure => failure.scope === 'plugin');
+    const groups = Array.from(failuresForScope.reduce((map, failure) => {
         const group = map.get(failure.sourceId) || [];
         group.push(failure);
         map.set(failure.sourceId, group);
@@ -1755,7 +1757,9 @@ async function handlePluginFailureRetry(task: CompanionTaskRuntime, payload: Com
 
 async function handleThemeFailureRetry(task: CompanionTaskRuntime, payload: CompanionThemeFailureRetryPayload) {
     const paths = getPersistencePaths(payload.persistence.basePath);
-    const groups = Array.from(payload.failures.reduce((map, failure) => {
+    const record = await loadBatchTaskRecord(paths);
+    const failuresForScope = record.failures.filter(failure => failure.scope === 'theme');
+    const groups = Array.from(failuresForScope.reduce((map, failure) => {
         const group = map.get(failure.sourceId) || [];
         group.push(failure);
         map.set(failure.sourceId, group);
@@ -1810,7 +1814,7 @@ function createInitialProgress(type: CompanionAsyncTaskType, payload: any, taskI
     const isTheme = type.startsWith('theme');
     const isExtract = type.endsWith('extract');
     const isRetry = type.endsWith('retry');
-    const resources = isRetry ? (payload.failures || []) : (payload.resources || []);
+    const resources = isRetry ? [] : (payload.resources || []);
     return {
         taskId,
         scope: isTheme ? 'theme' : 'plugin',
@@ -1820,9 +1824,7 @@ function createInitialProgress(type: CompanionAsyncTaskType, payload: any, taskI
         processedResources: Number(payload.completedResources || 0),
         totalResources: Number(payload.totalResources || resources.length),
         processedItems: Number(payload.processedItems || 0),
-        totalItems: isRetry
-            ? resources.reduce((sum: number, failure: BatchTaskFailureRecord) => sum + failure.items.length, 0)
-            : Number(payload.totalItems || 0),
+        totalItems: Number(payload.totalItems || 0),
         successCount: 0,
         failedCount: 0,
         skippedCount: 0,

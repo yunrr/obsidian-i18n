@@ -893,9 +893,10 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         try {
             const payload: CompanionPluginFailureRetryPayload = {
                 persistence: { basePath: i18n.sourceManager.getBasePath() },
-                failures: pluginFailureRecords,
                 config: getCompanionTranslationConfig(i18n.settings),
                 concurrency: getPositiveInt(i18n.settings.batchTranslateConcurrency, 2),
+                totalResources: pluginFailureRecords.length,
+                totalItems: pluginFailureRecords.reduce((sum, failure) => sum + failure.items.length, 0),
             };
             const progress = await runWorkerTask('plugin-failure-retry', payload);
             if (progress.status === 'cancelled') {

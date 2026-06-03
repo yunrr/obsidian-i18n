@@ -878,9 +878,10 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
         try {
             const payload: CompanionThemeFailureRetryPayload = {
                 persistence: { basePath: i18n.sourceManager.getBasePath() },
-                failures: themeFailureRecords,
                 config: getCompanionTranslationConfig(i18n.settings),
                 concurrency: getPositiveInt(i18n.settings.batchTranslateConcurrency, 2),
+                totalResources: themeFailureRecords.length,
+                totalItems: themeFailureRecords.reduce((sum, failure) => sum + failure.items.length, 0),
             };
             const progress = await runWorkerTask('theme-failure-retry', payload);
             if (progress.status === 'cancelled') {
