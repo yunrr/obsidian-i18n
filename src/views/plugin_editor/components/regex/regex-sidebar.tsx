@@ -28,12 +28,17 @@ interface Props {
     onIncrementalExtract?: () => void;
     onOpenFile?: () => void;
     onDiagnose?: () => void;
+    onStopDiagnose?: () => void;
     isDiagnosing?: boolean;
     errorItems?: DiagnoseError[];
     hasChecked?: boolean;
     setActiveTab?: (tab: string) => void;
     isApplied?: boolean;
     onJumpError?: (error: DiagnoseError) => void;
+    onCleanIssues?: () => void;
+    isCleaningIssues?: boolean;
+    switchCooldownMs: number;
+    onSwitchCooldownChange: (value: number) => number;
 }
 
 /**
@@ -46,12 +51,17 @@ const RegexSidebar: React.FC<Props> = ({
     onIncrementalExtract,
     onOpenFile,
     onDiagnose,
+    onStopDiagnose,
     isDiagnosing,
     errorItems,
     hasChecked,
     setActiveTab,
     isApplied,
-    onJumpError
+    onJumpError,
+    onCleanIssues,
+    isCleaningIssues,
+    switchCooldownMs,
+    onSwitchCooldownChange
 }) => {
     const { t } = useTranslation();
 
@@ -132,11 +142,16 @@ const RegexSidebar: React.FC<Props> = ({
                     )}
                     <DiagnoseCard
                         onDiagnose={onDiagnose!}
+                        onStopDiagnose={onStopDiagnose}
                         isDiagnosing={isDiagnosing!}
                         errorItems={errorItems || []}
                         hasChecked={hasChecked}
                         setActiveTab={setActiveTab}
                         onJumpError={onJumpError}
+                        onCleanIssues={onCleanIssues}
+                        isCleaningIssues={isCleaningIssues}
+                        switchCooldownMs={switchCooldownMs}
+                        onSwitchCooldownChange={onSwitchCooldownChange}
                     />
                     {showLLM && (
                         <RegexLLMCard controller={activeController} />

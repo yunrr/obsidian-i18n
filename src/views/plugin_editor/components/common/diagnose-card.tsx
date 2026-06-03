@@ -1,9 +1,9 @@
 import React from 'react';
-import { Button, Badge, Separator } from "~/shadcn";
+import { Button, Badge, Input, Label, Separator } from "~/shadcn";
 import { TemplateCard } from './template-card';
 import {
-    Activity, AlertTriangle, CheckCircle2, ChevronRight,
-    Play, CircleDot
+    Activity, AlertTriangle, CheckCircle2, ChevronRight, Clock3,
+    Play, CircleDot, Trash2, Loader2, Square
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { cn } from "~/shadcn/lib/utils";
@@ -11,22 +11,46 @@ import { DiagnoseError } from '../../types';
 
 interface DiagnoseCardProps {
     onDiagnose: () => void;
+    onStopDiagnose?: () => void;
     isDiagnosing: boolean;
     errorItems: DiagnoseError[];
     hasChecked?: boolean;
     setActiveTab?: (tab: string) => void;
     onJumpError?: (error: DiagnoseError) => void;
+    onCleanIssues?: () => void;
+    isCleaningIssues?: boolean;
+    switchCooldownMs: number;
+    onSwitchCooldownChange: (value: number) => number;
 }
 
 export const DiagnoseCard: React.FC<DiagnoseCardProps> = ({
     onDiagnose,
+    onStopDiagnose,
     isDiagnosing,
     errorItems,
     hasChecked,
     setActiveTab,
-    onJumpError
+    onJumpError,
+    onCleanIssues,
+    isCleaningIssues,
+    switchCooldownMs,
+    onSwitchCooldownChange
 }) => {
     const { t } = useTranslation();
+    const [cooldownInput, setCooldownInput] = React.useState(String(switchCooldownMs));
+
+    React.useEffect(() => {
+        setCooldownInput(String(switchCooldownMs));
+    }, [switchCooldownMs]);
+
+    const handleCooldownBlur = () => {
+        const nextValue = Number.parseInt(cooldownInput, 10);
+        if (Number.isFinite(nextValue)) {
+            setCooldownInput(String(onSwitchCooldownChange(nextValue)));
+        } else {
+            setCooldownInput(String(switchCooldownMs));
+        }
+    };
 
     const handleJump = (error: DiagnoseError) => {
         if (setActiveTab) {
@@ -63,13 +87,12 @@ export const DiagnoseCard: React.FC<DiagnoseCardProps> = ({
                     size="sm"
                     className="w-full gap-2 h-9 text-xs font-medium transition-all duration-200 border border-blue-500/20 bg-blue-500/10 text-blue-600 hover:bg-blue-500/20 dark:text-blue-400 hover:scale-[1.01] active:scale-95"
                     variant="outline"
-                    onClick={onDiagnose}
-                    disabled={isDiagnosing}
+                    onClick={isDiagnosing ? onStopDiagnose : onDiagnose}
                 >
                     {isDiagnosing ? (
                         <>
-                            <Activity className="w-3.5 h-3.5 animate-spin" />
-                            {t('Editor.Status.PreflightChecking')}
+                            <Square className="w-3.5 h-3.5" />
+                            {t('Editor.Actions.StopPreflightCheck')}
                         </>
                     ) : (
                         <>
@@ -78,6 +101,29 @@ export const DiagnoseCard: React.FC<DiagnoseCardProps> = ({
                         </>
                     )}
                 </Button>
+
+                <div className="space-y-1.5">
+                    <Label
+                        htmlFor="i18n-preflight-switch-cooldown"
+                        className="flex items-center gap-1.5 text-[10px] font-medium text-muted-foreground"
+                    >
+                        <Clock3 className="w-3 h-3" />
+                        {t('Editor.Labels.PreflightSwitchCooldown')}
+                    </Label>
+                    <Input
+                        id="i18n-preflight-switch-cooldown"
+                        type="number"
+                        min={500}
+                        max={60000}
+                        step={500}
+                        value={cooldownInput}
+                        onChange={(event) => setCooldownInput(event.target.value)}
+                        onBlur={handleCooldownBlur}
+                        disabled={isDiagnosing}
+                        className="h-8 text-xs"
+                        aria-label={t('Editor.Labels.PreflightSwitchCooldown')}
+                    />
+                </div>
 
                 {/* ═══════ 统计概览 ═══════ */}
                 {errorItems.length > 0 && (
@@ -92,6 +138,22 @@ export const DiagnoseCard: React.FC<DiagnoseCardProps> = ({
                                 {t('Editor.Errors.TotalCount', { count: totalCount })}
                             </span>
                         </div>
+                        {onCleanIssues && (
+                            <Button
+                                size="sm"
+                                variant="outline"
+                                className="w-full h-8 gap-2 text-xs text-destructive border-destructive/20 bg-destructive/5 hover:bg-destructive/10"
+                                onClick={onCleanIssues}
+                                disabled={isDiagnosing || isCleaningIssues}
+                            >
+                                {isCleaningIssues ? (
+                                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                ) : (
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                )}
+                                {t('Editor.Actions.CleanDiagnoseIssues')}
+                            </Button>
+                        )}
                     </>
                 )}
 
@@ -129,6 +191,9 @@ export const DiagnoseCard: React.FC<DiagnoseCardProps> = ({
                                                 >
                                                     {label}
                                                 </Badge>
+                                                <span className="text-[9px] font-mono text-muted-foreground truncate">
+                                                    {error.file}
+                                                </span>
                                                 <span className={cn(
                                                     "text-[9px] font-mono opacity-50",
                                                     errorStyles.text

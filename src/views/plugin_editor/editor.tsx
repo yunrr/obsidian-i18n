@@ -29,6 +29,12 @@ import { AstSidebar } from './components/ast/ast-sidebar';
 import { RegexSidebar } from './components/regex/regex-sidebar';
 import { TemplateCard } from './components/common/template-card';
 import { saveCurrentPluginEditorTranslation } from './save-current-translation';
+import {
+    getPluginLoadState,
+    getPluginRestorePlan,
+    normalizePluginSwitchCooldownMs,
+    RuntimePluginApi,
+} from './runtime-plugin-state';
 
 // ====================================================================================================
 // 子组件 & 辅助功能
@@ -91,33 +97,192 @@ const AutoSaveManager: React.FC<{ onSave: (silent?: boolean) => void, enabled: b
     return null;
 };
 
-type PluginApi = {
+type PluginApi = RuntimePluginApi & {
     manifests: Record<string, unknown>;
     plugins: Record<string, unknown>;
     enabledPlugins: Set<string>;
     disablePlugin(id: string): Promise<void>;
     enablePlugin(id: string): Promise<void>;
+    loadPlugin?(id: string): Promise<void>;
+    disablePluginAndSave?(id: string): Promise<void>;
+    enablePluginAndSave?(id: string): Promise<void>;
+};
+
+class DiagnoseStoppedError extends Error {
+    constructor() {
+        super('运行前检查已停止');
+        this.name = 'DiagnoseStoppedError';
+    }
+}
+
+type PluginDiagnoseRuntime = {
+    pluginId: string;
+    basePath: string;
+    pluginsApi: PluginApi;
+    switchCooldownMs: number;
+    sessionId?: string;
 };
 
 type RuntimeProbeRequest = {
     files: Array<{ file: string; code: string }>;
 };
 
-const wait = (ms: number) => new Promise(resolve => window.setTimeout(resolve, ms));
+const countTranslationDictItems = (dict: unknown): number => {
+    if (!dict || typeof dict !== 'object') return 0;
+    let count = 0;
+    for (const fileDict of Object.values(dict as Record<string, unknown>)) {
+        if (!fileDict || typeof fileDict !== 'object') continue;
+        const data = fileDict as Record<string, unknown>;
+        count += Array.isArray(data.ast) ? data.ast.length : 0;
+        count += Array.isArray(data.regex) ? data.regex.length : 0;
+    }
+    return count;
+};
 
-const getPluginLoadState = (pluginsApi: PluginApi, pluginId: string) => ({
-    enabled: pluginsApi.enabledPlugins.has(pluginId),
-    loaded: !!pluginsApi.plugins[pluginId],
+const wait = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+        reject(new DiagnoseStoppedError());
+        return;
+    }
+    const timer = window.setTimeout(() => {
+        signal?.removeEventListener('abort', abort);
+        resolve();
+    }, ms);
+    const abort = () => {
+        window.clearTimeout(timer);
+        reject(new DiagnoseStoppedError());
+    };
+    signal?.addEventListener('abort', abort, { once: true });
 });
+const PLUGIN_POLL_INTERVAL_MS = 100;
+const PLUGIN_STOP_TIMEOUT_MS = 10000;
+const PLUGIN_LOAD_TIMEOUT_MS = 15000;
 
-const waitForPluginLoaded = async (pluginsApi: PluginApi, pluginId: string, timeoutMs = 3000) => {
+const waitForPluginLoaded = async (
+    pluginsApi: PluginApi,
+    pluginId: string,
+    timeoutMs = PLUGIN_LOAD_TIMEOUT_MS,
+    signal?: AbortSignal,
+) => {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
+        throwIfDiagnoseStopped(signal);
         const state = getPluginLoadState(pluginsApi, pluginId);
-        if (state.enabled && state.loaded) return state;
-        await wait(50);
+        if (state.loaded) return state;
+        await wait(PLUGIN_POLL_INTERVAL_MS, signal);
     }
     return getPluginLoadState(pluginsApi, pluginId);
+};
+
+const waitForPluginStopped = async (
+    pluginsApi: PluginApi,
+    pluginId: string,
+    requireDisabled = false,
+    timeoutMs = PLUGIN_STOP_TIMEOUT_MS,
+    signal?: AbortSignal,
+) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        throwIfDiagnoseStopped(signal);
+        const state = getPluginLoadState(pluginsApi, pluginId);
+        if (!state.loaded && (!requireDisabled || !state.enabled)) return state;
+        await wait(PLUGIN_POLL_INTERVAL_MS, signal);
+    }
+    return getPluginLoadState(pluginsApi, pluginId);
+};
+
+const formatPluginErrors = (...items: Array<[string, unknown | null]>) => {
+    const details = items
+        .filter(([, error]) => !!error)
+        .map(([label, error]) => `${label}：${String(error)}`);
+    return details.length > 0 ? `，${details.join('；')}` : '';
+};
+
+const formatDiagnosticError = (error: unknown) => {
+    if (error instanceof Error) return `${error.name}: ${error.message}`;
+    return String(error);
+};
+
+const restorePluginAfterProbe = async (
+    pluginsApi: PluginApi,
+    pluginId: string,
+    startedState: ReturnType<typeof getPluginLoadState>,
+    switchCooldownMs: number,
+) => {
+    const normalizedSwitchCooldownMs = normalizePluginSwitchCooldownMs(switchCooldownMs);
+    const restorePlan = getPluginRestorePlan(startedState);
+    const beforeRestoreState = getPluginLoadState(pluginsApi, pluginId);
+    if (beforeRestoreState.loaded || beforeRestoreState.enabled) {
+        await pluginsApi.disablePlugin(pluginId);
+        await waitForPluginStopped(pluginsApi, pluginId, false);
+        await wait(normalizedSwitchCooldownMs);
+    }
+    if (restorePlan.restoreLoaded) {
+        await enablePluginForProbe(pluginsApi, pluginId, {
+            save: restorePlan.saveEnabledState,
+            requireLoaded: true,
+        });
+        await wait(normalizedSwitchCooldownMs);
+    } else {
+        const stoppedState = getPluginLoadState(pluginsApi, pluginId);
+        if (stoppedState.loaded || stoppedState.enabled) {
+            await pluginsApi.disablePlugin(pluginId);
+            await waitForPluginStopped(pluginsApi, pluginId, false);
+        }
+    }
+};
+
+const enablePluginForProbe = async (
+    pluginsApi: PluginApi,
+    pluginId: string,
+    options: {
+        save?: boolean;
+        requireLoaded?: boolean;
+        signal?: AbortSignal;
+    } = {},
+) => {
+    let enableError: unknown = null;
+    let loadError: unknown = null;
+    try {
+        if (options.save && pluginsApi.enablePluginAndSave) {
+            await pluginsApi.enablePluginAndSave(pluginId);
+        } else {
+            await pluginsApi.enablePlugin(pluginId);
+        }
+    } catch (error) {
+        enableError = error;
+    }
+
+    let state = options.requireLoaded
+        ? await waitForPluginLoaded(pluginsApi, pluginId, PLUGIN_LOAD_TIMEOUT_MS, options.signal)
+        : getPluginLoadState(pluginsApi, pluginId);
+    if (options.requireLoaded && !state.loaded && pluginsApi.loadPlugin) {
+        throwIfDiagnoseStopped(options.signal);
+        try {
+            await pluginsApi.loadPlugin(pluginId);
+        } catch (error) {
+            loadError = error;
+        }
+        state = await waitForPluginLoaded(pluginsApi, pluginId, PLUGIN_LOAD_TIMEOUT_MS, options.signal);
+    }
+    if (options.requireLoaded && !state.loaded) {
+        const suffix = formatPluginErrors(
+            [options.save ? 'enablePluginAndSave 错误' : 'enablePlugin 错误', enableError],
+            ['loadPlugin 错误', loadError],
+        );
+        throw new Error(`插件启用后状态异常：enabled=${state.enabled}, loaded=${state.loaded}${suffix}`);
+    }
+
+    if (enableError) {
+        console.warn('[i18n] Plugin enable API reported an error, but final state is acceptable:', enableError);
+    }
+    return state;
+};
+
+const throwIfDiagnoseStopped = (signal?: AbortSignal) => {
+    if (signal?.aborted) {
+        throw new DiagnoseStoppedError();
+    }
 };
 
 // 组件
@@ -147,15 +312,29 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
     // 使用 ref 标记是否已初始化，防止 useEffect 重复执行时用原始数据覆盖用户编辑中的内容
     const initializedRef = useRef(false);
     const savingRef = useRef(false);
+    const diagnoseAbortRef = useRef<AbortController | null>(null);
+    const diagnoseRuntimeRef = useRef<PluginDiagnoseRuntime | null>(null);
     const [isSaving, setIsSaving] = useState(false);
     const [isDiagnosing, setIsDiagnosing] = useState(false);
+    const [isCleaningIssues, setIsCleaningIssues] = useState(false);
     const [errorItems, setErrorItems] = useState<DiagnoseError[]>([]);
     const [hasChecked, setHasChecked] = useState(false);
     const [activeTab, setActiveTab] = useState('ast');
     const [isAddPathDialogOpen, setIsAddPathDialogOpen] = useState(false);
     const [newPathInput, setNewPathInput] = useState('');
+    const [switchCooldownMs, setSwitchCooldownMs] = useState(() => (
+        normalizePluginSwitchCooldownMs(i18n.settings.preflightPluginSwitchCooldownMs)
+    ));
 
     const getExtractionSettings = React.useCallback(() => getEffectiveExtractionSettings(i18n.settings), [i18n.settings]);
+
+    const handleSwitchCooldownChange = React.useCallback((value: number) => {
+        const normalized = normalizePluginSwitchCooldownMs(value);
+        setSwitchCooldownMs(normalized);
+        i18n.settings.preflightPluginSwitchCooldownMs = normalized;
+        void i18n.saveSettings();
+        return normalized;
+    }, [i18n]);
 
     useEffect(() => {
         // 如果已经初始化过，不再用原始数据覆盖 store
@@ -329,13 +508,26 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
 
 
     // ================================================== Diagnose ==================================================
+    const handleStopDiagnose = React.useCallback(() => {
+        const controller = diagnoseAbortRef.current;
+        if (!isDiagnosing || !controller || controller.signal.aborted) return;
+        const runtime = diagnoseRuntimeRef.current;
+        controller.abort();
+        if (runtime?.sessionId) {
+            void i18n.companionWorkerManager.cancelPluginDiagnoseCleanup({ sessionId: runtime.sessionId });
+        }
+        notice.info(t('Editor.Notices.DiagnosisStopping'));
+    }, [i18n, isDiagnosing, notice, t]);
+
     const handleDiagnose = React.useCallback(async () => {
         if (isDiagnosing) return;
+        const abortController = new AbortController();
+        diagnoseAbortRef.current = abortController;
         setIsDiagnosing(true);
         setErrorItems([]);
         setHasChecked(true);
         try {
-            await save(true);
+            const signal = abortController.signal;
             const { metadata } = useRegexStore.getState();
             if (!metadata) {
                 notice.error(t('Editor.Errors.NoMetadata'));
@@ -343,8 +535,6 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
             }
 
             const pluginId = metadata.plugin;
-            const state = i18n.stateManager.getPluginState(pluginId);
-            const isApplied = !!(state && state.isApplied);
             // @ts-ignore
             const manifest = i18n.app.plugins.manifests[pluginId];
             if (!manifest) {
@@ -363,64 +553,95 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
                 notice.error(t('Editor.Errors.NoMetadata'));
                 return;
             }
+            const { currentFile, astItems, regexItems, syncFileDictInfo } = useRegexStore.getState();
+            syncFileDictInfo(currentFile, astItems, regexItems);
+            const draftDict = useRegexStore.getState().dictData;
+            const draftCount = countTranslationDictItems(draftDict);
+            const diskSource = i18n.sourceManager.readSourceFile(activeSourceId);
+            const diskCount = countTranslationDictItems(diskSource?.dict);
+            if (diskCount > 0 && draftCount === 0) {
+                setHasChecked(false);
+                notice.error(t('Editor.Errors.DiagnosisWouldClearTranslations', { count: diskCount }));
+                return;
+            }
+            i18n.backupManager.backupTranslationSync(activeSourceId, i18n.sourceManager.sourcesDir);
+            await save(true);
+            throwIfDiagnoseStopped(signal);
 
             const pluginsApi = i18n.app.plugins as PluginApi;
-            const wasEnabled = pluginsApi.enabledPlugins.has(pluginId);
+            const normalizedSwitchCooldownMs = normalizePluginSwitchCooldownMs(switchCooldownMs);
+            diagnoseRuntimeRef.current = {
+                pluginId,
+                basePath,
+                pluginsApi,
+                switchCooldownMs: normalizedSwitchCooldownMs,
+            };
             const applyAst = i18n.settings.applyAstTranslations !== false;
             const applyRegex = i18n.settings.applyRegexTranslations !== false;
+            const state = i18n.stateManager.getPluginState(pluginId);
+            const isApplied = !!(state && state.isApplied);
             // @ts-ignore
             const backupBasePath = path.join(basePath, i18n.manifest.dir || '');
 
-            const restorePluginState = async () => {
-                if (pluginsApi.enabledPlugins.has(pluginId)) {
-                    await pluginsApi.disablePlugin(pluginId);
-                }
-                if (wasEnabled) {
-                    await pluginsApi.enablePlugin(pluginId);
-                    await waitForPluginLoaded(pluginsApi, pluginId);
-                }
-            };
-
             const runProbe = async (probe: RuntimeProbeRequest) => {
                 const originals = new Map<string, string | null>();
-                let success = false;
-                let error = '';
+                const startedState = getPluginLoadState(pluginsApi, pluginId);
+                let stoppedError: DiagnoseStoppedError | null = null;
                 try {
+                    throwIfDiagnoseStopped(signal);
                     for (const file of probe.files) {
                         const targetPath = path.join(pluginDir, file.file);
                         originals.set(file.file, fs.existsSync(targetPath) ? fs.readFileSync(targetPath, 'utf8') : null);
+                    }
+
+                    const beforeReloadState = getPluginLoadState(pluginsApi, pluginId);
+                    if (beforeReloadState.loaded || beforeReloadState.enabled) {
+                        await pluginsApi.disablePlugin(pluginId);
+                        await waitForPluginStopped(pluginsApi, pluginId, false, PLUGIN_STOP_TIMEOUT_MS, signal);
+                        await wait(normalizedSwitchCooldownMs, signal);
+                    }
+
+                    throwIfDiagnoseStopped(signal);
+                    for (const file of probe.files) {
+                        const targetPath = path.join(pluginDir, file.file);
                         fs.ensureDirSync(path.dirname(targetPath));
                         fs.writeFileSync(targetPath, file.code, 'utf8');
                     }
 
-                    if (pluginsApi.enabledPlugins.has(pluginId)) {
-                        await pluginsApi.disablePlugin(pluginId);
+                    await enablePluginForProbe(pluginsApi, pluginId, { requireLoaded: true, signal });
+                    await wait(normalizedSwitchCooldownMs, signal);
+                    const loadState = getPluginLoadState(pluginsApi, pluginId);
+                    return {
+                        success: loadState.loaded,
+                        error: loadState.loaded ? '' : `插件启用后状态异常：enabled=${loadState.enabled}, loaded=${loadState.loaded}`,
+                    };
+                } catch (error) {
+                    if (error instanceof DiagnoseStoppedError) {
+                        stoppedError = error;
                     }
-                    await pluginsApi.enablePlugin(pluginId);
-                    const loadState = await waitForPluginLoaded(pluginsApi, pluginId);
-                    success = loadState.enabled && loadState.loaded;
-                    if (!success) {
-                        error = `插件启用后状态异常：enabled=${loadState.enabled}, loaded=${loadState.loaded}`;
-                    }
-                } catch (e) {
-                    success = false;
-                    error = String(e);
+                    return {
+                        success: false,
+                        error: formatDiagnosticError(error),
+                    };
                 } finally {
                     for (const [file, content] of originals) {
                         const targetPath = path.join(pluginDir, file);
                         if (content === null) {
                             if (fs.existsSync(targetPath)) fs.removeSync(targetPath);
                         } else {
+                            fs.ensureDirSync(path.dirname(targetPath));
                             fs.writeFileSync(targetPath, content, 'utf8');
                         }
                     }
                     try {
-                        await restorePluginState();
+                        await restorePluginAfterProbe(pluginsApi, pluginId, startedState, normalizedSwitchCooldownMs);
                     } catch (restoreError) {
                         console.error('[i18n] Failed to restore plugin state after diagnose probe:', restoreError);
                     }
+                    if (stoppedError) {
+                        throw stoppedError;
+                    }
                 }
-                return { success, error };
             };
 
             let response = await i18n.companionWorkerManager.startPluginDiagnoseCleanup({
@@ -434,16 +655,115 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
                 runtimeProbe: true,
                 isApplied,
             });
+            throwIfDiagnoseStopped(signal);
+            if (response.sessionId && diagnoseRuntimeRef.current) {
+                diagnoseRuntimeRef.current.sessionId = response.sessionId;
+            }
 
             while (response.status === 'probe' && response.sessionId && response.probe) {
+                throwIfDiagnoseStopped(signal);
+                if (diagnoseRuntimeRef.current) {
+                    diagnoseRuntimeRef.current.sessionId = response.sessionId;
+                }
                 const probeResult = await runProbe(response.probe);
+                throwIfDiagnoseStopped(signal);
                 response = await i18n.companionWorkerManager.stepPluginDiagnoseCleanup({
                     sessionId: response.sessionId,
                     probeId: response.probe.probeId,
                     success: probeResult.success,
                     error: probeResult.error,
                 });
+                throwIfDiagnoseStopped(signal);
+                if (response.sessionId && diagnoseRuntimeRef.current) {
+                    diagnoseRuntimeRef.current.sessionId = response.sessionId;
+                }
             }
+
+            const results: DiagnoseError[] = (response.issueItems || []).map((item) => ({
+                type: item.kind,
+                id: item.index,
+                file: item.file,
+                source: item.source,
+                target: item.target,
+                message: item.reason,
+            }));
+            setErrorItems(results);
+            if (response.status === 'baselineFailed') {
+                notice.warning(t('Editor.Notices.DiagnosisRuntimeBaselineFailed'));
+                if (results.length > 0) {
+                    notice.error(t('Editor.Notices.DiagnosisIssuesFound', { count: results.length }));
+                }
+            } else if (results.length === 0) {
+                notice.success(t('Editor.Notices.DiagnosisSuccess'));
+            } else {
+                notice.error(t('Editor.Notices.DiagnosisIssuesFound', { count: results.length }));
+            }
+        } catch (e) {
+            if (e instanceof DiagnoseStoppedError) {
+                const sessionId = diagnoseRuntimeRef.current?.sessionId;
+                if (sessionId) {
+                    try {
+                        await i18n.companionWorkerManager.cancelPluginDiagnoseCleanup({ sessionId });
+                    } catch (cancelError) {
+                        console.error('[i18n] Failed to cancel plugin diagnose cleanup:', cancelError);
+                    }
+                }
+                setHasChecked(false);
+                notice.info(t('Editor.Notices.DiagnosisStopped'));
+            } else {
+                notice.error(t('Common.Status.Failure') + ' ' + t('Editor.Notices.DiagnosisSuccess') + ': ' + e);
+            }
+        } finally {
+            if (diagnoseAbortRef.current === abortController) {
+                diagnoseAbortRef.current = null;
+            }
+            diagnoseRuntimeRef.current = null;
+            setIsDiagnosing(false);
+        }
+    }, [i18n, notice, t, isDiagnosing, save, setDictData, setCurrentFile, switchCooldownMs]);
+
+    const handleJumpError = React.useCallback((error: DiagnoseError) => {
+        if (error.file) {
+            setCurrentFile(error.file);
+        }
+        setActiveTab(error.type);
+        // 通过 CustomEvent 触发表格滚动定位 (由子组件监听)
+        window.setTimeout(() => {
+            window.dispatchEvent(new CustomEvent('i18n-jump-error', {
+                detail: { type: error.type, id: error.id }
+            }));
+        }, 50);
+    }, [setCurrentFile]);
+
+    const handleCleanDiagnoseIssues = React.useCallback(async () => {
+        if (isCleaningIssues || errorItems.length === 0) return;
+        setIsCleaningIssues(true);
+        try {
+            const { metadata } = useRegexStore.getState();
+            const pluginId = metadata?.plugin;
+            const pluginTranslationPath = useGlobalStoreInstance.getState().editorPluginTranslationPath;
+            const sourceIdFromPath = pluginTranslationPath
+                ? path.basename(pluginTranslationPath, path.extname(pluginTranslationPath))
+                : '';
+            const activeSourceId = sourceIdFromPath || (pluginId ? i18n.sourceManager.getActiveSourceId(pluginId) : '');
+            if (!pluginId || !activeSourceId) {
+                notice.error(t('Editor.Errors.NoMetadata'));
+                return;
+            }
+
+            const response = await i18n.companionWorkerManager.applyPluginDiagnoseCleanup({
+                pluginId,
+                persistence: { basePath: i18n.sourceManager.getBasePath() },
+                translationSourceId: activeSourceId,
+                issues: errorItems.map((item) => ({
+                    file: item.file,
+                    kind: item.type,
+                    index: item.id,
+                    source: item.source,
+                    target: item.target,
+                    reason: item.message || '',
+                })),
+            });
 
             i18n.sourceManager.reloadFromDisk();
             const cleaned = i18n.sourceManager.readSourceFile(activeSourceId);
@@ -454,38 +774,15 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
                 const nextFile = cleaned.dict['main.js'] ? 'main.js' : Object.keys(cleaned.dict)[0] || '';
                 if (nextFile) setCurrentFile(nextFile);
             }
-
-            const results: DiagnoseError[] = (response.removedItems || []).map((item) => ({
-                type: item.kind,
-                id: item.index,
-                source: item.source,
-                message: item.reason,
-            }));
-            setErrorItems(results);
-            if (response.status === 'baselineFailed') {
-                notice.warning(t('Editor.Notices.DiagnosisRuntimeBaselineFailed'));
-            } else if (results.length === 0) {
-                notice.success(t('Editor.Notices.DiagnosisSuccess'));
-            } else {
-                notice.error(t('Editor.Notices.DiagnosisCleanupRemoved', { count: results.length }));
-            }
-            if (response.status === 'baselineFailed' && results.length > 0) {
-                notice.error(t('Editor.Notices.DiagnosisCleanupRemoved', { count: results.length }));
-            }
+            setErrorItems([]);
+            setHasChecked(false);
+            notice.success(t('Editor.Notices.DiagnosisCleanupApplied', { count: response.removedCount }));
         } catch (e) {
-            notice.error(t('Common.Status.Failure') + ' ' + t('Editor.Notices.DiagnosisSuccess') + ': ' + e);
+            notice.error(t('Common.Status.Failure') + ': ' + e);
         } finally {
-            setIsDiagnosing(false);
+            setIsCleaningIssues(false);
         }
-    }, [i18n, notice, t, isDiagnosing, save, setDictData, setCurrentFile]);
-
-    const handleJumpError = React.useCallback((error: DiagnoseError) => {
-        setActiveTab(error.type);
-        // 通过 CustomEvent 触发表格滚动定位 (由子组件监听)
-        window.dispatchEvent(new CustomEvent('i18n-jump-error', {
-            detail: { type: error.type, id: error.id }
-        }));
-    }, []);
+    }, [i18n, notice, t, errorItems, isCleaningIssues, setDictData, setCurrentFile]);
 
     // 快捷键: Ctrl + S 保存
     useEffect(() => {
@@ -663,12 +960,17 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
                                     translationEntries={astItems as any}
                                     onOpenFile={handleOpenFile}
                                     onDiagnose={handleDiagnose}
+                                    onStopDiagnose={handleStopDiagnose}
                                     isDiagnosing={isDiagnosing}
                                     errorItems={errorItems}
                                     hasChecked={hasChecked}
                                     setActiveTab={setActiveTab}
                                     isApplied={isApplied}
                                     onJumpError={handleJumpError}
+                                    onCleanIssues={handleCleanDiagnoseIssues}
+                                    isCleaningIssues={isCleaningIssues}
+                                    switchCooldownMs={switchCooldownMs}
+                                    onSwitchCooldownChange={handleSwitchCooldownChange}
                                 />
                             </TabsContent>
                             <TabsContent value="regex" className="flex-1 min-h-0 m-0 overflow-hidden outline-none">
@@ -677,12 +979,17 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
                                     onIncrementalExtract={incrementalExtractRegex}
                                     onOpenFile={handleOpenFile}
                                     onDiagnose={handleDiagnose}
+                                    onStopDiagnose={handleStopDiagnose}
                                     isDiagnosing={isDiagnosing}
                                     errorItems={errorItems}
                                     hasChecked={hasChecked}
                                     setActiveTab={setActiveTab}
                                     isApplied={isApplied}
                                     onJumpError={handleJumpError}
+                                    onCleanIssues={handleCleanDiagnoseIssues}
+                                    isCleaningIssues={isCleaningIssues}
+                                    switchCooldownMs={switchCooldownMs}
+                                    onSwitchCooldownChange={handleSwitchCooldownChange}
                                 />
                             </TabsContent>
                         </div>

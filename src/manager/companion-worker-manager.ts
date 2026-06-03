@@ -24,6 +24,10 @@ import type {
     CompanionGithubWriteResponse,
     CompanionPluginApplyTranslationRequest,
     CompanionPluginDiagnoseCleanupResponse,
+    CompanionPluginDiagnoseCleanupApplyRequest,
+    CompanionPluginDiagnoseCleanupApplyResponse,
+    CompanionPluginDiagnoseCleanupCancelRequest,
+    CompanionPluginDiagnoseCleanupCancelResponse,
     CompanionPluginDiagnoseCleanupStartRequest,
     CompanionPluginDiagnoseCleanupStepRequest,
     CompanionProxyRequest,
@@ -60,6 +64,10 @@ export type {
     CompanionExtractResult,
     CompanionPluginApplyTranslationRequest,
     CompanionPluginDiagnoseCleanupResponse,
+    CompanionPluginDiagnoseCleanupApplyRequest,
+    CompanionPluginDiagnoseCleanupApplyResponse,
+    CompanionPluginDiagnoseCleanupCancelRequest,
+    CompanionPluginDiagnoseCleanupCancelResponse,
     CompanionPluginDiagnoseCleanupStartRequest,
     CompanionPluginDiagnoseCleanupStepRequest,
     CompanionPluginBatchExtractPayload,
@@ -181,6 +189,14 @@ export class CompanionWorkerManager {
 
     public async stepPluginDiagnoseCleanup(request: CompanionPluginDiagnoseCleanupStepRequest): Promise<CompanionPluginDiagnoseCleanupResponse> {
         return this.runTask<CompanionPluginDiagnoseCleanupResponse>('plugin-diagnose-cleanup-step', request);
+    }
+
+    public async cancelPluginDiagnoseCleanup(request: CompanionPluginDiagnoseCleanupCancelRequest): Promise<CompanionPluginDiagnoseCleanupCancelResponse> {
+        return this.runTask<CompanionPluginDiagnoseCleanupCancelResponse>('plugin-diagnose-cleanup-cancel', request);
+    }
+
+    public async applyPluginDiagnoseCleanup(request: CompanionPluginDiagnoseCleanupApplyRequest): Promise<CompanionPluginDiagnoseCleanupApplyResponse> {
+        return this.runTask<CompanionPluginDiagnoseCleanupApplyResponse>('plugin-diagnose-cleanup-apply', request);
     }
 
     public async applyThemeTranslation(request: CompanionThemeApplyTranslationRequest): Promise<CompanionApplyTranslationResponse> {

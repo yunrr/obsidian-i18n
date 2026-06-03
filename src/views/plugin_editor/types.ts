@@ -27,7 +27,9 @@ export interface AstItem {
 export type DiagnoseError = {
     type: 'ast' | 'regex';
     id: number;
+    file: string;
     source: string;
+    target: string;
     message?: string;
 };
 

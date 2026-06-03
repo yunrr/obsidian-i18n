@@ -36,12 +36,17 @@ const AstSidebar = ({
     onIncrementalExtract,
     onOpenFile,
     onDiagnose,
+    onStopDiagnose,
     isDiagnosing,
     errorItems,
     hasChecked,
     setActiveTab,
     isApplied,
-    onJumpError
+    onJumpError,
+    onCleanIssues,
+    isCleaningIssues,
+    switchCooldownMs,
+    onSwitchCooldownChange
 }: {
     translationEntries?: any[],
     progress?: number,
@@ -55,12 +60,17 @@ const AstSidebar = ({
     onIncrementalExtract?: () => void,
     onOpenFile?: () => void,
     onDiagnose?: () => void,
+    onStopDiagnose?: () => void,
     isDiagnosing?: boolean,
     errorItems?: DiagnoseError[],
     hasChecked?: boolean,
     setActiveTab?: (value: string) => void,
     isApplied?: boolean,
-    onJumpError?: (error: DiagnoseError) => void
+    onJumpError?: (error: DiagnoseError) => void,
+    onCleanIssues?: () => void,
+    isCleaningIssues?: boolean,
+    switchCooldownMs: number,
+    onSwitchCooldownChange: (value: number) => number
 }) => {
     const { t } = useTranslation();
     // 5. AST Translation Controller (Received via props)
@@ -140,11 +150,16 @@ const AstSidebar = ({
                     )}
                     <DiagnoseCard
                         onDiagnose={onDiagnose!}
+                        onStopDiagnose={onStopDiagnose}
                         isDiagnosing={isDiagnosing!}
                         errorItems={errorItems || []}
                         hasChecked={hasChecked}
                         setActiveTab={setActiveTab}
                         onJumpError={onJumpError}
+                        onCleanIssues={onCleanIssues}
+                        isCleaningIssues={isCleaningIssues}
+                        switchCooldownMs={switchCooldownMs}
+                        onSwitchCooldownChange={onSwitchCooldownChange}
                     />
 
                     {showLLM && (

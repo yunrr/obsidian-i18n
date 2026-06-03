@@ -50,7 +50,8 @@ export default {
         VariableCheck: "变量校验",
         PunctuationCheck: "标点检查",
         ExpectedConsumption: "预期消耗",
-        LineNumber: "行 {{line}}"
+        LineNumber: "行 {{line}}",
+        PreflightSwitchCooldown: "插件开关间隔 (ms)"
     },
     Actions: {
         BatchTranslate: "开始批量翻译 ({{count}})",
@@ -69,6 +70,8 @@ export default {
         Settings: "配置",
         Diagnose: "运行前检查",
         PreflightCheck: "运行前检查",
+        StopPreflightCheck: "停止检查",
+        CleanDiagnoseIssues: "一键清理问题条目",
         ContextAware: "上下文感知",
         ContextAwareTip: "附加源码上下文以提升翻译准确度"
     },
@@ -138,8 +141,11 @@ export default {
         SuccessDelete: "删除成功",
         SuccessIncrementalExtract: "增量提取完成",
         DiagnosisSuccess: "运行前检查通过",
-        DiagnosisCleanupRemoved: "运行前检查完成：已移除 {{count}} 个导致脚本失败的条目",
-        DiagnosisRuntimeBaselineFailed: "原始插件脚本也无法正常加载，已跳过运行级定位，仅保留静态清理结果。"
+        DiagnosisIssuesFound: "运行前检查完成：发现 {{count}} 个导致脚本失败的条目",
+        DiagnosisCleanupApplied: "已清理 {{count}} 个问题条目，并写入问题记录文件",
+        DiagnosisRuntimeBaselineFailed: "原始插件脚本也无法正常加载，已跳过运行级定位，仅保留静态清理结果。",
+        DiagnosisStopping: "正在停止运行前检查，正在恢复插件状态...",
+        DiagnosisStopped: "运行前检查已停止，插件状态已恢复"
     },
     Errors: {
         FailExists: "新增失败\n译文中已存在此内容",
@@ -159,6 +165,7 @@ export default {
         SourceError: "源码本身存在语法错误，无法进行运行前检查。",
         FileNotFound: "文件不存在",
         SavePathMissing: "保存路径不存在",
+        DiagnosisWouldClearTranslations: "运行前检查已中止：编辑器当前为 0 个译文条目，但磁盘源文件仍有 {{count}} 个条目。为避免清空译文，请重新打开编辑器或恢复译文后再检查。",
         TotalCount: "共 {{count}} 项"
     },
     Dialogs: {

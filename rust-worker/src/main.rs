@@ -140,6 +140,12 @@ struct PluginDiagnoseCleanupStepPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct PluginDiagnoseCleanupCancelPayload {
+    session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ThemeApplyTranslationPayload {
     theme_id: String,
     theme_dir: String,
@@ -178,7 +184,8 @@ struct TranslationIssueItem {
 #[serde(rename_all = "camelCase")]
 struct TranslationCleanupReport {
     state: bool,
-    removed_items: Vec<TranslationIssueItem>,
+    issue_items: Vec<TranslationIssueItem>,
+    cleared_items: Vec<TranslationIssueItem>,
     processed_files: usize,
 }
 
@@ -206,8 +213,27 @@ struct PluginDiagnoseCleanupResponse {
     session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     probe: Option<RuntimeProbeRequest>,
-    removed_items: Vec<TranslationIssueItem>,
+    issue_items: Vec<TranslationIssueItem>,
+    cleared_items: Vec<TranslationIssueItem>,
     processed_files: usize,
+    translation_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginDiagnoseCleanupApplyPayload {
+    persistence: PersistenceConfig,
+    translation_source_id: String,
+    plugin_id: String,
+    issues: Vec<TranslationIssueItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginDiagnoseCleanupApplyResponse {
+    state: bool,
+    removed_count: usize,
+    issue_record_path: String,
     translation_version: String,
 }
 
@@ -721,23 +747,31 @@ struct PersistencePaths {
     meta_path: PathBuf,
     checkpoint_path: PathBuf,
     batch_task_record_path: PathBuf,
+    diagnose_checkpoint_path: PathBuf,
+    diagnose_issue_record_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
 struct DiagnoseCleanupSession {
     paths: PersistencePaths,
+    plugin_id: String,
     translation_source_id: String,
     translation_json: Value,
     source_by_file: HashMap<String, String>,
-    apply_ast: bool,
-    apply_regex: bool,
-    removed_items: Vec<TranslationIssueItem>,
+    issue_items: Vec<TranslationIssueItem>,
+    cleared_runtime_candidates: Vec<TranslationCandidate>,
     pending_candidates: Vec<TranslationCandidate>,
     probe_map: HashMap<String, Vec<TranslationCandidate>>,
     runtime_probe_queue: Vec<Vec<TranslationCandidate>>,
-    combo_fallback_groups: Vec<Vec<TranslationCandidate>>,
+    combo_fallback_groups: Vec<ComboFallbackGroup>,
     pairwise_tested_group_signatures: HashSet<String>,
     processed_files: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ComboFallbackGroup {
+    candidates: Vec<TranslationCandidate>,
+    issue_count_at_start: usize,
 }
 
 #[tokio::main]
@@ -3790,6 +3824,8 @@ async fn handle_sync_task(state: &AppState, task_type: &str, payload: Value) -> 
         "plugin-apply-translation" => handle_plugin_apply_translation(payload).await,
         "plugin-diagnose-cleanup-start" => handle_plugin_diagnose_cleanup_start(state, payload).await,
         "plugin-diagnose-cleanup-step" => handle_plugin_diagnose_cleanup_step(state, payload).await,
+        "plugin-diagnose-cleanup-cancel" => handle_plugin_diagnose_cleanup_cancel(state, payload).await,
+        "plugin-diagnose-cleanup-apply" => handle_plugin_diagnose_cleanup_apply(state, payload).await,
         "theme-apply-translation" => handle_theme_apply_translation(payload).await,
         "source-export" | "source-read" | "source-import" | "source-remove" | "source-set-active" | "source-index" | "source-clear-batch-records" => handle_source_manager_task(state, task_type, payload).await,
         "plugin-extract" => Ok(serde_json::to_value(handle_plugin_extract(payload).await?)?),
@@ -4309,6 +4345,46 @@ fn remove_translation_candidates(translation_json: &mut Value, candidates: &[Tra
     removed
 }
 
+fn remove_translation_issues(translation_json: &mut Value, issues: &[TranslationIssueItem]) -> usize {
+    let mut grouped: HashMap<(String, String), Vec<&TranslationIssueItem>> = HashMap::new();
+    for issue in issues {
+        grouped
+            .entry((issue.file.clone(), issue.kind.clone()))
+            .or_default()
+            .push(issue);
+    }
+
+    let Some(dict) = translation_json.get_mut("dict").and_then(Value::as_object_mut) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for ((file, kind), mut items_to_remove) in grouped {
+        items_to_remove.sort_by_key(|issue| issue.index);
+        items_to_remove.dedup_by_key(|issue| issue.index);
+        let Some(items) = dict
+            .get_mut(&file)
+            .and_then(|file_dict| file_dict.get_mut(&kind))
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+
+        for issue in items_to_remove.into_iter().rev() {
+            if issue.index >= items.len() {
+                continue;
+            }
+            let item = &items[issue.index];
+            let source = item.get("source").and_then(Value::as_str).unwrap_or_default();
+            let target = item.get("target").and_then(Value::as_str).unwrap_or_default();
+            if source == issue.source && target == issue.target {
+                items.remove(issue.index);
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
 fn validate_original_sources(source_by_file: &HashMap<String, String>) -> Result<()> {
     for (file, code) in source_by_file {
         if !is_javascript_file(file) {
@@ -4319,17 +4395,19 @@ fn validate_original_sources(source_by_file: &HashMap<String, String>) -> Result
     Ok(())
 }
 
-fn diagnose_and_clean_translation_json(
-    translation_json: &mut Value,
+fn diagnose_translation_json(
+    translation_json: &Value,
     source_by_file: &HashMap<String, String>,
     apply_ast: bool,
     apply_regex: bool,
 ) -> Result<TranslationCleanupReport> {
     validate_original_sources(source_by_file)?;
-    let mut removed_items = Vec::new();
+    let mut working_translation_json = translation_json.clone();
+    let mut issue_items = Vec::new();
+    let cleared_items = Vec::new();
 
     loop {
-        let candidates = collect_translation_candidates(translation_json, apply_ast, apply_regex);
+        let candidates = collect_translation_candidates(&working_translation_json, apply_ast, apply_regex);
         if candidates.is_empty() {
             break;
         }
@@ -4340,7 +4418,7 @@ fn diagnose_and_clean_translation_json(
         let mut failing = Vec::new();
         for candidate in &candidates {
             if let Some(reason) = translation_candidates_fail(source_by_file, std::slice::from_ref(candidate)) {
-                removed_items.push(candidate.issue(&reason));
+                issue_items.push(candidate.issue(&reason));
                 failing.push(candidate.clone());
             }
         }
@@ -4353,19 +4431,20 @@ fn diagnose_and_clean_translation_json(
                 batch_reason
             };
             for candidate in &failing {
-                removed_items.push(candidate.issue(&reason));
+                issue_items.push(candidate.issue(&reason));
             }
         }
 
-        if remove_translation_candidates(translation_json, &failing) == 0 {
-            bail!("诊断发现问题条目但移除失败");
+        if remove_translation_candidates(&mut working_translation_json, &failing) == 0 {
+            bail!("诊断发现问题条目但临时排除失败");
         }
     }
 
     Ok(TranslationCleanupReport {
         state: true,
         processed_files: source_by_file.len(),
-        removed_items,
+        issue_items,
+        cleared_items,
     })
 }
 
@@ -4424,6 +4503,31 @@ fn save_cleaned_translation_source(
     Ok(())
 }
 
+fn apply_diagnose_cleanup_blocking(payload: PluginDiagnoseCleanupApplyPayload) -> Result<PluginDiagnoseCleanupApplyResponse> {
+    let paths = paths(&payload.persistence.base_path);
+    let mut translation_json = read_translation(&paths, &payload.translation_source_id)
+        .ok_or_else(|| anyhow!("翻译文件不存在"))?;
+    update_diagnose_issue_record(
+        &paths,
+        &payload.translation_source_id,
+        &payload.plugin_id,
+        &payload.issues,
+        "removed",
+    )?;
+    let removed_count = remove_translation_issues(&mut translation_json, &payload.issues);
+    save_cleaned_translation_source(&paths, &payload.translation_source_id, &translation_json)?;
+    Ok(PluginDiagnoseCleanupApplyResponse {
+        state: true,
+        removed_count,
+        issue_record_path: paths.diagnose_issue_record_path.to_string_lossy().to_string(),
+        translation_version: translation_json
+            .pointer("/metadata/version")
+            .and_then(Value::as_str)
+            .unwrap_or("0.0.0")
+            .to_string(),
+    })
+}
+
 fn render_probe_files(
     source_by_file: &HashMap<String, String>,
     candidates: &[TranslationCandidate],
@@ -4479,6 +4583,18 @@ fn candidate_identity(candidate: &TranslationCandidate) -> (String, String, usiz
     )
 }
 
+fn issue_identity(issue: &TranslationIssueItem) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        issue.file, issue.kind, issue.index, issue.source, issue.target
+    )
+}
+
+fn candidate_issue_identity(candidate: &TranslationCandidate) -> String {
+    let (file, kind, index, source, target) = candidate_identity(candidate);
+    format!("{file}\u{1f}{kind}\u{1f}{index}\u{1f}{source}\u{1f}{target}")
+}
+
 fn same_candidate_set(left: &[TranslationCandidate], right: &[TranslationCandidate]) -> bool {
     if left.len() != right.len() {
         return false;
@@ -4486,6 +4602,18 @@ fn same_candidate_set(left: &[TranslationCandidate], right: &[TranslationCandida
     let left_set = left.iter().map(candidate_identity).collect::<HashSet<_>>();
     let right_set = right.iter().map(candidate_identity).collect::<HashSet<_>>();
     left_set == right_set
+}
+
+fn issue_as_candidate(issue: &TranslationIssueItem) -> TranslationCandidate {
+    TranslationCandidate {
+        file: issue.file.clone(),
+        kind: issue.kind.clone(),
+        index: issue.index,
+        item: json!({
+            "source": issue.source,
+            "target": issue.target,
+        }),
+    }
 }
 
 fn candidate_group_signature(candidates: &[TranslationCandidate]) -> String {
@@ -4498,6 +4626,179 @@ fn candidate_group_signature(candidates: &[TranslationCandidate]) -> String {
         .collect::<Vec<_>>();
     parts.sort();
     parts.join("\u{1e}")
+}
+
+fn remove_issue_items_from_candidates(
+    source: &mut Vec<TranslationCandidate>,
+    issues: &[TranslationIssueItem],
+) {
+    if issues.is_empty() {
+        return;
+    }
+    let issue_set = issues.iter().map(issue_identity).collect::<HashSet<_>>();
+    source.retain(|candidate| !issue_set.contains(&candidate_issue_identity(candidate)));
+}
+
+fn remove_candidates_from_list(
+    source: &mut Vec<TranslationCandidate>,
+    candidates: &[TranslationCandidate],
+) {
+    if candidates.is_empty() {
+        return;
+    }
+    let remove_set = candidates.iter().map(candidate_identity).collect::<HashSet<_>>();
+    source.retain(|candidate| !remove_set.contains(&candidate_identity(candidate)));
+}
+
+fn push_unique_issues(target: &mut Vec<TranslationIssueItem>, issues: impl IntoIterator<Item = TranslationIssueItem>) {
+    let mut seen = target.iter().map(issue_identity).collect::<HashSet<_>>();
+    for issue in issues {
+        if seen.insert(issue_identity(&issue)) {
+            target.push(issue);
+        }
+    }
+}
+
+fn diagnose_checkpoint_items(candidates: &[TranslationCandidate], reason: &str) -> Vec<TranslationIssueItem> {
+    candidates.iter().map(|candidate| candidate.issue(reason)).collect()
+}
+
+fn save_diagnose_checkpoint(session: &DiagnoseCleanupSession, status: &str) -> Result<()> {
+    write_json_pretty(
+        &session.paths.diagnose_checkpoint_path,
+        &json!({
+            "schemaVersion": 1,
+            "updatedAt": now_ms(),
+            "pluginId": session.plugin_id.clone(),
+            "translationSourceId": session.translation_source_id.clone(),
+            "status": status,
+            "pendingItems": diagnose_checkpoint_items(&session.pending_candidates, "待运行验证"),
+            "clearedItems": diagnose_checkpoint_items(&session.cleared_runtime_candidates, "运行验证通过"),
+            "issueItems": session.issue_items.clone(),
+            "processedFiles": session.processed_files,
+        }),
+    )
+}
+
+fn load_diagnose_checkpoint(
+    paths: &PersistencePaths,
+    plugin_id: &str,
+    translation_source_id: &str,
+) -> Option<Value> {
+    let checkpoint = load_json_or(&paths.diagnose_checkpoint_path, Value::Null);
+    let same_plugin = checkpoint.get("pluginId").and_then(Value::as_str) == Some(plugin_id);
+    let same_source = checkpoint
+        .get("translationSourceId")
+        .and_then(Value::as_str)
+        == Some(translation_source_id);
+    if same_plugin && same_source {
+        Some(checkpoint)
+    } else {
+        None
+    }
+}
+
+fn restore_diagnose_checkpoint(session: &mut DiagnoseCleanupSession) -> Result<()> {
+    let Some(checkpoint) = load_diagnose_checkpoint(
+        &session.paths,
+        &session.plugin_id,
+        &session.translation_source_id,
+    ) else {
+        return Ok(());
+    };
+
+    let issue_items = checkpoint
+        .get("issueItems")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<TranslationIssueItem>>(value).ok())
+        .unwrap_or_default();
+    let cleared_items = checkpoint
+        .get("clearedItems")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<TranslationIssueItem>>(value).ok())
+        .unwrap_or_default();
+
+    push_unique_issues(&mut session.issue_items, issue_items.clone());
+    remove_issue_items_from_candidates(&mut session.pending_candidates, &issue_items);
+    remove_issue_items_from_candidates(&mut session.pending_candidates, &cleared_items);
+    for issue in cleared_items {
+        session.cleared_runtime_candidates.push(issue_as_candidate(&issue));
+    }
+    Ok(())
+}
+
+fn update_diagnose_issue_record(
+    paths: &PersistencePaths,
+    translation_source_id: &str,
+    plugin_id: &str,
+    issues: &[TranslationIssueItem],
+    status: &str,
+) -> Result<()> {
+    if issues.is_empty() {
+        return Ok(());
+    }
+
+    let mut record = load_json_or(
+        &paths.diagnose_issue_record_path,
+        json!({ "schemaVersion": 1, "sources": {}, "updatedAt": 0 }),
+    );
+    if !record.is_object() {
+        record = json!({ "schemaVersion": 1, "sources": {}, "updatedAt": 0 });
+    }
+    if record.get("sources").and_then(Value::as_object).is_none() {
+        record["sources"] = json!({});
+    }
+
+    let now = now_ms();
+    record["schemaVersion"] = json!(1);
+    record["updatedAt"] = json!(now);
+
+    let source_key = translation_source_id.to_string();
+    let Some(sources) = record.get_mut("sources").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    let source_entry = sources.entry(source_key).or_insert_with(|| {
+        json!({
+            "translationSourceId": translation_source_id,
+            "pluginId": plugin_id,
+            "issues": [],
+            "createdAt": now,
+            "updatedAt": now,
+        })
+    });
+    source_entry["translationSourceId"] = json!(translation_source_id);
+    source_entry["pluginId"] = json!(plugin_id);
+    source_entry["updatedAt"] = json!(now);
+    if source_entry.get("issues").and_then(Value::as_array).is_none() {
+        source_entry["issues"] = json!([]);
+    }
+
+    let Some(items) = source_entry.get_mut("issues").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for issue in issues {
+        let key = issue_identity(issue);
+        if let Some(existing) = items.iter_mut().find(|item| item.get("key").and_then(Value::as_str) == Some(key.as_str())) {
+            existing["lastSeenAt"] = json!(now);
+            existing["status"] = json!(status);
+            existing["reason"] = json!(issue.reason.clone());
+        } else {
+            items.push(json!({
+                "key": key,
+                "status": status,
+                "file": issue.file.clone(),
+                "kind": issue.kind.clone(),
+                "index": issue.index,
+                "source": issue.source.clone(),
+                "target": issue.target.clone(),
+                "reason": issue.reason.clone(),
+                "firstSeenAt": now,
+                "lastSeenAt": now,
+            }));
+        }
+    }
+
+    write_json_pretty(&paths.diagnose_issue_record_path, &record)
 }
 
 fn pairwise_candidate_groups(candidates: &[TranslationCandidate]) -> Vec<Vec<TranslationCandidate>> {
@@ -4531,7 +4832,12 @@ fn probe_response(
             files,
             label: label.to_string(),
         }),
-        removed_items: session.removed_items.clone(),
+        issue_items: session.issue_items.clone(),
+        cleared_items: session
+            .cleared_runtime_candidates
+            .iter()
+            .map(|candidate| candidate.issue("运行验证通过，已从嫌疑池排除"))
+            .collect(),
         processed_files: session.processed_files,
         translation_version: session
             .translation_json
@@ -4548,7 +4854,12 @@ fn completed_response(session: &DiagnoseCleanupSession, status: &str) -> PluginD
         status: status.to_string(),
         session_id: None,
         probe: None,
-        removed_items: session.removed_items.clone(),
+        issue_items: session.issue_items.clone(),
+        cleared_items: session
+            .cleared_runtime_candidates
+            .iter()
+            .map(|candidate| candidate.issue("运行验证通过，已从嫌疑池排除"))
+            .collect(),
         processed_files: session.processed_files,
         translation_version: session
             .translation_json
@@ -4566,69 +4877,137 @@ fn runtime_probe_chunks(candidates: &[TranslationCandidate]) -> Vec<Vec<Translat
     partition_candidates(candidates, 2)
 }
 
-fn remove_runtime_candidates(
+fn mark_runtime_candidates_cleared(
     session: &mut DiagnoseCleanupSession,
-    candidates: Vec<TranslationCandidate>,
+    candidates: &[TranslationCandidate],
+) -> Result<()> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let pending_set = session.pending_candidates.iter().map(candidate_identity).collect::<HashSet<_>>();
+    let cleared = candidates
+        .iter()
+        .filter(|candidate| pending_set.contains(&candidate_identity(candidate)))
+        .cloned()
+        .collect::<Vec<_>>();
+    if cleared.is_empty() {
+        return Ok(());
+    }
+    let issue_set = session
+        .issue_items
+        .iter()
+        .map(|issue| (issue.file.clone(), issue.kind.clone(), issue.index, issue.source.clone(), issue.target.clone()))
+        .collect::<HashSet<_>>();
+    for candidate in &cleared {
+        let (file, kind, index, source, target) = candidate_identity(candidate);
+        if !issue_set.contains(&(file, kind, index, source, target)) {
+            session.cleared_runtime_candidates.push(candidate.clone());
+        }
+    }
+    remove_candidates_from_list(&mut session.pending_candidates, &cleared);
+    save_diagnose_checkpoint(session, "running")
+}
+
+fn mark_runtime_candidates_issues(
+    session: &mut DiagnoseCleanupSession,
+    candidates: &[TranslationCandidate],
     reason: &str,
 ) -> Result<()> {
-    for candidate in &candidates {
-        session.removed_items.push(candidate.issue(reason));
+    if candidates.is_empty() {
+        return Ok(());
     }
-    if remove_translation_candidates(&mut session.translation_json, &candidates) == 0 {
-        bail!("运行诊断发现问题条目但移除失败");
-    }
-    save_cleaned_translation_source(
+    let issues = candidates.iter().map(|candidate| candidate.issue(reason)).collect::<Vec<_>>();
+    push_unique_issues(&mut session.issue_items, issues.clone());
+    remove_candidates_from_list(&mut session.pending_candidates, candidates);
+    remove_candidates_from_list(&mut session.cleared_runtime_candidates, candidates);
+    update_diagnose_issue_record(
         &session.paths,
         &session.translation_source_id,
-        &session.translation_json,
+        &session.plugin_id,
+        &issues,
+        "open",
     )?;
-    session.pending_candidates = collect_translation_candidates(
-        &session.translation_json,
-        session.apply_ast,
-        session.apply_regex,
-    );
-    session.runtime_probe_queue.clear();
-    session.combo_fallback_groups.clear();
-    session.pairwise_tested_group_signatures.clear();
-    session.probe_map.clear();
-    Ok(())
+    save_diagnose_checkpoint(session, "running")
+}
+
+fn filter_unresolved_candidates(
+    session: &DiagnoseCleanupSession,
+    candidates: &[TranslationCandidate],
+) -> Vec<TranslationCandidate> {
+    let pending_set = session.pending_candidates.iter().map(candidate_identity).collect::<HashSet<_>>();
+    candidates
+        .iter()
+        .filter(|candidate| pending_set.contains(&candidate_identity(candidate)))
+        .cloned()
+        .collect()
+}
+
+fn mark_combo_group_if_exhausted(
+    session: &mut DiagnoseCleanupSession,
+    group: Vec<TranslationCandidate>,
+) -> Result<bool> {
+    let unresolved = filter_unresolved_candidates(session, &group);
+    if !unresolved.is_empty() {
+        mark_runtime_candidates_issues(
+            session,
+            &unresolved,
+            "组合导致插件运行验证失败，已记录该组合中的条目",
+        )?;
+    }
+    Ok(true)
+}
+
+fn queue_runtime_chunks(session: &mut DiagnoseCleanupSession, candidates: Vec<TranslationCandidate>) {
+    for chunk in runtime_probe_chunks(&candidates).into_iter().rev() {
+        session.runtime_probe_queue.push(chunk);
+    }
+}
+
+fn next_runtime_queued_probe(
+    session_id: &str,
+    session: &mut DiagnoseCleanupSession,
+) -> Result<Option<PluginDiagnoseCleanupResponse>> {
+    while let Some(candidates) = session.runtime_probe_queue.pop() {
+        let unresolved = filter_unresolved_candidates(session, &candidates);
+        if !unresolved.is_empty() {
+            return probe_response(session_id, session, unresolved, "分组运行验证").map(Some);
+        }
+    }
+    Ok(None)
 }
 
 fn next_runtime_probe_response(
     session_id: &str,
     session: &mut DiagnoseCleanupSession,
 ) -> Result<Option<PluginDiagnoseCleanupResponse>> {
-    if session.pending_candidates.is_empty() {
-        return Ok(None);
-    }
-
-    if let Some(candidates) = session.runtime_probe_queue.pop() {
-        return probe_response(session_id, session, candidates, "分组运行验证").map(Some);
+    if let Some(response) = next_runtime_queued_probe(session_id, session)? {
+        return Ok(Some(response));
     }
 
     if let Some(group) = session.combo_fallback_groups.pop() {
-        let signature = candidate_group_signature(&group);
+        let signature = candidate_group_signature(&group.candidates);
         if !session.pairwise_tested_group_signatures.contains(&signature) {
-            let pairwise = pairwise_candidate_groups(&group);
+            let pairwise = pairwise_candidate_groups(&group.candidates);
             if !pairwise.is_empty() {
                 session.pairwise_tested_group_signatures.insert(signature);
                 session.combo_fallback_groups.push(group.clone());
                 for pair in pairwise.into_iter().rev() {
                     session.runtime_probe_queue.push(pair);
                 }
-                if let Some(candidates) = session.runtime_probe_queue.pop() {
-                    return probe_response(session_id, session, candidates, "组合运行验证").map(Some);
+                if let Some(response) = next_runtime_queued_probe(session_id, session)? {
+                    return Ok(Some(response));
                 }
             }
         }
-        remove_runtime_candidates(
-            session,
-            group,
-            "组合导致插件运行验证失败，已移除该最小失败集合",
-        )?;
-        if session.pending_candidates.is_empty() {
-            return Ok(None);
+        if session.issue_items.len() == group.issue_count_at_start {
+            mark_combo_group_if_exhausted(session, group.candidates.clone())?;
         }
+        return next_runtime_probe_response(session_id, session);
+    }
+
+    if session.pending_candidates.is_empty() {
+        save_diagnose_checkpoint(session, "completed")?;
+        return Ok(None);
     }
 
     probe_response(
@@ -4647,7 +5026,7 @@ async fn handle_plugin_diagnose_cleanup_start(
     let _guard = state.persistence_lock.lock().await;
     let payload: PluginDiagnoseCleanupStartPayload = serde_json::from_value(payload)?;
     let paths = paths(&payload.persistence.base_path);
-    let mut translation_json = read_translation(&paths, &payload.translation_source_id)
+    let translation_json = read_translation(&paths, &payload.translation_source_id)
         .ok_or_else(|| anyhow!("翻译文件不存在"))?;
     let apply_ast = payload.apply_ast.unwrap_or(true);
     let apply_regex = payload.apply_regex.unwrap_or(true);
@@ -4658,23 +5037,30 @@ async fn handle_plugin_diagnose_cleanup_start(
         &translation_json,
         payload.is_applied.unwrap_or(false),
     )?;
-    let static_report = diagnose_and_clean_translation_json(
-        &mut translation_json,
+    let static_report = diagnose_translation_json(
+        &translation_json,
         &source_by_file,
         apply_ast,
         apply_regex,
     )?;
-    save_cleaned_translation_source(&paths, &payload.translation_source_id, &translation_json)?;
+    update_diagnose_issue_record(
+        &paths,
+        &payload.translation_source_id,
+        &payload.plugin_id,
+        &static_report.issue_items,
+        "open",
+    )?;
 
-    let pending_candidates = collect_translation_candidates(&translation_json, apply_ast, apply_regex);
+    let mut pending_candidates = collect_translation_candidates(&translation_json, apply_ast, apply_regex);
+    remove_issue_items_from_candidates(&mut pending_candidates, &static_report.issue_items);
     let mut session = DiagnoseCleanupSession {
         paths,
+        plugin_id: payload.plugin_id,
         translation_source_id: payload.translation_source_id,
         translation_json,
         source_by_file,
-        apply_ast,
-        apply_regex,
-        removed_items: static_report.removed_items,
+        issue_items: static_report.issue_items,
+        cleared_runtime_candidates: Vec::new(),
         pending_candidates,
         probe_map: HashMap::new(),
         runtime_probe_queue: Vec::new(),
@@ -4682,8 +5068,11 @@ async fn handle_plugin_diagnose_cleanup_start(
         pairwise_tested_group_signatures: HashSet::new(),
         processed_files: static_report.processed_files,
     };
+    restore_diagnose_checkpoint(&mut session)?;
+    save_diagnose_checkpoint(&session, "running")?;
 
     if !payload.runtime_probe.unwrap_or(false) || session.pending_candidates.is_empty() {
+        save_diagnose_checkpoint(&session, "completed")?;
         return Ok(serde_json::to_value(completed_response(&session, "completed"))?);
     }
 
@@ -4733,14 +5122,7 @@ async fn handle_plugin_diagnose_cleanup_step(
 
     if payload.success {
         if same_candidate_set(&candidates, &session.pending_candidates) {
-            save_cleaned_translation_source(
-                &session.paths,
-                &session.translation_source_id,
-                &session.translation_json,
-            )?;
-            let response = completed_response(session, "completed");
-            sessions.remove(&payload.session_id);
-            return Ok(serde_json::to_value(response)?);
+            mark_runtime_candidates_cleared(session, &candidates)?;
         }
     } else if candidates.len() <= 1 {
         let reason = payload
@@ -4748,26 +5130,46 @@ async fn handle_plugin_diagnose_cleanup_step(
             .as_deref()
             .filter(|value| !value.is_empty())
             .unwrap_or("插件运行验证失败");
-        remove_runtime_candidates(session, candidates, reason)?;
+        mark_runtime_candidates_issues(session, &candidates, reason)?;
     } else {
-        session.combo_fallback_groups.push(candidates.clone());
-        for chunk in runtime_probe_chunks(&candidates).into_iter().rev() {
-            session.runtime_probe_queue.push(chunk);
-        }
+        session.combo_fallback_groups.push(ComboFallbackGroup {
+            candidates: candidates.clone(),
+            issue_count_at_start: session.issue_items.len(),
+        });
+        queue_runtime_chunks(session, candidates);
     }
 
     if let Some(response) = next_runtime_probe_response(&payload.session_id, session)? {
         Ok(serde_json::to_value(response)?)
     } else {
-        save_cleaned_translation_source(
-            &session.paths,
-            &session.translation_source_id,
-            &session.translation_json,
-        )?;
+        save_diagnose_checkpoint(session, "completed")?;
         let response = completed_response(session, "completed");
         sessions.remove(&payload.session_id);
         Ok(serde_json::to_value(response)?)
     }
+}
+
+async fn handle_plugin_diagnose_cleanup_cancel(
+    state: &AppState,
+    payload: Value,
+) -> Result<Value> {
+    let _guard = state.persistence_lock.lock().await;
+    let payload: PluginDiagnoseCleanupCancelPayload = serde_json::from_value(payload)?;
+    let mut sessions = state.diagnose_sessions.lock().await;
+    if let Some(session) = sessions.remove(&payload.session_id) {
+        save_diagnose_checkpoint(&session, "stopped")?;
+    }
+    Ok(json!({ "state": true }))
+}
+
+async fn handle_plugin_diagnose_cleanup_apply(
+    state: &AppState,
+    payload: Value,
+) -> Result<Value> {
+    let _guard = state.persistence_lock.lock().await;
+    let payload: PluginDiagnoseCleanupApplyPayload = serde_json::from_value(payload)?;
+    let response = apply_diagnose_cleanup_blocking(payload)?;
+    Ok(serde_json::to_value(response)?)
 }
 
 fn apply_theme_settings_translations(css: &str, translations: &[Value]) -> String {
@@ -5074,6 +5476,8 @@ fn paths(base_path: &str) -> PersistencePaths {
         meta_path: base_path.join("metadata.json"),
         checkpoint_path: base_path.join("backup-checkpoint.json"),
         batch_task_record_path: base_path.join("batch-task-records.json"),
+        diagnose_checkpoint_path: base_path.join("diagnose-checkpoint.json"),
+        diagnose_issue_record_path: base_path.join("diagnose-issues.json"),
     }
 }
 
@@ -8772,9 +9176,9 @@ mod tests {
     }
 
     #[test]
-    fn diagnose_cleanup_removes_multiple_syntax_breaking_items() {
+    fn diagnose_records_multiple_syntax_breaking_items_without_touching_source_file() {
         let original_code = r#"const label = "Hello"; const tip = "Tip"; const ok = "Okay";"#;
-        let mut translation_json = json!({
+        let translation_json = json!({
             "schemaVersion": 1,
             "metadata": {
                 "plugin": "demo-plugin",
@@ -8797,17 +9201,17 @@ mod tests {
             }
         });
 
-        let report = diagnose_and_clean_translation_json(
-            &mut translation_json,
+        let report = diagnose_translation_json(
+            &translation_json,
             &HashMap::from([("main.js".to_string(), original_code.to_string())]),
             true,
             true,
         )
         .unwrap();
 
-        assert_eq!(report.removed_items.len(), 2);
-        assert!(report.removed_items.iter().any(|item| item.source == "Hello"));
-        assert!(report.removed_items.iter().any(|item| item.source == "Okay"));
+        assert_eq!(report.issue_items.len(), 2);
+        assert!(report.issue_items.iter().any(|item| item.source == "Hello"));
+        assert!(report.issue_items.iter().any(|item| item.source == "Okay"));
         assert_eq!(
             translation_json
                 .pointer("/dict/main.js/regex")
@@ -8816,8 +9220,90 @@ mod tests {
                 .iter()
                 .map(|item| item.get("source").and_then(Value::as_str).unwrap_or_default())
                 .collect::<Vec<_>>(),
-            vec!["Tip"]
+            vec!["Hello", "Tip", "Okay"]
         );
+    }
+
+    #[tokio::test]
+    async fn plugin_diagnose_start_records_static_issues_without_rewriting_translation_source() {
+        let base_path = env::temp_dir().join(format!("i18n-static-diagnose-{}", nanoid!()));
+        let _ = fs::remove_dir_all(&base_path);
+        let plugin_dir = base_path.join("demo-plugin");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("main.js"),
+            r#"const label = "Hello"; const tip = "Tip"; const ok = "Okay";"#,
+        )
+        .unwrap();
+
+        let paths = paths(base_path.to_str().unwrap());
+        let source_id = "source-static";
+        let translation_json = json!({
+            "schemaVersion": 1,
+            "metadata": {
+                "plugin": "demo-plugin",
+                "language": "zh-CN",
+                "version": "1.0.0",
+                "supportedVersions": "*",
+                "title": "Demo",
+                "description": "",
+                "author": ""
+            },
+            "dict": {
+                "main.js": {
+                    "ast": [],
+                    "regex": [
+                        { "source": "Hello", "target": "\"; const broken = ; //" },
+                        { "source": "Tip", "target": "提示" },
+                        { "source": "Okay", "target": "\"; if ( ; //" }
+                    ]
+                }
+            }
+        });
+        save_translation(&paths, source_id, &translation_json).unwrap();
+
+        let state = AppState {
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            diagnose_sessions: Arc::new(Mutex::new(HashMap::new())),
+            persistence_lock: Arc::new(Mutex::new(())),
+            plugin_dir: base_path.clone(),
+            http: reqwest::Client::new(),
+            shutdown: Arc::new(Mutex::new(None)),
+        };
+
+        let start_value = handle_plugin_diagnose_cleanup_start(
+            &state,
+            json!({
+                "pluginId": "demo-plugin",
+                "pluginDir": plugin_dir.to_string_lossy(),
+                "backupBasePath": base_path.to_string_lossy(),
+                "persistence": { "basePath": base_path.to_string_lossy() },
+                "translationSourceId": source_id,
+                "applyAst": true,
+                "applyRegex": true,
+                "runtimeProbe": false,
+                "isApplied": false
+            }),
+        )
+        .await
+        .unwrap();
+        let response: PluginDiagnoseCleanupResponse = serde_json::from_value(start_value).unwrap();
+        assert_eq!(response.status, "completed");
+        assert_eq!(response.issue_items.len(), 2);
+
+        let saved_translation = read_translation(&paths, source_id).unwrap();
+        assert_eq!(
+            saved_translation
+                .pointer("/dict/main.js/regex")
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .map(|item| item.get("source").and_then(Value::as_str).unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["Hello", "Tip", "Okay"]
+        );
+
+        let _ = fs::remove_dir_all(&base_path);
     }
 
     #[tokio::test]
@@ -8950,6 +9436,32 @@ mod tests {
         assert_eq!(split_probe.label, "分组运行验证");
         let split_code = &split_probe.files[0].code;
         assert_ne!(split_code.contains("甲"), split_code.contains("乙"));
+
+        let after_failed_single_value = handle_plugin_diagnose_cleanup_step(
+            &state,
+            json!({
+                "sessionId": after_failed_full.session_id.unwrap(),
+                "probeId": split_probe.probe_id,
+                "success": false,
+                "error": "plugin crashed"
+            }),
+        )
+        .await
+        .unwrap();
+        let after_failed_single: PluginDiagnoseCleanupResponse =
+            serde_json::from_value(after_failed_single_value).unwrap();
+        assert_eq!(after_failed_single.issue_items.len(), 1);
+        let saved_translation = read_translation(&paths, source_id).unwrap();
+        assert_eq!(
+            saved_translation
+                .pointer("/dict/main.js/regex")
+                .and_then(Value::as_array)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(paths.diagnose_checkpoint_path.exists());
+        assert!(paths.diagnose_issue_record_path.exists());
 
         let _ = fs::remove_dir_all(&base_path);
     }
