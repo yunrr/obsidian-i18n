@@ -2,7 +2,6 @@ import { App, PluginManifest } from 'obsidian';
 import * as path from 'path';
 import * as fs from 'fs-extra';
 import I18N from '../main';
-import { loadTranslationFile } from '../manager/io-manager';
 import { t } from '../locales';
 
 export class InjectorManager {
@@ -86,20 +85,18 @@ export class InjectorManager {
         const pluginDir = path.join(path.normalize(this.i18n.app.vault.adapter.getBasePath()), plugin.dir ?? '');
 
         try {
-            // 1. 读取译文
-            const translationPath = this.i18n.sourceManager.getActiveSourcePath(plugin.id);
-            if (!translationPath) return false;
-            const translationJson = loadTranslationFile(translationPath);
-            if (!translationJson || !translationJson.dict) return false;
+            const sourceId = this.i18n.sourceManager.getActiveSourceId(plugin.id);
+            if (!sourceId) return false;
 
-            // 2. 交给 Rust worker 完成备份、AST/Regex 替换和写回
+            // 交给 Rust worker 读取译文、备份、AST/Regex 替换和写回
             // @ts-ignore
             const backupBasePath = path.join(path.normalize(this.i18n.app.vault.adapter.getBasePath()), this.i18n.manifest.dir || '');
             const result = await this.i18n.companionWorkerManager.applyPluginTranslation({
                 pluginId: plugin.id,
                 pluginDir,
                 backupBasePath,
-                translationJson,
+                persistence: { basePath: this.i18n.sourceManager.getBasePath() },
+                translationSourceId: sourceId,
             });
             if (!result.state) return false;
 
@@ -108,7 +105,7 @@ export class InjectorManager {
                 id: plugin.id,
                 isApplied: true,
                 pluginVersion: plugin.version,
-                translationVersion: translationJson.metadata?.version || '0.0.0'
+                translationVersion: result.translationVersion || '0.0.0'
             });
 
             // 7. 重启插件与健康检查
@@ -195,14 +192,10 @@ export class InjectorManager {
                 } catch (e) { }
             }
 
-            // Read translation
-            // @ts-ignore
-            const translationPath = this.i18n.sourceManager.getActiveSourcePath(themeId);
-            if (!translationPath) return false;
-            const translationJson = loadTranslationFile(translationPath);
-            if (!translationJson || !translationJson.dict) return false;
+            const sourceId = this.i18n.sourceManager.getActiveSourceId(themeId);
+            if (!sourceId) return false;
 
-            // Apply theme translation in Rust worker.
+            // Apply theme translation in Rust worker. The worker reads the translation JSON by source id.
             // @ts-ignore
             const backupBasePath = path.join(path.normalize(this.i18n.app.vault.adapter.getBasePath()), this.i18n.manifest.dir || '');
             const result = await this.i18n.companionWorkerManager.applyThemeTranslation({
@@ -211,16 +204,16 @@ export class InjectorManager {
                 themeCssPath,
                 themeCssRelativePath,
                 backupBasePath,
-                translationJson,
+                persistence: { basePath: this.i18n.sourceManager.getBasePath() },
+                translationSourceId: sourceId,
             });
             if (!result.state) return false;
 
-            const version = translationJson.metadata?.version || '1.0.0';
             this.i18n.stateManager.setThemeState(themeId, {
                 id: themeId,
                 isApplied: true,
                 pluginVersion: themeVersion,
-                translationVersion: String(version)
+                translationVersion: result.translationVersion || '1.0.0'
             });
 
             console.log(`[i18n] Successfully injected theme: ${themeId}`);

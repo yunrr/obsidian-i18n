@@ -275,6 +275,9 @@ export class SourceManager {
                 if (source.processedTranslationCount === undefined || source.unprocessedTranslationCount === undefined || source.translationProcessingComplete === undefined) return true;
                 if (source.sourceFileExists === undefined || source.sourceFileMtime === undefined) return true;
                 if (source.isInstalled === undefined) return true;
+                const currentMtime = this.getSourceFileMtime(source.id);
+                if (!currentMtime) return source.sourceFileExists !== false;
+                if (Math.abs(currentMtime - (source.sourceFileMtime || 0)) > 1) return true;
                 return false;
             })
             .map(source => source.id);
@@ -382,17 +385,14 @@ export class SourceManager {
      * 添加/更新翻译源
      */
     saveSource(source: TranslationSource, options?: { activate?: boolean; skipFileIndex?: boolean }): void {
-        if (!options?.skipFileIndex) {
-            const content = this.readSourceFile(source.id);
-            if (content?.metadata) {
-                source = { ...this.mergeMetadataIndex(source, content), sourceFileExists: true, sourceFileMtime: this.getSourceFileMtime(source.id) };
-            }
-        }
         this.upsertSourceInMemory(source);
         if (options?.activate) {
             this.setActiveInMemory(source.id, true);
         }
         this.saveMeta();
+        if (!options?.skipFileIndex && this.i18n?.companionWorkerManager) {
+            void this.batchIndexSourceMetadata([source.id]);
+        }
     }
 
     /**
@@ -554,7 +554,7 @@ export class SourceManager {
         const content = this.readSourceFile(sourceId);
         if (!content?.metadata) return false;
         this.meta.sources[sourceId] = {
-            ...this.mergeMetadataIndex(source, content, { preserveProcessingState: true }),
+            ...this.mergeMetadataIndex(source, content),
             sourceFileExists: true,
             sourceFileMtime: this.getSourceFileMtime(sourceId),
         };
@@ -580,7 +580,7 @@ export class SourceManager {
             const content = this.readSourceFile(sourceId);
             if (!content?.metadata) continue;
             this.meta.sources[sourceId] = {
-                ...this.mergeMetadataIndex(source, content, { preserveProcessingState: true }),
+                ...this.mergeMetadataIndex(source, content),
                 sourceFileExists: true,
                 sourceFileMtime: this.getSourceFileMtime(sourceId),
             };

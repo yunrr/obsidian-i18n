@@ -97,7 +97,12 @@ struct PluginApplyTranslationPayload {
     plugin_id: String,
     plugin_dir: String,
     backup_base_path: String,
-    translation_json: Value,
+    #[serde(default)]
+    translation_json: Option<Value>,
+    #[serde(default)]
+    persistence: Option<PersistenceConfig>,
+    #[serde(default)]
+    translation_source_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,7 +114,12 @@ struct ThemeApplyTranslationPayload {
     #[serde(default)]
     theme_css_relative_path: Option<String>,
     backup_base_path: String,
-    translation_json: Value,
+    #[serde(default)]
+    translation_json: Option<Value>,
+    #[serde(default)]
+    persistence: Option<PersistenceConfig>,
+    #[serde(default)]
+    translation_source_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +156,8 @@ struct SourceImportExportResponse {
     state: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     content_base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<Value>,
     added_count: usize,
     updated_count: usize,
     skipped_count: usize,
@@ -3673,7 +3685,7 @@ async fn handle_sync_task(state: &AppState, task_type: &str, payload: Value) -> 
         "code-extract" => handle_code_extract(payload).await,
         "plugin-apply-translation" => handle_plugin_apply_translation(payload).await,
         "theme-apply-translation" => handle_theme_apply_translation(payload).await,
-        "source-export" | "source-import" | "source-remove" | "source-set-active" | "source-index" | "source-clear-batch-records" => handle_source_manager_task(state, task_type, payload).await,
+        "source-export" | "source-read" | "source-import" | "source-remove" | "source-set-active" | "source-index" | "source-clear-batch-records" => handle_source_manager_task(state, task_type, payload).await,
         "plugin-extract" => Ok(serde_json::to_value(handle_plugin_extract(payload).await?)?),
         "theme-extract" => Ok(serde_json::to_value(handle_theme_extract(payload).await?)?),
         "plugin-translate" => {
@@ -3751,6 +3763,7 @@ async fn handle_source_manager_task(state: &AppState, operation: &str, payload: 
         let payload: SourceManagerPayload = serde_json::from_value(payload)?;
         let result = match operation.as_str() {
             "source-export" => source_export_blocking(payload)?,
+            "source-read" => source_read_blocking(payload)?,
             "source-import" => source_import_blocking(payload)?,
             "source-remove" => source_remove_blocking(payload)?,
             "source-set-active" => source_set_active_blocking(payload)?,
@@ -3763,9 +3776,23 @@ async fn handle_source_manager_task(state: &AppState, operation: &str, payload: 
     .await?
 }
 
+fn resolve_apply_translation_json(
+    translation_json: Option<Value>,
+    persistence: Option<PersistenceConfig>,
+    translation_source_id: Option<String>,
+) -> Result<Value> {
+    if let Some(content) = translation_json {
+        return Ok(content);
+    }
+    let persistence = persistence.ok_or_else(|| anyhow!("persistence missing"))?;
+    let source_id = translation_source_id.ok_or_else(|| anyhow!("translationSourceId missing"))?;
+    let paths = paths(&persistence.base_path);
+    read_translation(&paths, &source_id).ok_or_else(|| anyhow!("翻译文件不存在"))
+}
+
 fn apply_plugin_translation_blocking(payload: PluginApplyTranslationPayload) -> Result<ApplyTranslationResponse> {
-    let dict = payload
-        .translation_json
+    let translation_json = resolve_apply_translation_json(payload.translation_json, payload.persistence, payload.translation_source_id)?;
+    let dict = translation_json
         .get("dict")
         .and_then(Value::as_object)
         .ok_or_else(|| anyhow!("translationJson.dict missing"))?;
@@ -3799,8 +3826,7 @@ fn apply_plugin_translation_blocking(payload: PluginApplyTranslationPayload) -> 
     Ok(ApplyTranslationResponse {
         state: true,
         processed_files,
-        translation_version: payload
-            .translation_json
+        translation_version: translation_json
             .pointer("/metadata/version")
             .and_then(Value::as_str)
             .unwrap_or("0.0.0")
@@ -3809,8 +3835,8 @@ fn apply_plugin_translation_blocking(payload: PluginApplyTranslationPayload) -> 
 }
 
 fn apply_theme_translation_blocking(payload: ThemeApplyTranslationPayload) -> Result<ApplyTranslationResponse> {
-    let dict = payload
-        .translation_json
+    let translation_json = resolve_apply_translation_json(payload.translation_json, payload.persistence, payload.translation_source_id)?;
+    let dict = translation_json
         .get("dict")
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("translationJson.dict missing"))?;
@@ -3825,8 +3851,7 @@ fn apply_theme_translation_blocking(payload: ThemeApplyTranslationPayload) -> Re
     Ok(ApplyTranslationResponse {
         state: true,
         processed_files: 1,
-        translation_version: payload
-            .translation_json
+        translation_version: translation_json
             .pointer("/metadata/version")
             .and_then(Value::as_str)
             .unwrap_or("1.0.0")
@@ -4282,6 +4307,22 @@ fn source_export_blocking(payload: SourceManagerPayload) -> Result<SourceImportE
     Ok(SourceImportExportResponse {
         state: true,
         content_base64: Some(BASE64_STANDARD.encode(compressed)),
+        source: None,
+        added_count: 0,
+        updated_count: 0,
+        skipped_count: 0,
+        deleted_count: 0,
+    })
+}
+
+fn source_read_blocking(payload: SourceManagerPayload) -> Result<SourceImportExportResponse> {
+    let paths = paths(&payload.persistence.base_path);
+    let source_id = payload.source_id.ok_or_else(|| anyhow!("sourceId missing"))?;
+    let source = read_translation(&paths, &source_id).ok_or_else(|| anyhow!("翻译文件不存在"))?;
+    Ok(SourceImportExportResponse {
+        state: true,
+        content_base64: None,
+        source: Some(source),
         added_count: 0,
         updated_count: 0,
         skipped_count: 0,
@@ -4349,6 +4390,7 @@ fn source_import_blocking(payload: SourceManagerPayload) -> Result<SourceImportE
     Ok(SourceImportExportResponse {
         state: true,
         content_base64: None,
+        source: None,
         added_count,
         updated_count,
         skipped_count,
@@ -4386,6 +4428,7 @@ fn source_remove_blocking(payload: SourceManagerPayload) -> Result<SourceImportE
     Ok(SourceImportExportResponse {
         state: true,
         content_base64: None,
+        source: None,
         added_count: 0,
         updated_count: 0,
         skipped_count: 0,
@@ -4421,6 +4464,7 @@ fn source_set_active_blocking(payload: SourceManagerPayload) -> Result<SourceImp
     Ok(SourceImportExportResponse {
         state: true,
         content_base64: None,
+        source: None,
         added_count: 0,
         updated_count: 0,
         skipped_count: 0,
@@ -4459,6 +4503,7 @@ fn source_clear_batch_records_blocking(payload: SourceManagerPayload) -> Result<
     Ok(SourceImportExportResponse {
         state: true,
         content_base64: None,
+        source: None,
         added_count: 0,
         updated_count: 0,
         skipped_count: 0,
@@ -4698,7 +4743,7 @@ fn source_index_blocking(state: &AppState, payload: SourceManagerPayload) -> Res
                 skipped_count += 1;
                 continue;
             };
-            merge_metadata_index(source, &content, true);
+            merge_metadata_index(source, &content, false);
             source["sourceFileExists"] = json!(true);
             source["sourceFileMtime"] = json!(source_file_mtime);
             merge_source_install_state(source, &installed_plugins, &installed_themes);
@@ -4713,6 +4758,7 @@ fn source_index_blocking(state: &AppState, payload: SourceManagerPayload) -> Res
     Ok(SourceImportExportResponse {
         state: true,
         content_base64: None,
+        source: None,
         added_count: 0,
         updated_count,
         skipped_count,

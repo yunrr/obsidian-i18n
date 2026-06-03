@@ -173,6 +173,10 @@ export class CompanionWorkerManager {
         return this.runTask<CompanionApplyTranslationResponse>('theme-apply-translation', request);
     }
 
+    public async readSource(request: CompanionSourceManagerRequest): Promise<CompanionSourceManagerResponse> {
+        return this.runTask<CompanionSourceManagerResponse>('source-read', request);
+    }
+
     public async exportSources(request: CompanionSourceManagerRequest): Promise<CompanionSourceManagerResponse> {
         return this.runTask<CompanionSourceManagerResponse>('source-export', request);
     }
@@ -287,9 +291,7 @@ export class CompanionWorkerManager {
             type === 'plugin-batch-extract' ||
             type === 'theme-batch-extract' ||
             type === 'code-extract' ||
-            type === 'ast-replace' ||
-            type === 'plugin-apply-translation' ||
-            type === 'theme-apply-translation'
+            type === 'ast-replace'
         ) {
             return 'cjs';
         }

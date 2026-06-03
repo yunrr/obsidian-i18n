@@ -14,6 +14,8 @@ import type { BatchTaskCheckpoint, BatchTaskFailureRecord, BatchTaskRecordMeta, 
 import type {
     CompanionProxyRequest,
     CompanionProxyResponse,
+    CompanionSourceManagerRequest,
+    CompanionSourceManagerResponse,
     CompanionAstReplaceRequest,
     CompanionAstReplaceResponse,
     CompanionCodeExtractRequest,
@@ -441,7 +443,13 @@ async function handleAstReplace(payload: CompanionAstReplaceRequest): Promise<Co
 
 async function handlePluginApplyTranslation(payload: CompanionPluginApplyTranslationRequest) {
     try {
-        const dict = payload.translationJson.dict || {};
+        const translationJson = payload.translationJson || (
+            payload.persistence && payload.translationSourceId
+                ? await readTranslationFile<PluginTranslationV1>(getPersistencePaths(payload.persistence.basePath), payload.translationSourceId)
+                : null
+        );
+        if (!translationJson) throw new Error('翻译文件不存在');
+        const dict = translationJson.dict || {};
         const files = Object.keys(dict);
         await createWorkerBackup(payload.backupBasePath, payload.pluginId, payload.pluginDir, files);
 
@@ -471,7 +479,7 @@ async function handlePluginApplyTranslation(payload: CompanionPluginApplyTransla
         return {
             state: true,
             processedFiles,
-            translationVersion: payload.translationJson.metadata?.version || '0.0.0',
+            translationVersion: translationJson.metadata?.version || '0.0.0',
         };
     } catch (error) {
         return {
@@ -496,17 +504,23 @@ function applyThemeSettingsTranslations(css: string, translations: Array<{ sourc
 
 async function handleThemeApplyTranslation(payload: CompanionThemeApplyTranslationRequest) {
     try {
+        const translationJson = payload.translationJson || (
+            payload.persistence && payload.translationSourceId
+                ? await readTranslationFile<ThemeTranslationV1>(getPersistencePaths(payload.persistence.basePath), payload.translationSourceId)
+                : null
+        );
+        if (!translationJson) throw new Error('翻译文件不存在');
         const cssRelativePath = payload.themeCssRelativePath || 'theme.css';
         await createWorkerBackup(payload.backupBasePath, payload.themeId, payload.themeDir, [cssRelativePath]);
         const backupCss = await readWorkerBackupContent(payload.backupBasePath, payload.themeId, cssRelativePath);
         const sourceCss = backupCss || await fs.readFile(payload.themeCssPath, 'utf8');
-        const translatedCss = applyThemeSettingsTranslations(sourceCss, payload.translationJson.dict || []);
+        const translatedCss = applyThemeSettingsTranslations(sourceCss, translationJson.dict || []);
         await fs.writeFile(payload.themeCssPath, translatedCss);
 
         return {
             state: true,
             processedFiles: 1,
-            translationVersion: payload.translationJson.metadata?.version || '0.0.0',
+            translationVersion: translationJson.metadata?.version || '0.0.0',
         };
     } catch (error) {
         return {
@@ -1853,6 +1867,21 @@ async function runAsyncTask(task: CompanionTaskRuntime, type: CompanionAsyncTask
     }
 }
 
+async function handleSourceRead(payload: CompanionSourceManagerRequest): Promise<CompanionSourceManagerResponse> {
+    const paths = getPersistencePaths(payload.persistence.basePath);
+    if (!payload.sourceId) throw new Error('缺少 sourceId');
+    const source = await readTranslationFile(paths, payload.sourceId);
+    if (!source) throw new Error('翻译文件不存在');
+    return {
+        state: true,
+        source,
+        addedCount: 0,
+        updatedCount: 0,
+        skippedCount: 0,
+        deletedCount: 0,
+    };
+}
+
 function startAsyncTask(type: CompanionAsyncTaskType, payload: any) {
     const taskId = nanoid(16);
     const task: CompanionTaskRuntime = {
@@ -1886,6 +1915,7 @@ async function handleTask(type: string, payload: any) {
     if (type === 'ast-replace') return handleAstReplace(payload);
     if (type === 'plugin-apply-translation') return handlePluginApplyTranslation(payload);
     if (type === 'theme-apply-translation') return handleThemeApplyTranslation(payload);
+    if (type === 'source-read') return handleSourceRead(payload);
     if (type === 'plugin-translate') return handlePluginTranslate(payload);
     if (type === 'theme-translate') return handleThemeTranslate(payload);
     if (type === 'plugin-retry') return handlePluginRetry(payload);

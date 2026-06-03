@@ -5,12 +5,9 @@ import * as fs from 'fs-extra';
 import { useTranslation } from 'react-i18next';
 import { Settings, FolderOpen, Pen, FileOutput, XCircle, Loader2, MoreHorizontal, CloudDownload, Cloud } from 'lucide-react';
 import I18N from 'src/main';
-import { PluginTranslationV1 } from 'src/types';
 import { i18nOpen } from '../../../utils/common/general';
 import { getPluginTranslationSources, hasExtractedTranslationContent, calculateChecksum } from '../../../utils/translator/light';
-import { loadTranslationFile } from '../../../manager/io-manager';
-import { useGlobalStoreInstance } from '~/utils/store/global';
-import { EDITOR_VIEW_TYPE } from '../../../views';
+import { openPluginSourceEditor } from '../utils/source-editor';
 import { getEffectiveExtractionSettings } from '../../../utils/translator/config';
 import {
     Button,
@@ -244,23 +241,22 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
         }
         setReplacing(true);
         try {
-            const translationJson: PluginTranslationV1 = loadTranslationFile(langDoc);
-            if (translationJson.dict) {
-                // @ts-ignore
-                const backupBasePath = path.join(path.normalize(i18n.app.vault.adapter.getBasePath()), i18n.manifest.dir || '');
-                const result = await i18n.companionWorkerManager.applyPluginTranslation({
-                    pluginId: plugin.id,
-                    pluginDir,
-                    backupBasePath,
-                    translationJson,
-                });
-                if (!result.state) throw new Error(result.error || t('Manager.Common.Errors.ErrorDesc'));
-            }
+            if (!activeSourceId) throw new Error(t('Manager.Common.Errors.ErrorDesc'));
+            // @ts-ignore
+            const backupBasePath = path.join(path.normalize(i18n.app.vault.adapter.getBasePath()), i18n.manifest.dir || '');
+            const result = await i18n.companionWorkerManager.applyPluginTranslation({
+                pluginId: plugin.id,
+                pluginDir,
+                backupBasePath,
+                persistence: { basePath: i18n.sourceManager.getBasePath() },
+                translationSourceId: activeSourceId,
+            });
+            if (!result.state) throw new Error(result.error || t('Manager.Common.Errors.ErrorDesc'));
             i18n.stateManager.setPluginState(plugin.id, {
                 id: plugin.id,
                 isApplied: true,
                 pluginVersion: plugin.version,
-                translationVersion: translationJson.metadata.version
+                translationVersion: result.translationVersion || translationVersion || '0.0.0',
             });
             const previousEnabledState = isEnabled;
             let loadFailed = false;
@@ -462,10 +458,10 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
                                     <DropdownMenuContent align="end" className="w-48 shadow-2xl backdrop-blur-md bg-background/95 border-border/40">
                                         {translationFormatMark && isLangDoc && (
                                             <DropdownMenuItem onClick={() => {
-                                                const pluginTranslationV1 = loadTranslationFile(langDoc);
-                                                useGlobalStoreInstance.getState().setEditorPluginTranslation(pluginTranslationV1);
-                                                useGlobalStoreInstance.getState().setEditorPluginTranslationPath(langDoc);
-                                                i18n.view.activateView(EDITOR_VIEW_TYPE);
+                                                if (!activeSourceId) return;
+                                                void openPluginSourceEditor(i18n, activeSourceId, langDoc).catch(error => {
+                                                    i18n.notice.error(String(error));
+                                                });
                                             }} className="text-[12px] py-2">
                                                 <Pen className="w-3.5 h-3.5 mr-2.5 text-primary/70" />
                                                 <span>{t('Manager.Common.Actions.Edit')}</span>
@@ -554,16 +550,16 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
                     )}
 
                     <div className="flex items-center gap-1.5">
-                        {translationFormatMark && isLangDoc && (
-                            <TooltipProvider>
-                                <Tooltip>
-                                    <TooltipTrigger asChild>
-                                        <Button variant="ghost" size="icon" className="h-8 w-8 rounded-none hover:bg-primary/10 hover:text-primary transition-all" onClick={() => {
-                                            const pluginTranslationV1 = loadTranslationFile(langDoc);
-                                            useGlobalStoreInstance.getState().setEditorPluginTranslation(pluginTranslationV1);
-                                            useGlobalStoreInstance.getState().setEditorPluginTranslationPath(langDoc);
-                                            i18n.view.activateView(EDITOR_VIEW_TYPE);
-                                        }}>
+                                    {translationFormatMark && isLangDoc && (
+                                        <TooltipProvider>
+                                            <Tooltip>
+                                                <TooltipTrigger asChild>
+                                                    <Button variant="ghost" size="icon" className="h-8 w-8 rounded-none hover:bg-primary/10 hover:text-primary transition-all" onClick={() => {
+                                                        if (!activeSourceId) return;
+                                                        void openPluginSourceEditor(i18n, activeSourceId, langDoc).catch(error => {
+                                                            i18n.notice.error(String(error));
+                                                        });
+                                                    }}>
                                             <Pen className="w-3.5 h-3.5" />
                                         </Button>
                                     </TooltipTrigger>

@@ -14,8 +14,7 @@ import { Notice } from 'obsidian';
 import * as path from 'path';
 import { useGlobalStoreInstance } from '~/utils/store/global';
 import { i18nOpen } from '~/utils/common/general';
-import { loadTranslationFile } from '../../../manager/io-manager';
-import { EDITOR_VIEW_TYPE } from '../../../views';
+import { openPluginSourceEditor, openThemeSourceEditor } from '../utils/source-editor';
 
 interface TranslationManagerPanelProps {
     i18n: I18N;
@@ -562,10 +561,12 @@ export const TranslationManagerPanel: React.FC<TranslationManagerPanelProps> = (
                                                     <DropdownMenuContent align="end" className="w-[180px] rounded-none p-1 shadow-2xl backdrop-blur-md bg-background/95 border-border/40">
                                                         <DropdownMenuItem className="text-[12px] rounded-none cursor-pointer py-2" onClick={() => {
                                                             const filePath = sourceManager.getSourceFilePath(source.id);
-                                                            const pluginTranslationV1 = loadTranslationFile(filePath);
-                                                            useGlobalStoreInstance.getState().setEditorPluginTranslation(pluginTranslationV1);
-                                                            useGlobalStoreInstance.getState().setEditorPluginTranslationPath(filePath);
-                                                            i18n.view.activateView(EDITOR_VIEW_TYPE);
+                                                            const openEditor = source.type === 'theme'
+                                                                ? openThemeSourceEditor(i18n, source.id, filePath, source.plugin, '', '')
+                                                                : openPluginSourceEditor(i18n, source.id, filePath);
+                                                            void openEditor.catch(error => {
+                                                                new Notice(String(error));
+                                                            });
                                                         }}>
                                                             <Pen className="w-3.5 h-3.5 mr-2.5 text-primary/70" />
                                                             {t('Manager.Common.Actions.Edit')}

@@ -4,12 +4,10 @@ import * as fs from 'fs-extra';
 import { useTranslation } from 'react-i18next';
 import { FolderOpen, FileOutput, XCircle, Loader2, MoreHorizontal, Pen, CloudDownload, Cloud } from 'lucide-react';
 import I18N from 'src/main';
-import { OBThemeManifest, ThemeTranslationV1 } from 'src/types';
+import { OBThemeManifest } from 'src/types';
 import { i18nOpen } from '../../../utils/common/general';
 import { getThemeTranslationSources, hasExtractedTranslationContent, calculateChecksum } from '../../../utils/translator/light';
-import { loadTranslationFile } from '../../../manager/io-manager';
-import { useGlobalStoreInstance } from '~/utils/store/global';
-import { THEME_EDITOR_VIEW_TYPE } from '../../theme_editor/editor';
+import { openThemeSourceEditor } from '../utils/source-editor';
 import { getEffectiveExtractionSettings } from '../../../utils/translator/config';
 import {
     Button,
@@ -386,13 +384,10 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
                                     <DropdownMenuContent align="end" className="w-48 shadow-2xl backdrop-blur-md bg-background/95 border-border/40">
                                         {hasTranslation && (
                                             <DropdownMenuItem onClick={() => {
-                                                const translationJson: ThemeTranslationV1 = loadTranslationFile(translationPath);
-                                                if (translationJson) {
-                                                    useGlobalStoreInstance.getState().setEditorTheme(
-                                                        translationJson, theme.name, themeDir, translationPath, themeCssPath
-                                                    );
-                                                    i18n.view.activateView(THEME_EDITOR_VIEW_TYPE);
-                                                }
+                                                if (!activeSourceId) return;
+                                                void openThemeSourceEditor(i18n, activeSourceId, translationPath, theme.name, themeDir, themeCssPath).catch(error => {
+                                                    i18n.notice.error(String(error));
+                                                });
                                             }} className="text-[12px] py-2">
                                                 <Pen className="w-3.5 h-3.5 mr-2.5 text-primary/70" />
                                                 <span>{t('Manager.Common.Actions.Edit')}</span>
@@ -481,13 +476,10 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
                                 <Tooltip>
                                     <TooltipTrigger asChild>
                                         <Button variant="ghost" size="icon" className="h-8 w-8 rounded-none hover:bg-primary/10 hover:text-primary transition-all" onClick={() => {
-                                            const translationJson: ThemeTranslationV1 = loadTranslationFile(translationPath);
-                                            if (translationJson) {
-                                                useGlobalStoreInstance.getState().setEditorTheme(
-                                                    translationJson, theme.name, themeDir, translationPath, themeCssPath
-                                                );
-                                                i18n.view.activateView(THEME_EDITOR_VIEW_TYPE);
-                                            }
+                                            if (!activeSourceId) return;
+                                            void openThemeSourceEditor(i18n, activeSourceId, translationPath, theme.name, themeDir, themeCssPath).catch(error => {
+                                                i18n.notice.error(String(error));
+                                            });
                                         }}>
                                             <Pen className="w-3.5 h-3.5" />
                                         </Button>

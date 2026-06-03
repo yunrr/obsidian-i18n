@@ -145,7 +145,9 @@ export interface CompanionPluginApplyTranslationRequest {
     pluginId: string;
     pluginDir: string;
     backupBasePath: string;
-    translationJson: PluginTranslationV1;
+    translationJson?: PluginTranslationV1;
+    persistence?: CompanionWorkerPersistenceConfig;
+    translationSourceId?: string;
 }
 
 export interface CompanionThemeApplyTranslationRequest {
@@ -154,7 +156,9 @@ export interface CompanionThemeApplyTranslationRequest {
     themeCssPath: string;
     themeCssRelativePath?: string;
     backupBasePath: string;
-    translationJson: ThemeTranslationV1;
+    translationJson?: ThemeTranslationV1;
+    persistence?: CompanionWorkerPersistenceConfig;
+    translationSourceId?: string;
 }
 
 export interface CompanionApplyTranslationResponse {
@@ -178,6 +182,7 @@ export interface CompanionSourceManagerRequest {
 export interface CompanionSourceManagerResponse {
     state: boolean;
     contentBase64?: string;
+    source?: any;
     addedCount: number;
     updatedCount: number;
     skippedCount: number;
@@ -470,4 +475,4 @@ export interface CompanionThemeFailureRetryPayload {
 
 export type CompanionAsyncTaskType = 'plugin-batch-extract' | 'theme-batch-extract' | 'plugin-batch-translate' | 'theme-batch-translate' | 'plugin-failure-retry' | 'theme-failure-retry' | 'cloud-backup-all';
 
-export type CompanionBatchTaskType = 'plugin-extract' | 'theme-extract' | 'plugin-translate' | 'theme-translate' | 'plugin-retry' | 'theme-retry' | 'ast-replace' | 'code-extract' | 'plugin-apply-translation' | 'theme-apply-translation' | 'source-export' | 'source-import' | 'source-remove' | 'source-set-active' | 'source-index' | 'source-clear-batch-records' | CompanionCloudTaskType;
+export type CompanionBatchTaskType = 'plugin-extract' | 'theme-extract' | 'plugin-translate' | 'theme-translate' | 'plugin-retry' | 'theme-retry' | 'ast-replace' | 'code-extract' | 'plugin-apply-translation' | 'theme-apply-translation' | 'source-read' | 'source-export' | 'source-import' | 'source-remove' | 'source-set-active' | 'source-index' | 'source-clear-batch-records' | CompanionCloudTaskType;
