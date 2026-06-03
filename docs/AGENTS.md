@@ -57,7 +57,7 @@
 
 ## 交付前检查
 
-从 `G:\goProjects\obsidian-i18n\docs` 运行：
+从仓库的 `docs` 目录运行：
 
 ```bash
 npx mint validate

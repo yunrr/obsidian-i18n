@@ -93,22 +93,16 @@ interface MemoizedAstRowProps {
     onRowClick: (id: number) => void;
     getCellClass: (columnId: string) => string;
     dataIndex: number;
-    errorType?: 'error' | 'unused' | 'security' | null;
+    hasError?: boolean;
 }
 
-const errorRowStyles: Record<string, string> = {
-    error: 'bg-destructive/8 border-l-2 border-l-destructive',
-    unused: 'bg-orange-500/8 border-l-2 border-l-orange-500',
-    security: 'bg-purple-500/8 border-l-2 border-l-purple-500',
-};
+const errorRowStyle = 'bg-destructive/8 border-l-2 border-l-destructive';
 
 const MemoizedAstRowInner = React.forwardRef<HTMLTableRowElement, MemoizedAstRowProps>(
-    ({ row, isSelected, onRowClick, getCellClass, dataIndex, errorType }, ref) => {
+    ({ row, isSelected, onRowClick, getCellClass, dataIndex, hasError }, ref) => {
         const handleClick = useCallback(() => {
             onRowClick(row.original.id);
         }, [row.original.id, onRowClick]);
-
-        const errorClass = errorType ? errorRowStyles[errorType] || '' : '';
 
         return (
             <TableRow
@@ -116,7 +110,7 @@ const MemoizedAstRowInner = React.forwardRef<HTMLTableRowElement, MemoizedAstRow
                 data-index={dataIndex}
                 id={`ast-row-${row.original.id}`}
                 data-state={isSelected ? "selected" : undefined}
-                className={`cursor-pointer hover:bg-accent/50 ${isSelected ? 'bg-accent' : ''} ${errorClass}`}
+                className={`cursor-pointer hover:bg-accent/50 ${isSelected ? 'bg-accent' : ''} ${hasError ? errorRowStyle : ''}`}
                 onClick={handleClick}
             >
                 {row.getVisibleCells().map((cell: any) => (
@@ -136,7 +130,7 @@ MemoizedAstRowInner.displayName = 'MemoizedAstRow';
 const MemoizedAstRow = React.memo(MemoizedAstRowInner, (prev, next) => {
     return prev.isSelected === next.isSelected
         && prev.row.original === next.row.original
-        && prev.errorType === next.errorType;
+        && prev.hasError === next.hasError;
 });
 
 export const ASTTable = React.forwardRef<HTMLDivElement, Props>(({ data, editingId, onRowClick, onDelete, onReset }, ref) => {
@@ -144,23 +138,16 @@ export const ASTTable = React.forwardRef<HTMLDivElement, Props>(({ data, editing
     const updateAstItem = useRegexStore.use.updateAstItem();
     const parentRef = useRef<HTMLDivElement>(null);
 
-    // 诊断错误高亮映射 {id -> errorType}
-    const [errorMap, setErrorMap] = useState<Map<number, 'error' | 'unused' | 'security'>>(new Map());
+    const [errorIds, setErrorIds] = useState<Set<number>>(new Set());
 
     useEffect(() => {
         const handleErrors = (e: CustomEvent<{ errors: DiagnoseError[] }>) => {
-            const map = new Map<number, 'error' | 'unused' | 'security'>();
+            const ids = new Set<number>();
             for (const err of e.detail.errors) {
                 if (err.type !== 'ast') continue;
-                if (err.severity === 'critical' || err.severity === 'warning') {
-                    map.set(err.id, 'security');
-                } else if (err.isUnused) {
-                    map.set(err.id, 'unused');
-                } else {
-                    map.set(err.id, 'error');
-                }
+                ids.add(err.id);
             }
-            setErrorMap(map);
+            setErrorIds(ids);
         };
         window.addEventListener('i18n-diagnose-errors', handleErrors as EventListener);
         return () => window.removeEventListener('i18n-diagnose-errors', handleErrors as EventListener);
@@ -351,7 +338,7 @@ export const ASTTable = React.forwardRef<HTMLDivElement, Props>(({ data, editing
                                     isSelected={row.original.id === editingId}
                                     onRowClick={onRowClick}
                                     getCellClass={getCellClass}
-                                    errorType={errorMap.get(row.original.id) || null}
+                                    hasError={errorIds.has(row.original.id)}
                                 />
                             );
                         })}

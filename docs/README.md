@@ -20,7 +20,7 @@
 
 ## 开发命令
 
-以下命令都从 `G:\goProjects\obsidian-i18n\docs` 目录执行：
+以下命令都从仓库的 `docs` 目录执行：
 
 ```bash
 npx mint dev

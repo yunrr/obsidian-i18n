@@ -8820,6 +8820,140 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn runtime_diagnose_probe_steps_after_baseline_success_and_failed_full_probe() {
+        let base_path = env::temp_dir().join(format!("i18n-runtime-diagnose-{}", nanoid!()));
+        let _ = fs::remove_dir_all(&base_path);
+        let plugin_dir = base_path.join("demo-plugin");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        let original_code = r#"const first = "A"; const second = "B";"#;
+        fs::write(plugin_dir.join("main.js"), original_code).unwrap();
+
+        let paths = paths(base_path.to_str().unwrap());
+        let source_id = "source-a";
+        let translation_json = json!({
+            "schemaVersion": 1,
+            "metadata": {
+                "plugin": "demo-plugin",
+                "language": "zh-CN",
+                "version": "1.0.0",
+                "supportedVersions": "*",
+                "title": "Demo",
+                "description": "",
+                "author": ""
+            },
+            "dict": {
+                "main.js": {
+                    "ast": [],
+                    "regex": [
+                        { "source": "A", "target": "甲" },
+                        { "source": "B", "target": "乙" }
+                    ]
+                }
+            }
+        });
+        save_translation(&paths, source_id, &translation_json).unwrap();
+        write_json_pretty(
+            &paths.meta_path,
+            &json!({
+                "schemaVersion": 2,
+                "sources": {
+                    source_id: {
+                        "id": source_id,
+                        "plugin": "demo-plugin",
+                        "type": "plugin",
+                        "origin": "local",
+                        "isActive": true,
+                        "checksum": "",
+                        "translationVersion": "1.0.0",
+                        "translationFormatValid": true,
+                        "totalTranslationCount": 2,
+                        "pendingTranslationCount": 0,
+                        "translatedEntryCount": 2,
+                        "processedTranslationCount": 0,
+                        "unprocessedTranslationCount": 2,
+                        "translationProcessingComplete": false,
+                        "createdAt": 1,
+                        "updatedAt": 1
+                    }
+                }
+            }),
+        )
+        .unwrap();
+
+        let state = AppState {
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            diagnose_sessions: Arc::new(Mutex::new(HashMap::new())),
+            persistence_lock: Arc::new(Mutex::new(())),
+            plugin_dir: base_path.clone(),
+            http: reqwest::Client::new(),
+            shutdown: Arc::new(Mutex::new(None)),
+        };
+
+        let start_value = handle_plugin_diagnose_cleanup_start(
+            &state,
+            json!({
+                "pluginId": "demo-plugin",
+                "pluginDir": plugin_dir.to_string_lossy(),
+                "backupBasePath": base_path.to_string_lossy(),
+                "persistence": { "basePath": base_path.to_string_lossy() },
+                "translationSourceId": source_id,
+                "applyAst": true,
+                "applyRegex": true,
+                "runtimeProbe": true,
+                "isApplied": false
+            }),
+        )
+        .await
+        .unwrap();
+        let start: PluginDiagnoseCleanupResponse = serde_json::from_value(start_value).unwrap();
+        assert_eq!(start.status, "probe");
+        let session_id = start.session_id.clone().unwrap();
+        let baseline_probe = start.probe.unwrap();
+        assert_eq!(baseline_probe.label, "原始运行验证");
+        assert_eq!(baseline_probe.files.len(), 1);
+        assert_eq!(baseline_probe.files[0].code, original_code);
+
+        let after_baseline_value = handle_plugin_diagnose_cleanup_step(
+            &state,
+            json!({
+                "sessionId": session_id,
+                "probeId": baseline_probe.probe_id,
+                "success": true
+            }),
+        )
+        .await
+        .unwrap();
+        let after_baseline: PluginDiagnoseCleanupResponse =
+            serde_json::from_value(after_baseline_value).unwrap();
+        assert_eq!(after_baseline.status, "probe");
+        let full_probe = after_baseline.probe.unwrap();
+        assert_eq!(full_probe.label, "全量运行验证");
+        assert!(full_probe.files[0].code.contains("甲"));
+        assert!(full_probe.files[0].code.contains("乙"));
+
+        let after_failed_full_value = handle_plugin_diagnose_cleanup_step(
+            &state,
+            json!({
+                "sessionId": after_baseline.session_id.unwrap(),
+                "probeId": full_probe.probe_id,
+                "success": false,
+                "error": "plugin crashed"
+            }),
+        )
+        .await
+        .unwrap();
+        let after_failed_full: PluginDiagnoseCleanupResponse =
+            serde_json::from_value(after_failed_full_value).unwrap();
+        assert_eq!(after_failed_full.status, "probe");
+        let split_probe = after_failed_full.probe.unwrap();
+        assert_eq!(split_probe.label, "分组运行验证");
+        let split_code = &split_probe.files[0].code;
+        assert_ne!(split_code.contains("甲"), split_code.contains("乙"));
+
+        let _ = fs::remove_dir_all(&base_path);
+    }
+
     #[test]
     fn metadata_index_separates_translated_entries_from_processing_progress() {
         let index = metadata_index(&json!({

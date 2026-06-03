@@ -75,25 +75,19 @@ interface MemoizedRegexRowProps {
     row: any;
     isSelected: boolean;
     dataIndex: number;
-    errorType?: 'error' | 'unused' | 'security' | null;
+    hasError?: boolean;
 }
 
-const errorRowStyles: Record<string, string> = {
-    error: 'bg-destructive/8 border-l-2 border-l-destructive',
-    unused: 'bg-orange-500/8 border-l-2 border-l-orange-500',
-    security: 'bg-purple-500/8 border-l-2 border-l-purple-500',
-};
+const errorRowStyle = 'bg-destructive/8 border-l-2 border-l-destructive';
 
 const MemoizedRegexRowInner = React.forwardRef<HTMLTableRowElement, MemoizedRegexRowProps>(
-    ({ row, isSelected, dataIndex, errorType }, ref) => {
-        const errorClass = errorType ? errorRowStyles[errorType] || '' : '';
-
+    ({ row, isSelected, dataIndex, hasError }, ref) => {
         return (
             <TableRow
                 ref={ref}
                 data-index={dataIndex}
                 id={`regex-row-${row.original.id}`}
-                className={`border-b hover:bg-accent/50 ${isSelected ? 'bg-accent' : ''} ${errorClass}`}
+                className={`border-b hover:bg-accent/50 ${isSelected ? 'bg-accent' : ''} ${hasError ? errorRowStyle : ''}`}
                 data-state={isSelected ? "selected" : undefined}
             >
                 {row.getVisibleCells().map((cell: any) => (
@@ -113,7 +107,7 @@ MemoizedRegexRowInner.displayName = 'MemoizedRegexRow';
 const MemoizedRegexRow = React.memo(MemoizedRegexRowInner, (prev, next) => {
     return prev.isSelected === next.isSelected
         && prev.row.original === next.row.original
-        && prev.errorType === next.errorType;
+        && prev.hasError === next.hasError;
 });
 
 export const RegexTable = React.forwardRef<HTMLDivElement, Props>(({ data, editingId, onEditingIdChange }, ref) => {
@@ -123,23 +117,16 @@ export const RegexTable = React.forwardRef<HTMLDivElement, Props>(({ data, editi
     const resetRegexItem = useRegexStore.use.resetRegexItem();
     const parentRef = useRef<HTMLDivElement>(null);
 
-    // 诊断错误高亮映射 {id -> errorType}
-    const [errorMap, setErrorMap] = useState<Map<number, 'error' | 'unused' | 'security'>>(new Map());
+    const [errorIds, setErrorIds] = useState<Set<number>>(new Set());
 
     useEffect(() => {
         const handleErrors = (e: CustomEvent<{ errors: DiagnoseError[] }>) => {
-            const map = new Map<number, 'error' | 'unused' | 'security'>();
+            const ids = new Set<number>();
             for (const err of e.detail.errors) {
                 if (err.type !== 'regex') continue;
-                if (err.severity === 'critical' || err.severity === 'warning') {
-                    map.set(err.id, 'security');
-                } else if (err.isUnused) {
-                    map.set(err.id, 'unused');
-                } else {
-                    map.set(err.id, 'error');
-                }
+                ids.add(err.id);
             }
-            setErrorMap(map);
+            setErrorIds(ids);
         };
         window.addEventListener('i18n-diagnose-errors', handleErrors as EventListener);
         return () => window.removeEventListener('i18n-diagnose-errors', handleErrors as EventListener);
@@ -276,7 +263,7 @@ export const RegexTable = React.forwardRef<HTMLDivElement, Props>(({ data, editi
                                     dataIndex={virtualRow.index}
                                     row={row}
                                     isSelected={row.original.id === editingId}
-                                    errorType={errorMap.get(row.original.id) || null}
+                                    hasError={errorIds.has(row.original.id)}
                                 />
                             );
                         })}

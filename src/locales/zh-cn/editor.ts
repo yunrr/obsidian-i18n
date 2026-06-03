@@ -66,15 +66,9 @@ export default {
         Source: "源码",
         Trans: "译文",
         Restore: "还原",
-        RestoreAllErrors: "还原所有异常项",
         Settings: "配置",
-        Diagnose: "语法诊断",
-        UnusedDiagnose: "冗余诊断",
-        SecurityDiagnose: "安全扫描",
-        ClearDiagnose: "清除诊断",
-        StartScan: "开始扫描",
-        AiFix: "AI 修复",
-        AiFixTip: "让 AI 尝试修复此译文的语法错误",
+        Diagnose: "运行前检查",
+        PreflightCheck: "运行前检查",
         ContextAware: "上下文感知",
         ContextAwareTip: "附加源码上下文以提升翻译准确度"
     },
@@ -123,9 +117,8 @@ export default {
     },
     Status: {
         ProcessingBatch: "正在翻译第 {{current}}/{{total}} 批...",
-        Diagnosing: "正在进行语法诊断...",
-        DiagnosingUnused: "正在进行冗余诊断...",
-        DiagnosingSecurity: "正在进行安全审计...",
+        Diagnosing: "正在进行运行前检查...",
+        PreflightChecking: "正在运行前检查...",
         Applied: "已应用",
         NotApplied: "未应用",
         Empty: "暂无条目",
@@ -133,7 +126,7 @@ export default {
     },
     Hints: {
         ExtractSummary: "增量提取完成，新增 {{count}} 个条目",
-        DiagnosisSuccess: "诊断完成：未发现导致语法错误的条目",
+        DiagnosisSuccess: "运行前检查完成，未发现导致脚本失败的条目",
         NoItems: "无可翻译项",
         NoNewItems: "未发现新的翻译条目"
     },
@@ -144,17 +137,13 @@ export default {
         SuccessRestore: "还原成功",
         SuccessDelete: "删除成功",
         SuccessIncrementalExtract: "增量提取完成",
-        DiagnosisSuccess: "语法诊断通过",
-        DiagnosisCleanupRemoved: "诊断完成：已移除 {{count}} 个导致脚本失败的条目",
-        DiagnosisRuntimeBaselineFailed: "原始插件脚本也无法正常加载，已跳过运行级定位，仅保留静态清理结果。",
-        ConfirmDeleteUnused: "确定删除这些冗余项吗？该操作不可撤销。",
-        AiFixSuccess: "AI 修复成功"
+        DiagnosisSuccess: "运行前检查通过",
+        DiagnosisCleanupRemoved: "运行前检查完成：已移除 {{count}} 个导致脚本失败的条目",
+        DiagnosisRuntimeBaselineFailed: "原始插件脚本也无法正常加载，已跳过运行级定位，仅保留静态清理结果。"
     },
     Errors: {
         FailExists: "新增失败\n译文中已存在此内容",
         SyntaxErrorTotal: "诊断完成：发现 {{count}} 个语法错误",
-        UnusedTotal: "诊断完成：发现 {{count}} 个未匹配的冗余条目",
-        SecurityRiskTotal: "安全预警：发现 {{count}} 个潜在的安全风险",
         SyntaxError: "基础语法错误",
         Unused: "冗余项 (未在源码中识别到)",
         SecurityCritical: "严重安全威胁",
@@ -167,11 +156,10 @@ export default {
         NoManifest: "未找到对应清单，无法定位目录。",
         NotJs: "当前选择的文件不是 .js 脚本，暂不支持语法诊断。",
         NoBackup: "诊断异常：未找到对应的备份文件。请先点击一次“替换”以创建基准备份。",
-        SourceError: "源码本身存在语法错误，无法进行诊断。",
+        SourceError: "源码本身存在语法错误，无法进行运行前检查。",
         FileNotFound: "文件不存在",
         SavePathMissing: "保存路径不存在",
-        TotalCount: "共 {{count}} 项",
-        AiFixFail: "AI 修复失败"
+        TotalCount: "共 {{count}} 项"
     },
     Dialogs: {
         ConfirmDeletePath: "确认删除该路径？",

@@ -4,7 +4,6 @@ import * as fs from 'fs-extra';
 import { ItemView, WorkspaceLeaf } from 'obsidian';
 import { Root } from 'react-dom/client';
 
-import { PluginTranslationV1Regex } from 'src/types';
 import I18N from "src/main";
 
 import { Button, Tabs, TabsContent, TabsList, TabsTrigger, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, Input, Label, DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger, Card, Badge, ResizablePanelGroup, ResizablePanel, ResizableHandle, ScrollArea } from '~/shadcn';
@@ -19,7 +18,6 @@ import { mountReactView } from '~/utils/core/react';
 import { StringPicker } from '~/utils/ui/string-picker';
 import { mergeAstItems, mergeRegexItems } from '@/src/utils/translator/light';
 import { getEffectiveExtractionSettings } from '@/src/utils/translator/config';
-import { createTranslationProvider } from '~/ai/provider-factory';
 
 import { useTranslation } from 'react-i18next';
 import { t as gt } from 'src/locales';
@@ -93,6 +91,35 @@ const AutoSaveManager: React.FC<{ onSave: (silent?: boolean) => void, enabled: b
     return null;
 };
 
+type PluginApi = {
+    manifests: Record<string, unknown>;
+    plugins: Record<string, unknown>;
+    enabledPlugins: Set<string>;
+    disablePlugin(id: string): Promise<void>;
+    enablePlugin(id: string): Promise<void>;
+};
+
+type RuntimeProbeRequest = {
+    files: Array<{ file: string; code: string }>;
+};
+
+const wait = (ms: number) => new Promise(resolve => window.setTimeout(resolve, ms));
+
+const getPluginLoadState = (pluginsApi: PluginApi, pluginId: string) => ({
+    enabled: pluginsApi.enabledPlugins.has(pluginId),
+    loaded: !!pluginsApi.plugins[pluginId],
+});
+
+const waitForPluginLoaded = async (pluginsApi: PluginApi, pluginId: string, timeoutMs = 3000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        const state = getPluginLoadState(pluginsApi, pluginId);
+        if (state.enabled && state.loaded) return state;
+        await wait(50);
+    }
+    return getPluginLoadState(pluginsApi, pluginId);
+};
+
 // 组件
 const ReactEditor: React.FC<EditorProps> = (_) => {
     const i18n = useGlobalStoreInstance.getState().i18n;
@@ -108,9 +135,6 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
     const astController = useAstTranslation();
     const regexController = useRegexTranslation();
 
-    // Lifted Sidebar Tab State (Syncs across Views)
-    const [activeSidebarTab, setActiveSidebarTab] = React.useState('overview');
-
     // 只获取 setter 函数（稳定引用），不订阅实际数据
     const setRegexItems = useRegexStore.use.setRegexItems();
     const setAstItems = useRegexStore.use.setAstItems();
@@ -125,8 +149,6 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
     const savingRef = useRef(false);
     const [isSaving, setIsSaving] = useState(false);
     const [isDiagnosing, setIsDiagnosing] = useState(false);
-    const [isUnusedScan, setIsUnusedScan] = useState(false);
-    const [isSecurityScan, setIsSecurityScan] = useState(false);
     const [errorItems, setErrorItems] = useState<DiagnoseError[]>([]);
     const [hasChecked, setHasChecked] = useState(false);
     const [activeTab, setActiveTab] = useState('ast');
@@ -134,17 +156,6 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
     const [newPathInput, setNewPathInput] = useState('');
 
     const getExtractionSettings = React.useCallback(() => getEffectiveExtractionSettings(i18n.settings), [i18n.settings]);
-
-    const validateSecurityText = React.useCallback((target: string) => {
-        const issues: { severity: 'critical' | 'warning'; message: string }[] = [];
-        if (!target) return issues;
-        const critical = [/\beval\s*\(/i, /\bFunction\s*\(/i, /\bsetTimeout\s*\(\s*['"`]/i, /\bsetInterval\s*\(\s*['"`]/i, /<script/i, /\bjavascript:/i];
-        const warning = [/\bfetch\s*\(/i, /\bXMLHttpRequest\b/i, /\bWebSocket\b/i, /\brequire\s*\(/i, /\bprocess\./i, /\belectron\./i, /\blocalStorage\b/i, /\bdocument\.cookie\b/i];
-        for (const regex of critical) if (regex.test(target)) issues.push({ severity: 'critical', message: `发现危险的执行指令: ${regex}` });
-        for (const regex of warning) if (regex.test(target)) issues.push({ severity: 'warning', message: `发现可疑的代码模式: ${regex}` });
-        return issues;
-    }, []);
-
 
     useEffect(() => {
         // 如果已经初始化过，不再用原始数据覆盖 store
@@ -353,15 +364,24 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
                 return;
             }
 
-            // @ts-ignore
-            const pluginsApi = i18n.app.plugins;
+            const pluginsApi = i18n.app.plugins as PluginApi;
             const wasEnabled = pluginsApi.enabledPlugins.has(pluginId);
             const applyAst = i18n.settings.applyAstTranslations !== false;
             const applyRegex = i18n.settings.applyRegexTranslations !== false;
             // @ts-ignore
             const backupBasePath = path.join(basePath, i18n.manifest.dir || '');
 
-            const runProbe = async (probe: { files: Array<{ file: string; code: string }> }) => {
+            const restorePluginState = async () => {
+                if (pluginsApi.enabledPlugins.has(pluginId)) {
+                    await pluginsApi.disablePlugin(pluginId);
+                }
+                if (wasEnabled) {
+                    await pluginsApi.enablePlugin(pluginId);
+                    await waitForPluginLoaded(pluginsApi, pluginId);
+                }
+            };
+
+            const runProbe = async (probe: RuntimeProbeRequest) => {
                 const originals = new Map<string, string | null>();
                 let success = false;
                 let error = '';
@@ -377,7 +397,11 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
                         await pluginsApi.disablePlugin(pluginId);
                     }
                     await pluginsApi.enablePlugin(pluginId);
-                    success = pluginsApi.enabledPlugins.has(pluginId) && !!pluginsApi.plugins[pluginId];
+                    const loadState = await waitForPluginLoaded(pluginsApi, pluginId);
+                    success = loadState.enabled && loadState.loaded;
+                    if (!success) {
+                        error = `插件启用后状态异常：enabled=${loadState.enabled}, loaded=${loadState.loaded}`;
+                    }
                 } catch (e) {
                     success = false;
                     error = String(e);
@@ -391,12 +415,7 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
                         }
                     }
                     try {
-                        if (pluginsApi.enabledPlugins.has(pluginId)) {
-                            await pluginsApi.disablePlugin(pluginId);
-                        }
-                        if (wasEnabled) {
-                            await pluginsApi.enablePlugin(pluginId);
-                        }
+                        await restorePluginState();
                     } catch (restoreError) {
                         console.error('[i18n] Failed to restore plugin state after diagnose probe:', restoreError);
                     }
@@ -441,7 +460,6 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
                 id: item.index,
                 source: item.source,
                 message: item.reason,
-                severity: 'error',
             }));
             setErrorItems(results);
             if (response.status === 'baselineFailed') {
@@ -461,195 +479,6 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
         }
     }, [i18n, notice, t, isDiagnosing, save, setDictData, setCurrentFile]);
 
-    const handleSecurityDiagnose = React.useCallback(async () => {
-        if (isDiagnosing) return;
-        setIsDiagnosing(true);
-        setIsUnusedScan(false);
-        setIsSecurityScan(true);
-        setErrorItems([]);
-        setHasChecked(true);
-
-        try {
-            const { regexItems, astItems } = useRegexStore.getState();
-            const results: DiagnoseError[] = [];
-
-            // 1. 扫描 AST 条目
-            for (const item of astItems) {
-                const target = item.target || '';
-                const issues = validateSecurityText(target);
-                for (const issue of issues) {
-                    results.push({
-                        type: 'ast',
-                        id: item.id as any,
-                        source: target,
-                        severity: issue.severity,
-                        message: issue.message
-                    });
-                }
-            }
-
-            // 2. 扫描 Regex 条目
-            for (const item of regexItems) {
-                const source = item.source || '';
-                const target = item.target || '';
-                const issues = validateSecurityText(target);
-                for (const issue of issues) {
-                    results.push({
-                        type: 'regex',
-                        id: item.id,
-                        source: target,
-                        severity: issue.severity,
-                        message: issue.message
-                    });
-                }
-            }
-
-            setErrorItems(results);
-            if (results.length === 0) {
-                notice.success(t('Editor.Notices.DiagnosisSuccess'));
-            } else {
-                notice.error(t('Editor.Errors.SecurityRiskTotal', { count: results.length }));
-            }
-        } catch (e) {
-            notice.error(t('Common.Status.Failure') + ': ' + e);
-        } finally {
-            setIsDiagnosing(false);
-        }
-    }, [notice, t, isDiagnosing, validateSecurityText]);
-
-    const handleUnusedDiagnose = React.useCallback(async () => {
-        if (isDiagnosing) return;
-        setIsDiagnosing(true);
-        setIsUnusedScan(true);
-        setIsSecurityScan(false);
-        setErrorItems([]);
-        setHasChecked(true);
-
-        try {
-            const { regexItems, astItems, metadata, currentFile, sourceCache, setSourceCache } = useRegexStore.getState();
-            if (!metadata) {
-                notice.error(t('Editor.Errors.NoMetadata'));
-                return;
-            }
-
-            const pluginId = metadata.plugin;
-
-            if (!currentFile || !currentFile.endsWith('.js')) {
-                notice.info(t('Editor.Errors.NotJs'));
-                return;
-            }
-
-            // 获取源代码 (逻辑同 handleDiagnose)
-            const state = i18n.stateManager.getPluginState(pluginId);
-            const isApplied = !!(state && state.isApplied);
-            let originalCode: string | null = sourceCache[currentFile];
-            if (!originalCode) {
-                if (!isApplied) {
-                    try {
-                        // @ts-ignore
-                        const manifest = i18n.app.plugins.manifests[pluginId];
-                        if (manifest) {
-                            // @ts-ignore
-                            const basePath = path.normalize(i18n.app.vault.adapter.getBasePath());
-                            const pluginDir = path.join(basePath, manifest.dir || '');
-                            const targetFilePath = path.join(pluginDir, currentFile);
-                            if (fs.existsSync(targetFilePath)) {
-                                originalCode = fs.readFileSync(targetFilePath, 'utf8');
-                            }
-                        }
-                    } catch (e) { }
-                }
-                if (!originalCode) {
-                    originalCode = await i18n.backupManager.getBackupContent(pluginId, currentFile);
-                }
-                if (originalCode) {
-                    setSourceCache(currentFile, originalCode);
-                }
-            }
-
-            if (!originalCode) {
-                notice.error(t('Editor.Errors.NoBackup'));
-                return;
-            }
-
-            const results: DiagnoseError[] = [];
-            const extracted = await i18n.companionWorkerManager.codeExtract({
-                code: originalCode,
-                settings: getExtractionSettings(),
-            });
-            const hitAst = new Set((extracted.ast || []).flatMap(item => [
-                `${item.type}:${item.name || ''}:${item.source}`,
-                item.source,
-            ]));
-            const hitRegex = new Set((extracted.regex || []).map(item => item.source));
-
-            astItems.forEach(item => {
-                const fingerprint = `${item.type}:${item.name || ''}:${item.source}`;
-                const isHit = hitAst.has(fingerprint) || hitAst.has(item.source) || originalCode.includes(item.source);
-                if (!isHit) {
-                    results.push({
-                        type: 'ast',
-                        id: item.id,
-                        source: item.source,
-                        isUnused: true
-                    });
-                }
-            });
-
-            regexItems.forEach(item => {
-                if (!hitRegex.has(item.source) && !originalCode.includes(item.source)) {
-                    results.push({
-                        type: 'regex',
-                        id: item.id,
-                        source: item.source,
-                        isUnused: true
-                    });
-                }
-            });
-
-            setErrorItems(results);
-            if (results.length === 0) {
-                notice.success(t('Editor.Notices.DiagnosisSuccess'));
-            } else {
-                notice.info(t('Editor.Errors.UnusedTotal', { count: results.length }));
-            }
-        } catch (e) {
-            notice.error(t('Common.Status.Failure') + ': ' + e);
-        } finally {
-            setIsDiagnosing(false);
-        }
-    }, [i18n, notice, t, isDiagnosing, getExtractionSettings]);
-
-    const handleClearDiagnose = React.useCallback(() => {
-        setErrorItems([]);
-        setHasChecked(false);
-        setIsUnusedScan(false);
-    }, []);
-
-    const handleDeleteUnused = React.useCallback(() => {
-        const unusedItems = errorItems.filter(i => i.isUnused);
-        if (unusedItems.length === 0) return;
-
-        if (!confirm(t('Editor.Notices.ConfirmDeleteUnused') || `确认删除这 ${unusedItems.length} 个冗余项吗？`)) return;
-
-        const { astItems, regexItems } = useRegexStore.getState();
-
-        const unusedAstIds = new Set(unusedItems.filter(i => i.type === 'ast').map(i => i.id));
-        const unusedRegexIds = new Set(unusedItems.filter(i => i.type === 'regex').map(i => i.id));
-
-        const newAstItems = astItems.filter(i => !unusedAstIds.has(i.id));
-        const newRegexItems = regexItems.filter(i => !unusedRegexIds.has(i.id));
-
-        // 重新分配 ID 保证连续性
-        setAstItems(newAstItems.map((item, index) => ({ ...item, id: index })));
-        setRegexItems(newRegexItems.map((item, index) => ({ ...item, id: index })));
-
-        setErrorItems([]);
-        setHasChecked(false);
-        setIsUnusedScan(false);
-        notice.success(t('Editor.Notices.SuccessDelete'));
-    }, [errorItems, notice, t, setAstItems, setRegexItems]);
-
     const handleJumpError = React.useCallback((error: DiagnoseError) => {
         setActiveTab(error.type);
         // 通过 CustomEvent 触发表格滚动定位 (由子组件监听)
@@ -657,79 +486,6 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
             detail: { type: error.type, id: error.id }
         }));
     }, []);
-
-    const handleRestoreAllErrors = React.useCallback(() => {
-        if (errorItems.length === 0) return;
-
-        const newAstItems = [...useRegexStore.getState().astItems];
-        const newRegexItems = [...useRegexStore.getState().regexItems];
-
-        errorItems.forEach(error => {
-            if (error.type === 'ast') {
-                const idx = newAstItems.findIndex(i => i.id === error.id);
-                if (idx !== -1) {
-                    newAstItems[idx] = { ...newAstItems[idx], target: newAstItems[idx].source };
-                }
-            } else if (error.type === 'regex') {
-                const idx = newRegexItems.findIndex(i => i.id === error.id);
-                if (idx !== -1) {
-                    newRegexItems[idx] = { ...newRegexItems[idx], target: newRegexItems[idx].source };
-                }
-            }
-        });
-
-        setAstItems(newAstItems);
-        setRegexItems(newRegexItems);
-        setErrorItems([]);
-        setHasChecked(false);
-        notice.success(t('Editor.Notices.SuccessRestore'));
-    }, [errorItems, notice, t, setAstItems, setRegexItems]);
-
-    // AI 修复单条错误项
-    const handleAiFixError = React.useCallback(async (error: DiagnoseError) => {
-        try {
-            // 从 store 中获取当前 target（DiagnoseError 没有 target 字段）
-            const state = useRegexStore.getState();
-            let currentTarget = '';
-            if (error.type === 'ast') {
-                const item = state.astItems.find(i => i.id === error.id);
-                currentTarget = item?.target || error.source;
-            } else {
-                const item = state.regexItems.find(i => i.id === error.id);
-                currentTarget = item?.target || error.source;
-            }
-
-            const provider = createTranslationProvider();
-            const fixedTarget = await provider.fixTranslation(
-                error.source,
-                currentTarget,
-                error.message || '语法错误'
-            );
-
-            // 更新对应的翻译条目
-            if (error.type === 'ast') {
-                const currentAstItems = useRegexStore.getState().astItems;
-                const updated = currentAstItems.map(item =>
-                    item.id === error.id ? { ...item, target: fixedTarget } : item
-                );
-                setAstItems(updated);
-            } else {
-                const currentRegexItems = useRegexStore.getState().regexItems;
-                const updated = currentRegexItems.map(item =>
-                    item.id === error.id ? { ...item, target: fixedTarget } : item
-                );
-                setRegexItems(updated);
-            }
-
-            // 从 errorItems 中移除已修复的项
-            setErrorItems(prev => prev.filter(e => !(e.id === error.id && e.type === error.type)));
-
-            notice.success(t('Editor.Notices.AiFixSuccess'));
-        } catch (err: any) {
-            console.error('[AI Fix] 修复失败:', err);
-            notice.error(`${t('Editor.Errors.AiFixFail')}: ${err.message}`);
-        }
-    }, [notice, t, setAstItems, setRegexItems, setErrorItems]);
 
     // 快捷键: Ctrl + S 保存
     useEffect(() => {
@@ -907,20 +663,12 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
                                     translationEntries={astItems as any}
                                     onOpenFile={handleOpenFile}
                                     onDiagnose={handleDiagnose}
-                                    onUnusedDiagnose={handleUnusedDiagnose}
-                                    onSecurityDiagnose={handleSecurityDiagnose}
-                                    onDeleteUnused={handleDeleteUnused}
-                                    onClearDiagnose={handleClearDiagnose}
-                                    onRestoreAllErrors={handleRestoreAllErrors}
                                     isDiagnosing={isDiagnosing}
-                                    isUnusedScan={isUnusedScan}
-                                    isSecurityScan={isSecurityScan}
                                     errorItems={errorItems}
                                     hasChecked={hasChecked}
                                     setActiveTab={setActiveTab}
                                     isApplied={isApplied}
                                     onJumpError={handleJumpError}
-                                    onAiFixError={handleAiFixError}
                                 />
                             </TabsContent>
                             <TabsContent value="regex" className="flex-1 min-h-0 m-0 overflow-hidden outline-none">
@@ -929,20 +677,12 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
                                     onIncrementalExtract={incrementalExtractRegex}
                                     onOpenFile={handleOpenFile}
                                     onDiagnose={handleDiagnose}
-                                    onUnusedDiagnose={handleUnusedDiagnose}
-                                    onSecurityDiagnose={handleSecurityDiagnose}
-                                    onDeleteUnused={handleDeleteUnused}
-                                    onClearDiagnose={handleClearDiagnose}
-                                    onRestoreAllErrors={handleRestoreAllErrors}
                                     isDiagnosing={isDiagnosing}
-                                    isUnusedScan={isUnusedScan}
-                                    isSecurityScan={isSecurityScan}
                                     errorItems={errorItems}
                                     hasChecked={hasChecked}
                                     setActiveTab={setActiveTab}
                                     isApplied={isApplied}
                                     onJumpError={handleJumpError}
-                                    onAiFixError={handleAiFixError}
                                 />
                             </TabsContent>
                         </div>

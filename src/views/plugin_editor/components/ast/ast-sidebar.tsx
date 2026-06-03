@@ -40,16 +40,8 @@ const AstSidebar = ({
     errorItems,
     hasChecked,
     setActiveTab,
-    onClearDiagnose,
-    onRestoreAllErrors,
-    onUnusedDiagnose,
-    onDeleteUnused,
-    isUnusedScan,
-    isSecurityScan,
-    onSecurityDiagnose,
     isApplied,
-    onJumpError,
-    onAiFixError
+    onJumpError
 }: {
     translationEntries?: any[],
     progress?: number,
@@ -63,20 +55,12 @@ const AstSidebar = ({
     onIncrementalExtract?: () => void,
     onOpenFile?: () => void,
     onDiagnose?: () => void,
-    onUnusedDiagnose?: () => void,
-    onDeleteUnused?: () => void,
-    onClearDiagnose?: () => void,
-    onRestoreAllErrors?: () => void,
     isDiagnosing?: boolean,
-    isUnusedScan?: boolean,
-    isSecurityScan?: boolean,
-    onSecurityDiagnose?: () => void,
     errorItems?: DiagnoseError[],
     hasChecked?: boolean,
     setActiveTab?: (value: string) => void,
     isApplied?: boolean,
-    onJumpError?: (error: DiagnoseError) => void,
-    onAiFixError?: (error: DiagnoseError) => Promise<void>
+    onJumpError?: (error: DiagnoseError) => void
 }) => {
     const { t } = useTranslation();
     // 5. AST Translation Controller (Received via props)
@@ -156,19 +140,11 @@ const AstSidebar = ({
                     )}
                     <DiagnoseCard
                         onDiagnose={onDiagnose!}
-                        onUnusedDiagnose={onUnusedDiagnose}
-                        onSecurityDiagnose={onSecurityDiagnose}
-                        onDeleteUnused={onDeleteUnused}
-                        onClear={onClearDiagnose!}
-                        onRestoreAllErrors={onRestoreAllErrors}
                         isDiagnosing={isDiagnosing!}
-                        isUnusedScan={isUnusedScan}
-                        isSecurityScan={isSecurityScan}
                         errorItems={errorItems || []}
                         hasChecked={hasChecked}
                         setActiveTab={setActiveTab}
                         onJumpError={onJumpError}
-                        onAiFixError={onAiFixError}
                     />
 
                     {showLLM && (
