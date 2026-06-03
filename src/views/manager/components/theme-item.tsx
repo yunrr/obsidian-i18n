@@ -53,6 +53,7 @@ export interface ThemeItemData {
     isApplied: boolean;
     isTranslated: boolean;
     pendingTranslationCount?: number;
+    translatedEntryCount?: number;
     totalTranslationCount?: number;
     translationVersion?: string;
     description?: string;
@@ -78,8 +79,9 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
     const {
         statusColor, statusText, statusDesc, hasTranslation, translationPath,
         themeDir, themeCssPath, themeCssRelativePath, isLegacy, sources, activeSourceId, isApplied,
-        isTranslated, translationVersion, description, supportedVersion, cloudEntries
+        isTranslated, translatedEntryCount, translationVersion, description, supportedVersion, cloudEntries
     } = data;
+    const hasTranslatedEntries = (translatedEntryCount || 0) > 0;
 
     const sourceManager = i18n.sourceManager;
     const [downloadingCloudId, setDownloadingCloudId] = useState<string | null>(null);
@@ -222,7 +224,7 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
 
     const handleReplace = async () => {
         if (replacing) return;
-        if (!isApplied && !isTranslated) {
+        if (!isApplied && !hasTranslatedEntries) {
             setShowEmptyDialog(true);
             return;
         }

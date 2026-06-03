@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { t } from "@/src/locales";
 import { STYLES } from '@/src/constants/llm-options';
 import { SUPPORTED_LANGUAGES } from '@/src/constants/languages';
+import { saveCurrentPluginEditorTranslation } from '../../save-current-translation';
 
 
 export const useRegexTranslation = () => {
@@ -191,6 +192,7 @@ export const useRegexTranslation = () => {
                         updates: { target: res.target }
                     }));
                     updateRegexItems(updates);
+                    await saveCurrentPluginEditorTranslation();
                 },
                 abortControllerRef.current.signal
             );

@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { t } from "@/src/locales";
 import { STYLES } from '~/constants/llm-options';
 import { SUPPORTED_LANGUAGES } from '~/constants/languages';
+import { saveCurrentPluginEditorTranslation } from '../../save-current-translation';
 
 
 export const useAstTranslation = () => {
@@ -191,6 +192,7 @@ export const useAstTranslation = () => {
                         updates: { target: res.target }
                     }));
                     updateAstItems(updates);
+                    await saveCurrentPluginEditorTranslation();
                 },
                 abortControllerRef.current.signal
             );

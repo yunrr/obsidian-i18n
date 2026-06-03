@@ -4564,16 +4564,22 @@ fn save_translation(paths: &PersistencePaths, source_id: &str, content: &Value) 
 }
 
 fn metadata_index(content: &Value) -> Value {
-    let source_matches = |item: &Value| {
+    let is_pending_translation = |item: &Value| {
         let source = item.get("source").and_then(Value::as_str).unwrap_or_default().trim();
         let target = item.get("target").and_then(Value::as_str).unwrap_or_default().trim();
         target.is_empty() || target == source
     };
+    let is_translated_entry = |item: &Value| {
+        let source = item.get("source").and_then(Value::as_str).unwrap_or_default().trim();
+        let target = item.get("target").and_then(Value::as_str).unwrap_or_default().trim();
+        !target.is_empty() && target != source
+    };
 
-    let (format_valid, total_count, pending_count) = if let Some(dict) = content.get("dict") {
+    let (format_valid, total_count, pending_count, translated_count) = if let Some(dict) = content.get("dict") {
         if let Some(plugin_dict) = dict.as_object() {
             let mut total = 0u64;
             let mut pending = 0u64;
+            let mut translated = 0u64;
             let mut valid = content.get("schemaVersion").is_some() && content.get("metadata").is_some();
             for group in plugin_dict.values() {
                 let ast = group.get("ast").and_then(Value::as_array);
@@ -4583,22 +4589,26 @@ fn metadata_index(content: &Value) -> Value {
                 }
                 for item in ast.into_iter().flatten().chain(regex.into_iter().flatten()) {
                     total += 1;
-                    if source_matches(item) {
+                    if is_pending_translation(item) {
                         pending += 1;
+                    }
+                    if is_translated_entry(item) {
+                        translated += 1;
                     }
                 }
             }
-            (valid, total, pending)
+            (valid, total, pending, translated)
         } else if let Some(theme_items) = dict.as_array() {
             let total = theme_items.len() as u64;
-            let pending = theme_items.iter().filter(|item| source_matches(item)).count() as u64;
+            let pending = theme_items.iter().filter(|item| is_pending_translation(item)).count() as u64;
+            let translated = theme_items.iter().filter(|item| is_translated_entry(item)).count() as u64;
             let valid = content.get("schemaVersion").is_some() && content.get("metadata").is_some();
-            (valid, total, pending)
+            (valid, total, pending, translated)
         } else {
-            (false, 0, 0)
+            (false, 0, 0, 0)
         }
     } else {
-        (false, 0, 0)
+        (false, 0, 0, 0)
     };
 
     json!({
@@ -4608,9 +4618,10 @@ fn metadata_index(content: &Value) -> Value {
         "description": content.pointer("/metadata/description").and_then(Value::as_str).unwrap_or_default(),
         "totalTranslationCount": total_count,
         "pendingTranslationCount": pending_count,
-        "processedTranslationCount": total_count.saturating_sub(pending_count),
-        "unprocessedTranslationCount": pending_count,
-        "translationProcessingComplete": format_valid && pending_count == 0,
+        "translatedEntryCount": translated_count,
+        "processedTranslationCount": 0,
+        "unprocessedTranslationCount": total_count,
+        "translationProcessingComplete": false,
         "translationFormatValid": format_valid,
         "metadataIndexedAt": now_ms(),
     })
@@ -4744,7 +4755,7 @@ fn source_index_blocking(state: &AppState, payload: SourceManagerPayload) -> Res
                 skipped_count += 1;
                 continue;
             };
-            merge_metadata_index(source, &content, false);
+            merge_metadata_index(source, &content, true);
             source["sourceFileExists"] = json!(true);
             source["sourceFileMtime"] = json!(source_file_mtime);
             merge_source_install_state(source, &installed_plugins, &installed_themes);
@@ -5267,6 +5278,59 @@ async fn update_source_processing_state(
         write_json_pretty(&paths.meta_path, &meta)?;
     }
     Ok(())
+}
+
+async fn update_retry_source_processing_state(
+    state: &AppState,
+    paths: &PersistencePaths,
+    scope: &str,
+    source_id: &str,
+) -> Result<SourceProcessingState> {
+    let _guard = state.persistence_lock.lock().await;
+    let record = load_record(paths);
+    let remaining_failures = record
+        .get("failures")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let unprocessed_count = remaining_failures
+        .iter()
+        .filter(|failure| {
+            failure.get("scope").and_then(Value::as_str) == Some(scope)
+                && failure.get("sourceId").and_then(Value::as_str) == Some(source_id)
+        })
+        .flat_map(|failure| {
+            failure
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        })
+        .count() as u64;
+
+    let mut meta = load_meta(paths);
+    let Some(source) = meta.pointer_mut(&format!("/sources/{source_id}")) else {
+        return Ok(SourceProcessingState {
+            complete: false,
+            processed_count: 0,
+            unprocessed_count,
+        });
+    };
+    let total_count = source
+        .get("totalTranslationCount")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let processing_state = SourceProcessingState {
+        complete: total_count > 0 && unprocessed_count == 0,
+        processed_count: total_count.saturating_sub(unprocessed_count),
+        unprocessed_count,
+    };
+    source["processedTranslationCount"] = json!(processing_state.processed_count);
+    source["unprocessedTranslationCount"] = json!(processing_state.unprocessed_count);
+    source["translationProcessingComplete"] = json!(processing_state.complete);
+    source["updatedAt"] = json!(now_ms());
+    write_json_pretty(&paths.meta_path, &meta)?;
+    Ok(processing_state)
 }
 
 fn build_failure_record(scope: &str, failure: CompanionBatchFailure) -> BatchTaskFailureRecord {
@@ -5797,6 +5861,7 @@ async fn process_batch_translate_window(
     is_plugin: bool,
 ) -> Result<()> {
     let mut failed_items_in_window = 0usize;
+    let mut stop_error: Option<anyhow::Error> = None;
 
     if is_plugin {
         touch_progress(task, json!({ "currentLabel": "AST" })).await;
@@ -5810,28 +5875,34 @@ async fn process_batch_translate_window(
         .await?;
         failed_items_in_window += packed_report_failed_item_count(&ast_report);
         apply_packed_translation_report(&mut resource_states, ast_report, "ast", true);
-        stop_if_batch_translate_failures_exceed_limit(
+        if let Err(error) = stop_if_batch_translate_failures_exceed_limit(
             failed_items_in_window,
             &batch.config,
             "AST",
-        )?;
+        ) {
+            stop_error = Some(error);
+        }
 
-        touch_progress(task, json!({ "currentLabel": "Regex" })).await;
-        let regex_report = translate_packed_batches(
-            &regex_items,
-            &batch.config.prompts.regex,
-            &batch.config,
-            |item| json!({ "i": item["id"], "s": item["source"] }),
-            Some(task.clone()),
-        )
-        .await?;
-        failed_items_in_window += packed_report_failed_item_count(&regex_report);
-        apply_packed_translation_report(&mut resource_states, regex_report, "regex", true);
-        stop_if_batch_translate_failures_exceed_limit(
-            failed_items_in_window,
-            &batch.config,
-            "Regex",
-        )?;
+        if stop_error.is_none() {
+            touch_progress(task, json!({ "currentLabel": "Regex" })).await;
+            let regex_report = translate_packed_batches(
+                &regex_items,
+                &batch.config.prompts.regex,
+                &batch.config,
+                |item| json!({ "i": item["id"], "s": item["source"] }),
+                Some(task.clone()),
+            )
+            .await?;
+            failed_items_in_window += packed_report_failed_item_count(&regex_report);
+            apply_packed_translation_report(&mut resource_states, regex_report, "regex", true);
+            if let Err(error) = stop_if_batch_translate_failures_exceed_limit(
+                failed_items_in_window,
+                &batch.config,
+                "Regex",
+            ) {
+                stop_error = Some(error);
+            }
+        }
     } else {
         touch_progress(task, json!({ "currentLabel": "Theme" })).await;
         let theme_report = translate_packed_batches(
@@ -5844,11 +5915,13 @@ async fn process_batch_translate_window(
         .await?;
         failed_items_in_window += packed_report_failed_item_count(&theme_report);
         apply_packed_translation_report(&mut resource_states, theme_report, "theme", false);
-        stop_if_batch_translate_failures_exceed_limit(
+        if let Err(error) = stop_if_batch_translate_failures_exceed_limit(
             failed_items_in_window,
             &batch.config,
             "Theme",
-        )?;
+        ) {
+            stop_error = Some(error);
+        }
     }
 
     for resource_state in resource_states {
@@ -5893,6 +5966,10 @@ async fn process_batch_translate_window(
         )
         .await?;
         bump_source_revision(task).await;
+    }
+
+    if let Some(error) = stop_error {
+        return Err(error);
     }
 
     Ok(())
@@ -7509,6 +7586,7 @@ async fn handle_failure_retry(
                     remove_completed_retry_items_from_record(record, scope, &completed_items);
             })
             .await?;
+            update_retry_source_processing_state(state, &paths, scope, &first.source_id).await?;
             for failure_id in &completed_failure_ids {
                 failed_retry_ids.remove(failure_id);
             }
@@ -7643,6 +7721,436 @@ mod tests {
         assert!(!should_stop_batch_translate_for_failures(499, 100, 5));
         assert!(should_stop_batch_translate_for_failures(500, 100, 5));
         assert!(should_stop_batch_translate_for_failures(1, 0, 0));
+    }
+
+    #[test]
+    fn metadata_index_separates_translated_entries_from_processing_progress() {
+        let index = metadata_index(&json!({
+            "schemaVersion": 1,
+            "metadata": { "version": "1.0.0" },
+            "dict": [
+                { "source": "A", "target": "甲" },
+                { "source": "B", "target": "B" },
+                { "source": "C", "target": "" }
+            ]
+        }));
+
+        assert_eq!(index.get("translatedEntryCount").and_then(Value::as_u64), Some(1));
+        assert_eq!(index.get("pendingTranslationCount").and_then(Value::as_u64), Some(2));
+        assert_eq!(index.get("processedTranslationCount").and_then(Value::as_u64), Some(0));
+        assert_eq!(
+            index
+                .get("translationProcessingComplete")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_processing_state_counts_ai_completed_items_even_when_target_matches_source() {
+        let base_path = env::temp_dir().join(format!("i18n-retry-state-{}", nanoid!()));
+        let paths = paths(base_path.to_str().unwrap());
+        write_json_pretty(
+            &paths.meta_path,
+            &json!({
+                "schemaVersion": 2,
+                "sources": {
+                    "source-a": {
+                        "id": "source-a",
+                        "plugin": "plugin-a",
+                        "type": "plugin",
+                        "totalTranslationCount": 2,
+                        "processedTranslationCount": 1,
+                        "unprocessedTranslationCount": 1,
+                        "translationProcessingComplete": false
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        write_json_pretty(
+            &paths.batch_task_record_path,
+            &json!({
+                "schemaVersion": 1,
+                "checkpoints": {},
+                "failures": [],
+                "successBatches": [],
+                "updatedAt": 0
+            }),
+        )
+        .unwrap();
+        let state = AppState {
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            persistence_lock: Arc::new(Mutex::new(())),
+            plugin_dir: base_path.clone(),
+            http: reqwest::Client::new(),
+            shutdown: Arc::new(Mutex::new(None)),
+        };
+
+        let processing_state =
+            update_retry_source_processing_state(&state, &paths, "plugin", "source-a")
+                .await
+                .unwrap();
+
+        assert!(processing_state.complete);
+        assert_eq!(processing_state.processed_count, 2);
+        assert_eq!(processing_state.unprocessed_count, 0);
+        let meta = load_meta(&paths);
+        let source = meta.pointer("/sources/source-a").unwrap();
+        assert_eq!(
+            source
+                .get("processedTranslationCount")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            source
+                .get("translationProcessingComplete")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_translate_writes_successful_plugin_items_to_source_file() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _request = read_test_http_request(&mut stream).await;
+            let body = json!({
+                "choices": [{
+                    "message": { "content": "{\"items\":[{\"i\":0,\"t\":\"你好\"}]}" },
+                    "finish_reason": "stop"
+                }]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+
+        let base_path = env::temp_dir().join(format!("i18n-batch-translate-write-{}", nanoid!()));
+        let paths = paths(base_path.to_str().unwrap());
+        let source_id = "source-a";
+        let translation_json = json!({
+            "schemaVersion": 1,
+            "metadata": {
+                "plugin": "plugin-a",
+                "title": "Plugin A",
+                "version": "1.0.0",
+                "supportedVersions": "1.0.0",
+                "language": "zh-cn"
+            },
+            "dict": {
+                "main.js": {
+                    "ast": [],
+                    "regex": [
+                        { "source": "Hello", "target": "Hello" }
+                    ]
+                }
+            }
+        });
+        write_json_pretty(
+            &paths.meta_path,
+            &json!({
+                "schemaVersion": 2,
+                "sources": {
+                    source_id: {
+                        "id": source_id,
+                        "plugin": "plugin-a",
+                        "title": "Plugin A",
+                        "type": "plugin",
+                        "origin": "local",
+                        "isActive": true,
+                        "checksum": "",
+                        "translationVersion": "1.0.0",
+                        "translationFormatValid": true,
+                        "totalTranslationCount": 1,
+                        "pendingTranslationCount": 1,
+                        "translatedEntryCount": 0,
+                        "processedTranslationCount": 0,
+                        "unprocessedTranslationCount": 1,
+                        "translationProcessingComplete": false,
+                        "createdAt": 1,
+                        "updatedAt": 1
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        save_translation(&paths, source_id, &translation_json).unwrap();
+
+        let state = AppState {
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            persistence_lock: Arc::new(Mutex::new(())),
+            plugin_dir: base_path.clone(),
+            http: reqwest::Client::new(),
+            shutdown: Arc::new(Mutex::new(None)),
+        };
+        let task = Arc::new(TaskRuntime {
+            progress: Mutex::new(CompanionTaskProgress {
+                task_id: "task".to_string(),
+                scope: "plugin".to_string(),
+                mode: "translate".to_string(),
+                status: "running".to_string(),
+                current_label: String::new(),
+                processed_resources: 0,
+                total_resources: 1,
+                processed_items: 0,
+                total_items: 1,
+                success_count: 0,
+                failed_count: 0,
+                skipped_count: 0,
+                source_revision: 0,
+                record_revision: 0,
+                updated_at: 0,
+                error: None,
+            }),
+            cancel_requested: Mutex::new(false),
+        });
+        let batch = PluginBatchTranslatePayload {
+            persistence: PersistenceConfig {
+                base_path: base_path.to_string_lossy().to_string(),
+            },
+            resources: vec![CompanionBatchResource {
+                resource_id: "plugin-a".to_string(),
+                label: "Plugin A".to_string(),
+                source_id: Some(source_id.to_string()),
+            }],
+            config: CompanionTranslationConfig {
+                chat_completions_url: format!("http://{addr}/v1/chat/completions"),
+                api_key: "test-key".to_string(),
+                model: "test-model".to_string(),
+                timeout_ms: 5_000,
+                response_format: "json_object".to_string(),
+                batch_size: 1,
+                overwrite_existing_translations: false,
+                concurrency: 1,
+                prompts: PromptConfig {
+                    ast: String::new(),
+                    regex: String::new(),
+                    theme: String::new(),
+                },
+            },
+            checkpoint_key: "plugin:translate".to_string(),
+            concurrency: 1,
+            completed_resources: None,
+            processed_items: None,
+            total_items: Some(1),
+        };
+
+        handle_batch_translate(&state, task.clone(), batch, true)
+            .await
+            .unwrap();
+
+        let saved = read_translation(&paths, source_id).unwrap();
+        assert_eq!(
+            saved.pointer("/dict/main.js/regex/0/target").and_then(Value::as_str),
+            Some("你好")
+        );
+        let meta = load_meta(&paths);
+        let source = meta.pointer("/sources/source-a").unwrap();
+        assert_eq!(
+            source.get("translatedEntryCount").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            source.get("processedTranslationCount").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            source.get("unprocessedTranslationCount").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            source
+                .get("translationProcessingComplete")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let progress = task.progress.lock().await.clone();
+        assert_eq!(progress.processed_resources, 1);
+        assert_eq!(progress.processed_items, 1);
+        assert_eq!(progress.success_count, 1);
+        let _ = fs::remove_dir_all(base_path);
+    }
+
+    #[tokio::test]
+    async fn batch_translate_persists_partial_success_before_failure_threshold_stops_task() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let request = read_test_http_request(&mut stream).await;
+                    let id = request_item_id(&request);
+                    let content = if id == 0 {
+                        "{\"items\":[{\"i\":0,\"t\":\"你好\"}]}"
+                    } else {
+                        "{\"items\":[{\"i\":1,\"t\":\"\"}]}"
+                    };
+                    let body = json!({
+                        "choices": [{
+                            "message": { "content": content },
+                            "finish_reason": "stop"
+                        }]
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let base_path = env::temp_dir().join(format!("i18n-batch-translate-threshold-{}", nanoid!()));
+        let paths = paths(base_path.to_str().unwrap());
+        let source_id = "source-a";
+        let translation_json = json!({
+            "schemaVersion": 1,
+            "metadata": {
+                "plugin": "plugin-a",
+                "title": "Plugin A",
+                "version": "1.0.0",
+                "supportedVersions": "1.0.0",
+                "language": "zh-cn"
+            },
+            "dict": {
+                "main.js": {
+                    "ast": [],
+                    "regex": [
+                        { "source": "Hello", "target": "Hello" },
+                        { "source": "World", "target": "World" }
+                    ]
+                }
+            }
+        });
+        write_json_pretty(
+            &paths.meta_path,
+            &json!({
+                "schemaVersion": 2,
+                "sources": {
+                    source_id: {
+                        "id": source_id,
+                        "plugin": "plugin-a",
+                        "title": "Plugin A",
+                        "type": "plugin",
+                        "origin": "local",
+                        "isActive": true,
+                        "checksum": "",
+                        "translationVersion": "1.0.0",
+                        "translationFormatValid": true,
+                        "totalTranslationCount": 2,
+                        "pendingTranslationCount": 2,
+                        "translatedEntryCount": 0,
+                        "processedTranslationCount": 0,
+                        "unprocessedTranslationCount": 2,
+                        "translationProcessingComplete": false,
+                        "createdAt": 1,
+                        "updatedAt": 1
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        save_translation(&paths, source_id, &translation_json).unwrap();
+
+        let state = AppState {
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            persistence_lock: Arc::new(Mutex::new(())),
+            plugin_dir: base_path.clone(),
+            http: reqwest::Client::new(),
+            shutdown: Arc::new(Mutex::new(None)),
+        };
+        let task = Arc::new(TaskRuntime {
+            progress: Mutex::new(CompanionTaskProgress {
+                task_id: "task".to_string(),
+                scope: "plugin".to_string(),
+                mode: "translate".to_string(),
+                status: "running".to_string(),
+                current_label: String::new(),
+                processed_resources: 0,
+                total_resources: 1,
+                processed_items: 0,
+                total_items: 2,
+                success_count: 0,
+                failed_count: 0,
+                skipped_count: 0,
+                source_revision: 0,
+                record_revision: 0,
+                updated_at: 0,
+                error: None,
+            }),
+            cancel_requested: Mutex::new(false),
+        });
+        let batch = PluginBatchTranslatePayload {
+            persistence: PersistenceConfig {
+                base_path: base_path.to_string_lossy().to_string(),
+            },
+            resources: vec![CompanionBatchResource {
+                resource_id: "plugin-a".to_string(),
+                label: "Plugin A".to_string(),
+                source_id: Some(source_id.to_string()),
+            }],
+            config: CompanionTranslationConfig {
+                chat_completions_url: format!("http://{addr}/v1/chat/completions"),
+                api_key: "test-key".to_string(),
+                model: "test-model".to_string(),
+                timeout_ms: 5_000,
+                response_format: "json_object".to_string(),
+                batch_size: 1,
+                overwrite_existing_translations: false,
+                concurrency: 1,
+                prompts: PromptConfig {
+                    ast: String::new(),
+                    regex: String::new(),
+                    theme: String::new(),
+                },
+            },
+            checkpoint_key: "plugin:translate".to_string(),
+            concurrency: 1,
+            completed_resources: None,
+            processed_items: None,
+            total_items: Some(2),
+        };
+
+        let result = handle_batch_translate(&state, task.clone(), batch, true).await;
+
+        assert!(result.is_err());
+        let saved = read_translation(&paths, source_id).unwrap();
+        assert_eq!(
+            saved.pointer("/dict/main.js/regex/0/target").and_then(Value::as_str),
+            Some("你好")
+        );
+        let meta = load_meta(&paths);
+        let source = meta.pointer("/sources/source-a").unwrap();
+        assert_eq!(
+            source.get("translatedEntryCount").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            source.get("processedTranslationCount").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            source.get("unprocessedTranslationCount").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            source
+                .get("translationProcessingComplete")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        let _ = fs::remove_dir_all(base_path);
     }
 
     #[test]

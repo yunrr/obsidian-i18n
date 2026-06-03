@@ -5,7 +5,6 @@ import * as fs from 'fs-extra';
 import { ItemView, WorkspaceLeaf } from 'obsidian';
 import { Root } from 'react-dom/client';
 
-import { ThemeTranslationV1, ThemeTranslationSchemaVersion } from 'src/types';
 import I18N from "src/main";
 
 import {
@@ -18,7 +17,6 @@ import { useThemeTranslation } from './components/use-theme-translation';
 
 import { useGlobalStoreInstance } from '~/utils/store/global';
 import { mountReactView } from '~/utils/core/react';
-import { saveTranslationFile } from '@/src/manager/io-manager';
 import { t as gt } from 'src/locales';
 import { getEffectiveExtractionSettings } from '@/src/utils/translator/config';
 
@@ -27,6 +25,7 @@ import { ThemeTranslationItem } from './types';
 import { ThemeTable } from './components/theme-table';
 import { ThemeMetadataCard } from './components/theme-metadata-card';
 import { ThemeSidebar } from './components/theme-sidebar';
+import { saveCurrentThemeEditorTranslation } from './save-current-translation';
 
 // ====================================================================================================
 // ====================================================================================================
@@ -167,55 +166,12 @@ const ReactThemeEditor: React.FC = () => {
         savingRef.current = true;
         setIsSaving(true);
         try {
-            const { items, metadata, translationPath } = useThemeEditorStore.getState();
+            const { translationPath } = useThemeEditorStore.getState();
             const globalState = useGlobalStoreInstance.getState();
             const i18n = globalState.i18n;
 
-            // 由于现在需要保存为结构化的数组，我们可以剔除掉内部使用的自增 id 后直接保存
-            const cleanDict = items.map(item => ({
-                type: item.type || 'unknown',
-                source: item.source,
-                target: item.target
-            }));
-
-            const themeJson: ThemeTranslationV1 = {
-                schemaVersion: ThemeTranslationSchemaVersion.V1,
-                metadata: metadata || {
-                    theme: themeName || '',
-                    language: 'zh-cn',
-                    version: i18n.settings.translationVersion || '1.0.1',
-                    supportedVersions: '0.0.0',
-                    title: themeName || '',
-                    description: '',
-                    author: i18n.settings.author || ''
-                },
-                dict: cleanDict,
-            };
-
             if (translationPath) {
-                saveTranslationFile(translationPath, themeJson);
-                // 更新 GlobalStore 中的缓存
-                useGlobalStoreInstance.setState({ editorThemeTranslation: themeJson });
-
-                // 同步更新 meta.json (SourceManager)
-                if (i18n?.sourceManager) {
-                    try {
-                        const ext = path.extname(translationPath);
-                        const baseName = path.basename(translationPath, ext);
-                        const source = i18n.sourceManager.getSource(baseName);
-                        if (source) {
-                            if (source.origin === 'cloud') {
-                                source.origin = 'local';
-                                source.cloud = undefined;
-                            }
-                            i18n.sourceManager.saveSource(source, { skipFileIndex: true });
-                            void i18n.sourceManager.batchIndexSourceMetadata([source.id]);
-                        }
-                    } catch (err) {
-                        console.error("Failed to update meta.json", err);
-                    }
-                }
-
+                await saveCurrentThemeEditorTranslation();
                 notice.successPrefix(t('Editor.Titles.Main'), t('Common.Notices.SaveSuccess'));
             } else {
                 notice.errorPrefix(t('Editor.Titles.Main'), t('Editor.Errors.SavePathMissing'));

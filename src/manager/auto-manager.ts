@@ -273,11 +273,7 @@ export class AutoManager {
                         store.updateTaskStatus(installed.id, 'skipped', t('Manager.Auto.Status.SkipReasons.NoVersion'));
                     }
                 } catch (pluginError: any) {
-                    if (pluginError.message === 'ROLLBACK_TRIGGERED') {
-                        store.updateTaskStatus(installed.id, 'error', t('Manager.Status.AutoRollbacked'));
-                    } else {
-                        store.updateTaskStatus(installed.id, 'error', pluginError.message || 'Unknown Error');
-                    }
+                    store.updateTaskStatus(installed.id, 'error', pluginError.message || 'Unknown Error');
                     errorCount++;
                 }
             }

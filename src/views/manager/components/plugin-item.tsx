@@ -54,6 +54,7 @@ export interface PluginItemData {
     isApplied: boolean;
     isTranslated: boolean;
     pendingTranslationCount?: number;
+    translatedEntryCount?: number;
     totalTranslationCount?: number;
     translationVersion?: string;
     supportedVersion?: string;
@@ -82,8 +83,9 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
     const {
         statusColor, statusText, statusDesc, isLangDoc, langDoc, pluginDir,
         sources, activeSourceId, translationFormatMark, mainDoc, manifestDoc, isApplied,
-        isTranslated, translationVersion, supportedVersion, cloudEntries
+        isTranslated, translatedEntryCount, translationVersion, supportedVersion, cloudEntries
     } = data;
+    const hasTranslatedEntries = (translatedEntryCount || 0) > 0;
 
     const sourceManager = i18n.sourceManager;
     const [downloadingCloudId, setDownloadingCloudId] = useState<string | null>(null);
@@ -235,7 +237,7 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
 
     const handleReplace = async () => {
         if (replacing) return;
-        if (!isApplied && !isTranslated) {
+        if (!isApplied && !hasTranslatedEntries) {
             setShowEmptyDialog(true);
             return;
         }
@@ -258,54 +260,20 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
                 pluginVersion: plugin.version,
                 translationVersion: result.translationVersion || translationVersion || '0.0.0',
             });
-            const previousEnabledState = isEnabled;
-            let loadFailed = false;
-
-            try {
-                // @ts-ignore
-                if (i18n.app.plugins.enabledPlugins.has(plugin.id)) {
+            if (isEnabled) {
+                try {
                     // @ts-ignore
-                    await i18n.app.plugins.disablePlugin(plugin.id);
-                }
-                // @ts-ignore
-                await i18n.app.plugins.enablePlugin(plugin.id);
-
-                // @ts-ignore
-                if (!i18n.app.plugins.plugins[plugin.id]) {
-                    loadFailed = true;
-                }
-            } catch (error) {
-                console.warn("[i18n 安全防护] 插件试运行失败:", error);
-                loadFailed = true;
-            }
-
-            if (loadFailed) {
-                i18n.notice.error(t('Manager.Plugins.Errors.LoadFailedAfterApply') || '译文导致核心逻辑损坏，已触发安全拦截并自动回滚。');
-
-                // 开始强效回滚到未翻译初始状态
-                await i18n.backupManager.restoreBackup(plugin.id, pluginDir);
-                i18n.stateManager.deletePluginState(plugin.id);
-
-                // 恢复它原本的状态
-                if (previousEnabledState) {
+                    if (i18n.app.plugins.enabledPlugins.has(plugin.id)) {
+                        // @ts-ignore
+                        await i18n.app.plugins.disablePlugin(plugin.id);
+                    }
                     // @ts-ignore
                     await i18n.app.plugins.enablePlugin(plugin.id);
-                } else {
-                    // @ts-ignore
-                    await i18n.app.plugins.disablePlugin(plugin.id);
+                    i18n.notice.successPrefix(t('Manager.Plugins.Notices.ReloadSuccess') || '插件重载成功', plugin.id);
+                } catch (error) {
+                    console.warn('[i18n] Plugin reload failed after apply:', error);
+                    i18n.notice.warning(`${t('Manager.Plugins.Errors.LoadFailedAfterApply') || '插件重载失败，译文已写入，请手动检查插件状态。'} ${String(error)}`);
                 }
-
-                refreshParent();
-                return; // 终止后续流程
-            }
-
-            // 试运行成功，如果是原本关闭的，我们要给它关回去
-            if (!previousEnabledState) {
-                // @ts-ignore
-                await i18n.app.plugins.disablePlugin(plugin.id);
-            } else {
-                // 成功重载后的轻提示（保持之前调 reloadPlugin 时的体验）
-                i18n.notice.successPrefix(t('Manager.Plugins.Notices.ReloadSuccess') || '插件重载成功', plugin.id);
             }
             refreshParent();
         } catch (error) {

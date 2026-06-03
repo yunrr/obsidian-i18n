@@ -116,27 +116,35 @@ export class SourceManager {
         this.sourceVersionIndex = index;
     }
 
-    private getMetadataIndex(content: any): Pick<TranslationSource, 'translationVersion' | 'supportedVersions' | 'language' | 'description' | 'totalTranslationCount' | 'pendingTranslationCount' | 'processedTranslationCount' | 'unprocessedTranslationCount' | 'translationProcessingComplete' | 'translationFormatValid' | 'metadataIndexedAt'> {
+    private getMetadataIndex(content: any): Pick<TranslationSource, 'translationVersion' | 'supportedVersions' | 'language' | 'description' | 'totalTranslationCount' | 'pendingTranslationCount' | 'translatedEntryCount' | 'processedTranslationCount' | 'unprocessedTranslationCount' | 'translationProcessingComplete' | 'translationFormatValid' | 'metadataIndexedAt'> {
         const metadata = content?.metadata || {};
-        const sourceMatches = (item: any) => {
+        const isPendingTranslation = (item: any) => {
             const source = String(item?.source || '').trim();
             const target = String(item?.target || '').trim();
             return target === '' || target === source;
         };
+        const isTranslatedEntry = (item: any) => {
+            const source = String(item?.source || '').trim();
+            const target = String(item?.target || '').trim();
+            return target !== '' && target !== source;
+        };
         let totalTranslationCount = 0;
         let pendingTranslationCount = 0;
+        let translatedEntryCount = 0;
         let translationFormatValid = !!(content && content.schemaVersion !== undefined && content.metadata && content.dict);
 
         if (content?.dict && typeof content.dict === 'object') {
             if (Array.isArray(content.dict)) {
                 totalTranslationCount = content.dict.length;
-                pendingTranslationCount = content.dict.filter(sourceMatches).length;
+                pendingTranslationCount = content.dict.filter(isPendingTranslation).length;
+                translatedEntryCount = content.dict.filter(isTranslatedEntry).length;
             } else {
                 for (const group of Object.values(content.dict) as any[]) {
                     if (!Array.isArray(group?.ast) || !Array.isArray(group?.regex)) translationFormatValid = false;
                     const items = [...(Array.isArray(group?.ast) ? group.ast : []), ...(Array.isArray(group?.regex) ? group.regex : [])];
                     totalTranslationCount += items.length;
-                    pendingTranslationCount += items.filter(sourceMatches).length;
+                    pendingTranslationCount += items.filter(isPendingTranslation).length;
+                    translatedEntryCount += items.filter(isTranslatedEntry).length;
                 }
             }
         } else {
@@ -150,9 +158,10 @@ export class SourceManager {
             description: metadata.description ? String(metadata.description) : '',
             totalTranslationCount,
             pendingTranslationCount,
-            processedTranslationCount: Math.max(0, totalTranslationCount - pendingTranslationCount),
-            unprocessedTranslationCount: pendingTranslationCount,
-            translationProcessingComplete: translationFormatValid && pendingTranslationCount === 0,
+            translatedEntryCount,
+            processedTranslationCount: 0,
+            unprocessedTranslationCount: totalTranslationCount,
+            translationProcessingComplete: false,
             translationFormatValid,
             metadataIndexedAt: Date.now(),
         };
@@ -271,7 +280,7 @@ export class SourceManager {
             .filter(source => {
                 if (type && source.type !== type) return false;
                 if (!source.metadataIndexedAt) return true;
-                if (source.totalTranslationCount === undefined || source.pendingTranslationCount === undefined || source.translationFormatValid === undefined) return true;
+                if (source.totalTranslationCount === undefined || source.pendingTranslationCount === undefined || source.translatedEntryCount === undefined || source.translationFormatValid === undefined) return true;
                 if (source.processedTranslationCount === undefined || source.unprocessedTranslationCount === undefined || source.translationProcessingComplete === undefined) return true;
                 if (source.sourceFileExists === undefined || source.sourceFileMtime === undefined) return true;
                 if (source.isInstalled === undefined) return true;
@@ -515,10 +524,8 @@ export class SourceManager {
         saveTranslationFile(filePath, content);
         const source = this.meta.sources[sourceId];
         if (source) {
-            const index = this.getMetadataIndex(content);
             this.meta.sources[sourceId] = {
-                ...source,
-                ...index,
+                ...this.mergeMetadataIndex(source, content, { preserveProcessingState: true }),
                 checksum: calculateChecksum(content),
                 sourceFileExists: true,
                 sourceFileMtime: this.getSourceFileMtime(sourceId),
@@ -554,7 +561,7 @@ export class SourceManager {
         const content = this.readSourceFile(sourceId);
         if (!content?.metadata) return false;
         this.meta.sources[sourceId] = {
-            ...this.mergeMetadataIndex(source, content),
+            ...this.mergeMetadataIndex(source, content, { preserveProcessingState: true }),
             sourceFileExists: true,
             sourceFileMtime: this.getSourceFileMtime(sourceId),
         };
@@ -580,7 +587,7 @@ export class SourceManager {
             const content = this.readSourceFile(sourceId);
             if (!content?.metadata) continue;
             this.meta.sources[sourceId] = {
-                ...this.mergeMetadataIndex(source, content),
+                ...this.mergeMetadataIndex(source, content, { preserveProcessingState: true }),
                 sourceFileExists: true,
                 sourceFileMtime: this.getSourceFileMtime(sourceId),
             };

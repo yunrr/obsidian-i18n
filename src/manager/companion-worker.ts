@@ -542,8 +542,10 @@ async function handlePluginTranslate(payload: CompanionPluginTranslatePayload, t
     const runAiRequest = task ? <TResult>(operation: () => Promise<TResult>) => runTaskAiRequest(task, operation) : undefined;
     let processedItems = 0;
     let nextId = 0;
+    let totalItems = 0;
 
     for (const [file, dict] of Object.entries(translationJson.dict || {})) {
+        totalItems += dict.ast.length + dict.regex.length;
         dict.ast.forEach((item, index) => {
             if (!shouldTranslateText(item.target, item.source, payload.config.overwriteExistingTranslations)) return;
             const id = nextId++;
@@ -630,7 +632,7 @@ async function handlePluginTranslate(payload: CompanionPluginTranslatePayload, t
         ),
     ]);
 
-    return { translationJson, processedItems, failures };
+    return { translationJson, processedItems, failures, totalItems };
 }
 
 async function handleThemeTranslate(payload: CompanionThemeTranslatePayload, task?: CompanionTaskRuntime): Promise<CompanionThemeTranslateResult> {
@@ -638,6 +640,7 @@ async function handleThemeTranslate(payload: CompanionThemeTranslatePayload, tas
     const failures: CompanionBatchFailure[] = [];
     const runAiRequest = task ? <TResult>(operation: () => Promise<TResult>) => runTaskAiRequest(task, operation) : undefined;
     let processedItems = 0;
+    const totalItems = translationJson.dict.length;
 
     const items: ThemeTranslationItem[] = translationJson.dict
         .map((item, index) => ({ id: index, type: item.type, source: item.source, target: item.target }))
@@ -675,7 +678,7 @@ async function handleThemeTranslate(payload: CompanionThemeTranslatePayload, tas
         runAiRequest,
     );
 
-    return { translationJson, processedItems, failures };
+    return { translationJson, processedItems, failures, totalItems };
 }
 
 async function handlePluginRetry(payload: CompanionPluginRetryPayload, task?: CompanionTaskRuntime): Promise<CompanionPluginRetryResult> {
@@ -1000,27 +1003,35 @@ async function readTranslationFile<T>(paths: WorkerPersistencePaths, sourceId: s
     }
 }
 
-function getTranslationMetadataIndex(content: any): Pick<TranslationSource, 'translationVersion' | 'supportedVersions' | 'language' | 'description' | 'totalTranslationCount' | 'pendingTranslationCount' | 'processedTranslationCount' | 'unprocessedTranslationCount' | 'translationProcessingComplete' | 'translationFormatValid' | 'metadataIndexedAt'> {
+function getTranslationMetadataIndex(content: any): Pick<TranslationSource, 'translationVersion' | 'supportedVersions' | 'language' | 'description' | 'totalTranslationCount' | 'pendingTranslationCount' | 'translatedEntryCount' | 'processedTranslationCount' | 'unprocessedTranslationCount' | 'translationProcessingComplete' | 'translationFormatValid' | 'metadataIndexedAt'> {
     const metadata = content?.metadata || {};
-    const sourceMatches = (item: any) => {
+    const isPendingTranslation = (item: any) => {
         const source = String(item?.source || '').trim();
         const target = String(item?.target || '').trim();
         return target === '' || target === source;
     };
+    const isTranslatedEntry = (item: any) => {
+        const source = String(item?.source || '').trim();
+        const target = String(item?.target || '').trim();
+        return target !== '' && target !== source;
+    };
     let totalTranslationCount = 0;
     let pendingTranslationCount = 0;
+    let translatedEntryCount = 0;
     let translationFormatValid = !!(content && content.schemaVersion !== undefined && content.metadata && content.dict);
 
     if (content?.dict && typeof content.dict === 'object') {
         if (Array.isArray(content.dict)) {
             totalTranslationCount = content.dict.length;
-            pendingTranslationCount = content.dict.filter(sourceMatches).length;
+            pendingTranslationCount = content.dict.filter(isPendingTranslation).length;
+            translatedEntryCount = content.dict.filter(isTranslatedEntry).length;
         } else {
             for (const group of Object.values(content.dict) as any[]) {
                 if (!Array.isArray(group?.ast) || !Array.isArray(group?.regex)) translationFormatValid = false;
                 const items = [...(Array.isArray(group?.ast) ? group.ast : []), ...(Array.isArray(group?.regex) ? group.regex : [])];
                 totalTranslationCount += items.length;
-                pendingTranslationCount += items.filter(sourceMatches).length;
+                pendingTranslationCount += items.filter(isPendingTranslation).length;
+                translatedEntryCount += items.filter(isTranslatedEntry).length;
             }
         }
     } else {
@@ -1034,22 +1045,12 @@ function getTranslationMetadataIndex(content: any): Pick<TranslationSource, 'tra
         description: metadata.description ? String(metadata.description) : '',
         totalTranslationCount,
         pendingTranslationCount,
-        processedTranslationCount: Math.max(0, totalTranslationCount - pendingTranslationCount),
-        unprocessedTranslationCount: pendingTranslationCount,
-        translationProcessingComplete: translationFormatValid && pendingTranslationCount === 0,
+        translatedEntryCount,
+        processedTranslationCount: 0,
+        unprocessedTranslationCount: totalTranslationCount,
+        translationProcessingComplete: false,
         translationFormatValid,
         metadataIndexedAt: Date.now(),
-    };
-}
-
-function getTranslationMetadataSummary(content: any): Pick<TranslationSource, 'translationVersion' | 'supportedVersions' | 'language' | 'description' | 'translationFormatValid'> {
-    const metadata = content?.metadata || {};
-    return {
-        translationVersion: metadata.version ? String(metadata.version) : '',
-        supportedVersions: metadata.supportedVersions ? String(metadata.supportedVersions) : '',
-        language: metadata.language ? String(metadata.language) : '',
-        description: metadata.description ? String(metadata.description) : '',
-        translationFormatValid: !!(content && content.schemaVersion !== undefined && content.metadata && content.dict),
     };
 }
 
@@ -1096,7 +1097,7 @@ async function saveExtractedSource(paths: WorkerPersistencePaths, pluginId: stri
             origin: 'local',
             isActive: true,
             checksum: calculateChecksum(content),
-            ...getTranslationMetadataSummary(content),
+            ...getTranslationMetadataIndex(content),
             sourceFileExists: true,
             sourceFileMtime: await getTranslationSourceFileMtime(paths, sourceId),
             createdAt: now,
@@ -1128,6 +1129,38 @@ async function saveTranslatedSource(paths: WorkerPersistencePaths, sourceId: str
             await saveMeta(paths, meta);
         }
     });
+}
+
+async function updateSourceProcessingState(
+    paths: WorkerPersistencePaths,
+    sourceId: string,
+    processedTranslationCount: number,
+    unprocessedTranslationCount: number,
+    translationProcessingComplete: boolean,
+) {
+    await withPersistenceLock(async () => {
+        const meta = await loadMeta(paths);
+        const source = meta.sources[sourceId];
+        if (!source) return;
+        meta.sources[sourceId] = {
+            ...source,
+            processedTranslationCount,
+            unprocessedTranslationCount,
+            translationProcessingComplete,
+            updatedAt: Date.now(),
+        };
+        await saveMeta(paths, meta);
+    });
+}
+
+function getProcessingStateFromTranslationResult(result: CompanionPluginTranslateResult | CompanionThemeTranslateResult) {
+    const failedItems = result.failures.reduce((sum, failure) => sum + failure.items.length, 0);
+    const unprocessedTranslationCount = Math.max(0, failedItems);
+    return {
+        processedTranslationCount: Math.max(0, result.totalItems - unprocessedTranslationCount),
+        unprocessedTranslationCount,
+        translationProcessingComplete: result.failures.length === 0 && unprocessedTranslationCount === 0,
+    };
 }
 
 function buildFailureRecord(scope: BatchTaskScope, failure: CompanionBatchFailure): BatchTaskFailureRecord {
@@ -1618,6 +1651,14 @@ async function handlePluginBatchTranslate(task: CompanionTaskRuntime, payload: C
                     }, task);
                     await saveTranslatedSource(paths, sourceId, result.translationJson);
                     await replaceFailuresForSource(paths, 'plugin', sourceId, result.failures);
+                    const processingState = getProcessingStateFromTranslationResult(result);
+                    await updateSourceProcessingState(
+                        paths,
+                        sourceId,
+                        processingState.processedTranslationCount,
+                        processingState.unprocessedTranslationCount,
+                        processingState.translationProcessingComplete,
+                    );
                     task.progress.processedItems += result.processedItems;
                     if (result.failures.length === 0) {
                         task.progress.successCount++;
@@ -1671,6 +1712,14 @@ async function handleThemeBatchTranslate(task: CompanionTaskRuntime, payload: Co
                     }, task);
                     await saveTranslatedSource(paths, sourceId, result.translationJson);
                     await replaceFailuresForSource(paths, 'theme', sourceId, result.failures);
+                    const processingState = getProcessingStateFromTranslationResult(result);
+                    await updateSourceProcessingState(
+                        paths,
+                        sourceId,
+                        processingState.processedTranslationCount,
+                        processingState.unprocessedTranslationCount,
+                        processingState.translationProcessingComplete,
+                    );
                     task.progress.processedItems += result.processedItems;
                     if (result.failures.length === 0) {
                         task.progress.successCount++;

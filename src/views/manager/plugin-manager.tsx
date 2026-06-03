@@ -69,6 +69,7 @@ interface PluginBatchResource {
     label: string;
     sourceId?: string | null;
     pendingTranslationCount?: number;
+    translatedEntryCount?: number;
     unprocessedTranslationCount?: number;
     totalTranslationCount?: number;
 }
@@ -98,6 +99,9 @@ const getUnprocessedTranslationCount = (source: Pick<PluginBatchResource, 'pendi
     return typeof source.unprocessedTranslationCount === 'number'
         ? source.unprocessedTranslationCount
         : source.pendingTranslationCount || 0;
+};
+const getTranslatedEntryCount = (source: Pick<PluginBatchResource, 'translatedEntryCount'> | null | undefined) => {
+    return typeof source?.translatedEntryCount === 'number' ? source.translatedEntryCount : 0;
 };
 const isTranslationProcessingComplete = (source: any) => {
     if (!source) return false;
@@ -381,6 +385,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             const activeSource = activeSourceId ? i18n.sourceManager.getSource(activeSourceId) : null;
             const translationFormatMark = isLangDoc ? activeSource?.translationFormatValid !== false : true;
             const pendingTranslationCount = activeSource?.pendingTranslationCount || 0;
+            const translatedEntryCount = getTranslatedEntryCount(activeSource);
             const totalTranslationCount = activeSource?.totalTranslationCount || 0;
             const hasTranslationCounts = typeof activeSource?.pendingTranslationCount === 'number' && typeof activeSource?.totalTranslationCount === 'number';
             const isTranslated = !!(isLangDoc && activeSourceId && translationFormatMark && hasTranslationCounts && isTranslationProcessingComplete(activeSource));
@@ -438,6 +443,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                 isApplied: !!(state && state.isApplied),
                 isTranslated,
                 pendingTranslationCount,
+                translatedEntryCount,
                 totalTranslationCount,
                 translationVersion,
                 supportedVersion,

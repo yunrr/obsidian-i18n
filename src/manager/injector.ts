@@ -108,40 +108,19 @@ export class InjectorManager {
                 translationVersion: result.translationVersion || '0.0.0'
             });
 
-            // 7. 重启插件与健康检查
+            // 7. 如果插件当前启用，尝试重启以加载已写入的译文；重启失败不回滚已应用文件。
             // @ts-ignore
             const wasEnabled = this.i18n.app.plugins.enabledPlugins.has(plugin.id);
             if (wasEnabled) {
-                // @ts-ignore
-                await this.i18n.app.plugins.disablePlugin(plugin.id);
-
                 try {
                     // @ts-ignore
-                    await this.i18n.app.plugins.enablePlugin(plugin.id);
-
-                    // 二次验证：检查插件是否真的起来了且被系统记录为开启
+                    await this.i18n.app.plugins.disablePlugin(plugin.id);
                     // @ts-ignore
-                    if (!this.i18n.app.plugins.enabledPlugins.has(plugin.id)) {
-                        throw new Error('Plugin failed to load after injection (not in enabledPlugins list)');
-                    }
+                    await this.i18n.app.plugins.enablePlugin(plugin.id);
                     console.log(`[i18n] Successfully injected and reloaded: ${pluginId}`);
                 } catch (loadError) {
-                    console.warn(`[i18n] Health check failed for ${pluginId}, triggering automatic rollback...`);
-
-                    // 立即还原备份
-                    await this.i18n.backupManager.restoreBackup(plugin.id, pluginDir);
-
-                    // 尝试重启原始版本
-                    try {
-                        // @ts-ignore
-                        await this.i18n.app.plugins.enablePlugin(plugin.id);
-                        this.i18n.notice.warning(t('Manager.Common.Notices.RollbackSuccess', { id: pluginId }));
-                    } catch (restoreError) {
-                        console.error(`[i18n] Even restore failed for ${pluginId}`, restoreError);
-                    }
-
-                    // 向外抛出特定错误，以便 UI 或 AutoManager 能标识为已回退状态
-                    throw new Error('ROLLBACK_TRIGGERED');
+                    console.warn(`[i18n] Reload failed after applying translation to ${pluginId}; keeping written files.`, loadError);
+                    this.i18n.notice.warning(`${t('Manager.Plugins.Errors.LoadFailedAfterApply') || '插件重载失败，译文已写入，请手动检查插件状态。'} ${String(loadError)}`);
                 }
             } else {
                 console.log(`[i18n] Injected but plugin is disabled: ${pluginId}`);
@@ -149,9 +128,6 @@ export class InjectorManager {
 
             return true;
         } catch (error) {
-            if (error.message === 'ROLLBACK_TRIGGERED') {
-                throw error; // 向上抛出，以便 AutoManager 捕获并显示回退状态
-            }
             console.error(`[i18n] Failed to inject translation to ${pluginId}:`, error);
             return false;
         }

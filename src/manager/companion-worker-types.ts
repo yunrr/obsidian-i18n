@@ -321,6 +321,7 @@ export interface CompanionThemeTranslatePayload extends CompanionThemeTranslateR
 export interface CompanionTranslateResult<TContent> {
     translationJson: TContent;
     processedItems: number;
+    totalItems: number;
     failures: CompanionBatchFailure[];
 }
 

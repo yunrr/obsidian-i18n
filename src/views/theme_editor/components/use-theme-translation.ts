@@ -7,6 +7,7 @@ import { t } from "@/src/locales";
 import { STYLES } from '~/constants/llm-options';
 import { SUPPORTED_LANGUAGES } from '~/constants/languages';
 import { ThemeTranslationItem } from '../types';
+import { saveCurrentThemeEditorTranslation } from '../save-current-translation';
 
 export const useThemeTranslation = () => {
     const {
@@ -191,6 +192,7 @@ export const useThemeTranslation = () => {
                         target: res.target
                     }));
                     updateItems(updates);
+                    await saveCurrentThemeEditorTranslation();
                 },
                 abortControllerRef.current.signal
             );

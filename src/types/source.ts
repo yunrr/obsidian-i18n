@@ -23,9 +23,10 @@ export interface TranslationSource {
     description?: string;          // 本地索引：metadata.description
     totalTranslationCount?: number; // 本地索引：总翻译条目数
     pendingTranslationCount?: number; // 本地索引：未翻译条目数（target 为空或等于 source）
-    processedTranslationCount?: number; // 本地索引：已处理条目数（包含 AI 判断无需翻译并保持原文的条目）
-    unprocessedTranslationCount?: number; // 本地索引：尚未经过翻译处理的条目数
-    translationProcessingComplete?: boolean; // 本地索引：翻译处理是否完成
+    translatedEntryCount?: number;  // 本地索引：实际有译文条目数（target 非空且不同于 source）
+    processedTranslationCount?: number; // AI 处理进度：已成功返回/处理条目数
+    unprocessedTranslationCount?: number; // AI 处理进度：尚未成功返回/处理条目数
+    translationProcessingComplete?: boolean; // AI 处理进度：是否所有条目都已成功返回/处理
     translationFormatValid?: boolean; // 本地索引：译文格式是否有效
     sourceFileMtime?: number;      // 本地索引：翻译文件更新时间
     sourceFileExists?: boolean;    // 本地索引：翻译文件是否存在

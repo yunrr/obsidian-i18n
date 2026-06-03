@@ -4,7 +4,7 @@ import * as fs from 'fs-extra';
 import { ItemView, WorkspaceLeaf } from 'obsidian';
 import { Root } from 'react-dom/client';
 
-import { PluginTranslationV1, PluginTranslationV1Regex } from 'src/types';
+import { PluginTranslationV1Regex } from 'src/types';
 import I18N from "src/main";
 
 import { Button, Tabs, TabsContent, TabsList, TabsTrigger, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, Input, Label, DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger, Card, Badge, ResizablePanelGroup, ResizablePanel, ResizableHandle, ScrollArea } from '~/shadcn';
@@ -17,9 +17,8 @@ import { RegexEditor, AstEditor } from '.';
 import { useGlobalStoreInstance } from '~/utils/store/global';
 import { mountReactView } from '~/utils/core/react';
 import { StringPicker } from '~/utils/ui/string-picker';
-import { calculateChecksum, mergeAstItems, mergeRegexItems } from '@/src/utils/translator/light';
+import { mergeAstItems, mergeRegexItems } from '@/src/utils/translator/light';
 import { getEffectiveExtractionSettings } from '@/src/utils/translator/config';
-import { saveTranslationFile } from '@/src/manager/io-manager';
 import { createTranslationProvider } from '~/ai/provider-factory';
 
 import { useTranslation } from 'react-i18next';
@@ -31,6 +30,7 @@ import { MetadataCard } from './components/common/metadata-card';
 import { AstSidebar } from './components/ast/ast-sidebar';
 import { RegexSidebar } from './components/regex/regex-sidebar';
 import { TemplateCard } from './components/common/template-card';
+import { saveCurrentPluginEditorTranslation } from './save-current-translation';
 
 // ====================================================================================================
 // 子组件 & 辅助功能
@@ -195,50 +195,14 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
         savingRef.current = true;
         setIsSaving(true);
         try {
-            // Direct store access to avoid dependency tracking in useCallback
-            const { regexItems, astItems, metadata, currentFile, syncFileDictInfo } = useRegexStore.getState();
-            syncFileDictInfo(currentFile, astItems, regexItems);
-
-            const finalDictData = useRegexStore.getState().dictData;
-
             const globalState = useGlobalStoreInstance.getState();
-            const pluginTranslation = globalState.editorPluginTranslation;
             const pluginTranslationPath = globalState.editorPluginTranslationPath;
             const i18n = globalState.i18n;
             const notice = i18n.notice;
 
-            const newPluginTranslation = JSON.parse(JSON.stringify(pluginTranslation)) as PluginTranslationV1;
-            newPluginTranslation.dict = JSON.parse(JSON.stringify(finalDictData));
-            if (metadata) { newPluginTranslation.metadata = { ...metadata }; }
-
             try {
                 if (pluginTranslationPath) {
-                    saveTranslationFile(pluginTranslationPath, newPluginTranslation);
-
-                    useGlobalStoreInstance.setState({ editorPluginTranslation: newPluginTranslation });
-
-                    // 同步更新 meta.json (SourceManager)
-                    if (i18n && i18n.sourceManager) {
-                        try {
-                            const ext = path.extname(pluginTranslationPath);
-                            const baseName = path.basename(pluginTranslationPath, ext);
-                            const source = i18n.sourceManager.getSource(baseName);
-
-                            if (source && metadata) {
-                                if (metadata.title) source.title = metadata.title;
-                                source.checksum = calculateChecksum(newPluginTranslation);
-                                // 编辑过的云端翻译自动转为本地来源
-                                if (source.origin === 'cloud') {
-                                    source.origin = 'local';
-                                    source.cloud = undefined;
-                                }
-                                i18n.sourceManager.saveSource(source, { skipFileIndex: true });
-                                void i18n.sourceManager.batchIndexSourceMetadata([source.id]);
-                            }
-                        } catch (err) {
-                            console.error("Failed to update meta.json", err);
-                        }
-                    }
+                    await saveCurrentPluginEditorTranslation();
 
                     if (!silent) {
                         notice.successPrefix(loggerPrefix, t("Common.Notices.SaveSuccess"));
