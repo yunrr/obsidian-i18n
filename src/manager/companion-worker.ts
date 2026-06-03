@@ -158,13 +158,30 @@ function proxy(payload: CompanionProxyRequest): Promise<CompanionProxyResponse> 
     });
 }
 
-function splitIntoBatches<T>(items: T[], batchSize: number): T[][] {
+function splitIntoBatches<T extends { source?: string }>(items: T[], batchSize: number, batchCharLimit = 0): T[][] {
     const size = Number.isFinite(batchSize) ? Math.max(1, Math.floor(batchSize)) : 1;
+    const charLimit = Number.isFinite(batchCharLimit) ? Math.max(0, Math.floor(batchCharLimit)) : 0;
     const batches: T[][] = [];
     for (let index = 0; index < items.length; index += size) {
-        batches.push(items.slice(index, index + size));
+        splitBatchByCharacterLimit(items.slice(index, index + size), charLimit, batches);
     }
     return batches;
+}
+
+function splitBatchByCharacterLimit<T extends { source?: string }>(batch: T[], charLimit: number, output: T[][]) {
+    if (batch.length === 0) return;
+    if (charLimit <= 0 || batch.length === 1 || getBatchSourceCharacterCount(batch) <= charLimit) {
+        output.push(batch);
+        return;
+    }
+
+    const mid = Math.ceil(batch.length / 2);
+    splitBatchByCharacterLimit(batch.slice(0, mid), charLimit, output);
+    splitBatchByCharacterLimit(batch.slice(mid), charLimit, output);
+}
+
+function getBatchSourceCharacterCount<T extends { source?: string }>(batch: T[]) {
+    return batch.reduce((sum, item) => sum + Array.from(String(item.source || '')).length, 0);
 }
 
 async function runConcurrent<T>(items: T[], limit: number, worker: (item: T, index: number) => Promise<void>) {
@@ -339,7 +356,7 @@ async function translateBatches<T extends { id: number; source: string; target: 
 ) {
     if (items.length === 0) return;
 
-    const batches = splitIntoBatches(items, config.batchSize);
+    const batches = splitIntoBatches(items, config.batchSize, config.batchCharLimit);
     await runConcurrent(batches, Math.max(1, Math.floor(config.concurrency || 1)), async batch => {
         try {
             const simplified = simplify(batch);
@@ -452,6 +469,8 @@ async function handlePluginApplyTranslation(payload: CompanionPluginApplyTransla
         const dict = translationJson.dict || {};
         const files = Object.keys(dict);
         await createWorkerBackup(payload.backupBasePath, payload.pluginId, payload.pluginDir, files);
+        const applyAst = payload.applyAst !== false;
+        const applyRegex = payload.applyRegex !== false;
 
         let processedFiles = 0;
         for (const file of files) {
@@ -462,12 +481,12 @@ async function handlePluginApplyTranslation(payload: CompanionPluginApplyTransla
                 || await fs.readFile(targetFilePath, 'utf8');
             const fileDict = dict[file];
 
-            if (fileDict?.ast?.length) {
+            if (applyAst && fileDict?.ast?.length) {
                 const astTranslator = new AstTranslator({} as any);
                 const ast = astTranslator.loadCode(fileString);
                 if (ast) fileString = astTranslator.translate(ast, fileDict.ast as any);
             }
-            if (fileDict?.regex?.length) {
+            if (applyRegex && fileDict?.regex?.length) {
                 const regexTranslator = new RegexTranslator({} as any);
                 fileString = regexTranslator.translate(fileString, fileDict.regex as any);
             }

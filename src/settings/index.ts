@@ -5,6 +5,7 @@ import I18nBasis from './ui/i18n-basis';
 import I18nModIMT from './ui/i18n-mode-imt';
 import I18nLLM from './ui/i18n-llm';
 import I18nLLMGeneric from './ui/i18n-llm-generic';
+import I18nExtractTranslate from './ui/i18n-extract-translate';
 import I18nRE from './ui/i18n-re';
 import I18nAST from './ui/i18n-ast';
 import I18nShare from './ui/i18n-mode-share';
@@ -81,6 +82,7 @@ class I18nSettingTab extends PluginSettingTab {
             { id: 'ast', text: t('Settings.Tabs.Ast'), icon: 'code-2', content: () => this.astDisplay() },
             { id: 'immersive', text: t('Settings.Tabs.Immersive'), icon: 'languages', content: () => this.imtDisplay() },
             { id: 'ai', text: t('Settings.Tabs.Ai'), icon: 'sparkles', content: () => this.llmDisplay() },
+            { id: 'extract-translate', text: t('Settings.Tabs.ExtractTranslate'), icon: 'list-filter', content: () => this.extractTranslateDisplay() },
             { id: 'share', text: t('Settings.Tabs.Share'), icon: 'share-2', content: () => this.shareDisplay() },
         ];
 
@@ -151,6 +153,7 @@ class I18nSettingTab extends PluginSettingTab {
     shareDisplay() { this.contentEl.empty(); new I18nShare(this).display(); }
     reDisplay() { this.contentEl.empty(); new I18nRE(this).display(); }
     astDisplay() { this.contentEl.empty(); new I18nAST(this).display(); }
+    extractTranslateDisplay() { this.contentEl.empty(); new I18nExtractTranslate(this).display(); }
 }
 
 export { I18nSettingTab };

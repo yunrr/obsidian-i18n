@@ -76,10 +76,14 @@ export interface I18nSettings {
     llmLanguage: string;            // LLM 翻译的目标语言
     llmStyle: string;               // LLM 翻译的风格类型
     llmBatchSize: number;           // LLM 批量翻译每批文本条数
+    llmBatchCharLimit: number;      // LLM 批量翻译每批源文本字符上限，0 为不限制
+    llmBatchWindowMultiplier: number; // 批量翻译窗口倍数
     llmOverwriteExistingTranslations: boolean; // 批量翻译是否覆盖现有译文
     llmConcurrencyLimit: number;    // LLM 并发请求限制数
     batchExtractConcurrency: number; // 管理器批量提取资源并发数
     batchTranslateConcurrency: number; // 管理器批量翻译资源并发数
+    applyAstTranslations: boolean;  // 应用插件译文时是否替换 AST 条目
+    applyRegexTranslations: boolean; // 应用插件译文时是否替换 Regex 条目
     llmTimeout: number;             // LLM 请求超时时间 (毫秒)
     llmCompanionWorkerEnabled: boolean; // 是否使用本地伴生进程转发 OpenAI 兼容请求
     llmCompanionWorkerPort: number;  // 本地伴生进程监听端口
@@ -306,10 +310,14 @@ export const DEFAULT_SETTINGS: I18nSettings = {
     llmLanguage: '简体中文',        // LLM 的默认生成语言
     llmStyle: '无',                 // LLM 的默认生成风格
     llmBatchSize: 10,               // 默认每批 10 条
+    llmBatchCharLimit: 0,           // 默认不限制批次字符数
+    llmBatchWindowMultiplier: 4,    // 默认窗口为 4 倍请求并发数的批次
     llmOverwriteExistingTranslations: false, // 默认不覆盖已有译文
     llmConcurrencyLimit: 3,         // 默认 LLM 请求并发限制为 3
     batchExtractConcurrency: 3,     // 默认批量提取资源并发为 3
     batchTranslateConcurrency: 2,   // 默认批量翻译资源并发为 2
+    applyAstTranslations: true,
+    applyRegexTranslations: true,
     llmTimeout: 60000,              // 默认超时为 60 秒
     llmCompanionWorkerEnabled: true,
     llmCompanionWorkerPort: 18743,

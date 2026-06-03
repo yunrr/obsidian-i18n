@@ -52,6 +52,17 @@ export default class I18nRE extends BaseSetting {
             );
 
         new Setting(containerEl)
+            .setName(t('Settings.Re.ApplyTitle'))
+            .setDesc(t('Settings.Re.ApplyDesc'))
+            .addToggle(toggle => toggle
+                .setValue(this.settings.applyRegexTranslations !== false)
+                .onChange(async (value) => {
+                    this.settings.applyRegexTranslations = value;
+                    await this.i18n.saveSettings();
+                })
+            );
+
+        new Setting(containerEl)
             .setName(t('Settings.Re.ProfileSelectTitle'))
             .setDesc(t('Settings.Re.ProfileSelectDesc'))
             .addDropdown(dropdown => {

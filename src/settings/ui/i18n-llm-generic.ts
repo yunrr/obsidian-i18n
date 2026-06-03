@@ -6,8 +6,6 @@ import { DiagnosticModal } from "./diagnostic-modal";
 import { LLM_PROVIDERS, LLMProviderConfig } from "../../ai/constants";
 import { I18nSettings, LLMProfile } from "../data";
 import { OllamaTranslationService, OLLAMA_DEFAULT_URL } from "src/ai/ollama-translation-service";
-import { SUPPORTED_LANGUAGES } from "src/constants/languages";
-import { STYLES } from "src/constants/llm-options";
 
 export default class I18nLLMGeneric extends BaseSetting {
     private config: LLMProviderConfig;
@@ -20,9 +18,7 @@ export default class I18nLLMGeneric extends BaseSetting {
 
         this.profileUI();
         this.configUI();
-        this.translationOptionsUI();
         this.companionWorkerUI();
-        this.batchConcurrencyUI();
 
         // 允许所有模型显式或者兜底式自选返回格式
         this.openaiSpecialUI();
@@ -258,98 +254,6 @@ export default class I18nLLMGeneric extends BaseSetting {
 
     }
 
-    private translationOptionsUI(): void {
-        new Setting(this.containerEl).setName(t('Settings.Ai.TranslateOptionsHeader')).setHeading();
-
-        new Setting(this.containerEl)
-            .setName(t('Settings.Ai.LanguageTitle'))
-            .setDesc(t('Settings.Ai.LanguageDesc'))
-            .addDropdown(dropdown => {
-                dropdown.addOption('', t('Settings.Ai.LanguageCustomOption'));
-                SUPPORTED_LANGUAGES.forEach(language => dropdown.addOption(language.label, language.label));
-                dropdown.setValue(SUPPORTED_LANGUAGES.some(language => language.label === this.settings.llmLanguage) ? this.settings.llmLanguage : '');
-                dropdown.onChange(async (value) => {
-                    if (!value) return;
-                    this.settings.llmLanguage = value;
-                    await this.i18n.saveSettings();
-                    this.settingTab.llmDisplay();
-                });
-            })
-            .addText(text => {
-                text.setValue(this.settings.llmLanguage || '')
-                    .setPlaceholder(t('Settings.Ai.LanguagePlaceholder'))
-                    .onChange(async (value) => {
-                        this.settings.llmLanguage = value.trim();
-                        await this.i18n.saveSettings();
-                    });
-            });
-
-        new Setting(this.containerEl)
-            .setName(t('Settings.Ai.StyleTitle'))
-            .setDesc(t('Settings.Ai.StyleDesc'))
-            .addDropdown(dropdown => {
-                dropdown.addOption('', t('Settings.Ai.StyleCustomOption'));
-                STYLES.forEach(style => dropdown.addOption(style.value, style.label));
-                dropdown.setValue(STYLES.some(style => style.value === this.settings.llmStyle) ? this.settings.llmStyle : '');
-                dropdown.onChange(async (value) => {
-                    if (!value) return;
-                    this.settings.llmStyle = value;
-                    await this.i18n.saveSettings();
-                    this.settingTab.llmDisplay();
-                });
-            })
-            .addText(text => {
-                text.setValue(this.settings.llmStyle || '')
-                    .setPlaceholder(t('Settings.Ai.StylePlaceholder'))
-                    .onChange(async (value) => {
-                        this.settings.llmStyle = value.trim();
-                        await this.i18n.saveSettings();
-                    });
-            });
-
-        new Setting(this.containerEl)
-            .setName(t('Settings.Ai.BatchSizeTitle'))
-            .setDesc(t('Settings.Ai.BatchSizeDesc'))
-            .addText(text => {
-                text.setValue(String(this.settings.llmBatchSize || 10))
-                    .onChange(async (value) => {
-                        const parsed = Number.parseInt(value, 10);
-                        if (!Number.isFinite(parsed) || parsed <= 0) return;
-                        this.settings.llmBatchSize = Math.floor(parsed);
-                        await this.i18n.saveSettings();
-                    });
-                text.inputEl.type = 'number';
-                text.inputEl.min = '1';
-            });
-
-        new Setting(this.containerEl)
-            .setName(t('Settings.Ai.OverwriteExistingTranslationsTitle'))
-            .setDesc(t('Settings.Ai.OverwriteExistingTranslationsDesc'))
-            .addToggle(toggle => {
-                toggle.setValue(this.settings.llmOverwriteExistingTranslations === true)
-                    .onChange(async (value) => {
-                        this.settings.llmOverwriteExistingTranslations = value;
-                        await this.i18n.saveSettings();
-                    });
-            });
-
-        new Setting(this.containerEl)
-            .setName(t('Settings.Ai.TimeoutTitle'))
-            .setDesc(t('Settings.Ai.TimeoutDesc'))
-            .addText(text => {
-                text.setValue(String(this.settings.llmTimeout || 60000))
-                    .onChange(async (value) => {
-                        const parsed = Number.parseInt(value, 10);
-                        if (!Number.isFinite(parsed) || parsed <= 0) return;
-                        this.settings.llmTimeout = Math.floor(parsed);
-                        await this.i18n.saveSettings();
-                    });
-                text.inputEl.type = 'number';
-                text.inputEl.min = '100';
-                text.inputEl.step = '1000';
-            });
-    }
-
     private companionWorkerUI(): void {
         if (this.config.engine !== 'openai') return;
 
@@ -394,55 +298,6 @@ export default class I18nLLMGeneric extends BaseSetting {
                         this.i18n.companionWorkerManager?.stop();
                         await this.i18n.saveSettings();
                     });
-            });
-    }
-
-    private batchConcurrencyUI(): void {
-        new Setting(this.containerEl).setName(t('Settings.Ai.BatchConcurrencyHeader')).setHeading();
-
-        const parseLimit = (value: string, fallback: number) => {
-            const parsed = Number.parseInt(value, 10);
-            return Number.isFinite(parsed) ? Math.max(1, parsed) : fallback;
-        };
-
-        new Setting(this.containerEl)
-            .setName(t('Settings.Ai.BatchExtractConcurrencyTitle'))
-            .setDesc(t('Settings.Ai.BatchExtractConcurrencyDesc'))
-            .addText(text => {
-                text.setValue(String(this.settings.batchExtractConcurrency || 3))
-                    .onChange(async (value) => {
-                        this.settings.batchExtractConcurrency = parseLimit(value, 3);
-                        await this.i18n.saveSettings();
-                    });
-                text.inputEl.type = 'number';
-                text.inputEl.min = '1';
-            });
-
-        new Setting(this.containerEl)
-            .setName('中文资源跳过策略')
-            .setDesc('控制批量提取时如何识别并跳过已是中文的插件或主题。')
-            .addDropdown(dropdown => dropdown
-                .addOption('none', '不跳过，所有资源一律提取')
-                .addOption('source', '检查名称/简介和源文件中文')
-                .addOption('extracted', '检查名称/简介和提取条目中文')
-                .setValue(this.settings.chineseSkipMode || 'source')
-                .onChange(async (value: 'none' | 'source' | 'extracted') => {
-                    this.settings.chineseSkipMode = value;
-                    await this.i18n.saveSettings();
-                })
-            );
-
-        new Setting(this.containerEl)
-            .setName(t('Settings.Ai.LlmConcurrencyTitle'))
-            .setDesc(t('Settings.Ai.LlmConcurrencyDesc'))
-            .addText(text => {
-                text.setValue(String(this.settings.llmConcurrencyLimit || 3))
-                    .onChange(async (value) => {
-                        this.settings.llmConcurrencyLimit = parseLimit(value, 3);
-                        await this.i18n.saveSettings();
-                    });
-                text.inputEl.type = 'number';
-                text.inputEl.min = '1';
             });
     }
 

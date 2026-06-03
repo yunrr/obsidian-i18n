@@ -42,7 +42,7 @@ const EXTRACT_CHECKPOINT_EVERY_RESOURCES: usize = 100;
 const EXTRACT_CHECKPOINT_EVERY_MS: u64 = 10_000;
 const MAX_EXTRACT_CPU_CONCURRENCY: usize = 32;
 const CLOUD_BACKUP_CHUNK_SIZE: usize = 20;
-const TRANSLATE_WINDOW_BATCH_MULTIPLIER: usize = 4;
+const DEFAULT_TRANSLATE_WINDOW_BATCH_MULTIPLIER: usize = 4;
 
 #[derive(Clone)]
 struct AppState {
@@ -103,6 +103,10 @@ struct PluginApplyTranslationPayload {
     persistence: Option<PersistenceConfig>,
     #[serde(default)]
     translation_source_id: Option<String>,
+    #[serde(default)]
+    apply_ast: Option<bool>,
+    #[serde(default)]
+    apply_regex: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,6 +301,10 @@ struct CompanionTranslationConfig {
     timeout_ms: u64,
     response_format: String,
     batch_size: usize,
+    #[serde(default)]
+    batch_char_limit: usize,
+    #[serde(default = "default_translate_window_batch_multiplier")]
+    batch_window_multiplier: usize,
     #[serde(default)]
     overwrite_existing_translations: bool,
     concurrency: usize,
@@ -3799,6 +3807,8 @@ fn apply_plugin_translation_blocking(payload: PluginApplyTranslationPayload) -> 
         .ok_or_else(|| anyhow!("translationJson.dict missing"))?;
     let files = dict.keys().cloned().collect::<Vec<_>>();
     create_plugin_backup(&payload.backup_base_path, &payload.plugin_id, &payload.plugin_dir, &files, false)?;
+    let apply_ast = payload.apply_ast.unwrap_or(true);
+    let apply_regex = payload.apply_regex.unwrap_or(true);
 
     let mut processed_files = 0usize;
     for (file, file_dict) in dict {
@@ -3809,14 +3819,18 @@ fn apply_plugin_translation_blocking(payload: PluginApplyTranslationPayload) -> 
         let mut file_string = read_backup_content(&payload.backup_base_path, &payload.plugin_id, file)?
             .unwrap_or_else(|| fs::read_to_string(&target_file_path).unwrap_or_default());
 
-        if let Some(ast) = file_dict.get("ast").and_then(Value::as_array) {
-            if !ast.is_empty() {
-                file_string = replace_ast_items_swc(&file_string, ast)?;
+        if apply_ast {
+            if let Some(ast) = file_dict.get("ast").and_then(Value::as_array) {
+                if !ast.is_empty() {
+                    file_string = replace_ast_items_swc(&file_string, ast)?;
+                }
             }
         }
-        if let Some(regex) = file_dict.get("regex").and_then(Value::as_array) {
-            if !regex.is_empty() {
-                file_string = apply_regex_translations(&file_string, regex);
+        if apply_regex {
+            if let Some(regex) = file_dict.get("regex").and_then(Value::as_array) {
+                if !regex.is_empty() {
+                    file_string = apply_regex_translations(&file_string, regex);
+                }
             }
         }
         fs::write(&target_file_path, file_string)
@@ -4797,6 +4811,25 @@ async fn save_translated_source(
     source_id: &str,
     content: &Value,
 ) -> Result<SavedTranslationIndex> {
+    save_translated_source_with_processing_preservation(state, paths, source_id, content, false).await
+}
+
+async fn save_translated_source_partial(
+    state: &AppState,
+    paths: &PersistencePaths,
+    source_id: &str,
+    content: &Value,
+) -> Result<SavedTranslationIndex> {
+    save_translated_source_with_processing_preservation(state, paths, source_id, content, true).await
+}
+
+async fn save_translated_source_with_processing_preservation(
+    state: &AppState,
+    paths: &PersistencePaths,
+    source_id: &str,
+    content: &Value,
+    preserve_processing_state: bool,
+) -> Result<SavedTranslationIndex> {
     let _guard = state.persistence_lock.lock().await;
     let mut meta = load_meta(paths);
     save_translation(paths, source_id, content)?;
@@ -4820,7 +4853,7 @@ async fn save_translated_source(
                     .unwrap_or(Value::String(String::new()))
         });
         source["origin"] = json!("local");
-        merge_metadata_index(source, content, false);
+        merge_metadata_index(source, content, preserve_processing_state);
         saved_index = SavedTranslationIndex {
             total_count: source.get("totalTranslationCount").and_then(Value::as_u64).unwrap_or(0),
             format_valid: source.get("translationFormatValid").and_then(Value::as_bool).unwrap_or(false),
@@ -5619,7 +5652,11 @@ async fn handle_batch_translate(
         .map(|resource| serde_json::to_value(resource).unwrap_or(Value::Null))
         .collect();
     let mut completed = HashSet::<usize>::new();
-    let window_item_limit = translate_window_item_limit(batch.config.batch_size, batch.config.concurrency);
+    let window_item_limit = translate_window_item_limit(
+        batch.config.batch_size,
+        batch.config.concurrency,
+        batch.config.batch_window_multiplier,
+    );
     let mut next_resource_index = 0usize;
 
     while next_resource_index < batch.resources.len() {
@@ -5724,6 +5761,7 @@ async fn handle_batch_translate(
                 source_id,
                 translation_json,
                 processed_items: 0,
+                dirty: false,
                 all_items: Vec::new(),
                 pending_items: Vec::new(),
                 success_items: Vec::new(),
@@ -5867,14 +5905,21 @@ async fn process_batch_translate_window(
         touch_progress(task, json!({ "currentLabel": "AST" })).await;
         let ast_report = translate_packed_batches(
             &ast_items,
+            &mut resource_states,
             &batch.config.prompts.ast,
             &batch.config,
             |item| json!({ "i": item["id"], "s": item["source"], "y": item["type"], "n": item["name"] }),
+            PackedBatchRuntime {
+                state,
+                paths,
+                batch_type: "ast",
+                is_plugin: true,
+                flush_every_batches: batch.config.concurrency,
+            },
             Some(task.clone()),
         )
         .await?;
         failed_items_in_window += packed_report_failed_item_count(&ast_report);
-        apply_packed_translation_report(&mut resource_states, ast_report, "ast", true);
         if let Err(error) = stop_if_batch_translate_failures_exceed_limit(
             failed_items_in_window,
             &batch.config,
@@ -5887,14 +5932,21 @@ async fn process_batch_translate_window(
             touch_progress(task, json!({ "currentLabel": "Regex" })).await;
             let regex_report = translate_packed_batches(
                 &regex_items,
+                &mut resource_states,
                 &batch.config.prompts.regex,
                 &batch.config,
                 |item| json!({ "i": item["id"], "s": item["source"] }),
+                PackedBatchRuntime {
+                    state,
+                    paths,
+                    batch_type: "regex",
+                    is_plugin: true,
+                    flush_every_batches: batch.config.concurrency,
+                },
                 Some(task.clone()),
             )
             .await?;
             failed_items_in_window += packed_report_failed_item_count(&regex_report);
-            apply_packed_translation_report(&mut resource_states, regex_report, "regex", true);
             if let Err(error) = stop_if_batch_translate_failures_exceed_limit(
                 failed_items_in_window,
                 &batch.config,
@@ -5907,14 +5959,21 @@ async fn process_batch_translate_window(
         touch_progress(task, json!({ "currentLabel": "Theme" })).await;
         let theme_report = translate_packed_batches(
             &theme_items,
+            &mut resource_states,
             &batch.config.prompts.theme,
             &batch.config,
             |item| json!({ "i": item["id"], "s": item["source"], "y": item["type"] }),
+            PackedBatchRuntime {
+                state,
+                paths,
+                batch_type: "theme",
+                is_plugin: false,
+                flush_every_batches: batch.config.concurrency,
+            },
             Some(task.clone()),
         )
         .await?;
         failed_items_in_window += packed_report_failed_item_count(&theme_report);
-        apply_packed_translation_report(&mut resource_states, theme_report, "theme", false);
         if let Err(error) = stop_if_batch_translate_failures_exceed_limit(
             failed_items_in_window,
             &batch.config,
@@ -5975,8 +6034,8 @@ async fn process_batch_translate_window(
     Ok(())
 }
 
-fn translate_window_item_limit(batch_size: usize, concurrency: usize) -> usize {
-    batch_size.max(1) * concurrency.max(1) * TRANSLATE_WINDOW_BATCH_MULTIPLIER
+fn translate_window_item_limit(batch_size: usize, concurrency: usize, window_multiplier: usize) -> usize {
+    batch_size.max(1) * concurrency.max(1) * window_multiplier.max(1)
 }
 
 fn failed_item_stop_threshold(batch_size: usize, concurrency: usize) -> usize {
@@ -5998,6 +6057,7 @@ struct BatchResourceState {
     source_id: String,
     translation_json: Value,
     processed_items: usize,
+    dirty: bool,
     all_items: Vec<String>,
     pending_items: Vec<String>,
     success_items: Vec<String>,
@@ -6015,6 +6075,14 @@ struct PackedBatchFailure {
     resource_state_index: usize,
     error_message: String,
     items: Vec<BatchTaskFailureItem>,
+}
+
+struct PackedBatchRuntime<'a> {
+    state: &'a AppState,
+    paths: &'a PersistencePaths,
+    batch_type: &'a str,
+    is_plugin: bool,
+    flush_every_batches: usize,
 }
 
 fn packed_report_failed_item_count(report: &PackedBatchReport) -> usize {
@@ -6171,9 +6239,11 @@ fn collect_all_item_keys(translation_json: &Value, is_plugin: bool) -> Vec<Strin
 
 async fn translate_packed_batches<F>(
     items: &[Value],
+    resource_states: &mut [BatchResourceState],
     prompt: &str,
     config: &CompanionTranslationConfig,
     simplify: F,
+    runtime: PackedBatchRuntime<'_>,
     task: Option<Arc<TaskRuntime>>,
 ) -> Result<PackedBatchReport>
 where
@@ -6187,14 +6257,14 @@ where
         return Ok(report);
     }
 
-    let batch_size = config.batch_size.max(1);
-    let batches: Vec<Vec<Value>> = items
-        .chunks(batch_size)
-        .map(|batch| batch.to_vec())
-        .collect();
+    let batches = split_translation_batches(items, config.batch_size, config.batch_char_limit);
     let concurrency = config.concurrency.max(1).min(batches.len().max(1));
     let mut handles = JoinSet::new();
     let mut next_batch = 0usize;
+    let mut completed_since_flush = 0usize;
+    let flush_every_batches = runtime.flush_every_batches.max(1);
+    let mut failed_items = 0usize;
+    let mut stop_scheduling = false;
 
     while next_batch < batches.len() && handles.len() < concurrency {
         if let Some(task) = &task {
@@ -6226,13 +6296,31 @@ where
         if let Some(task) = &task {
             increment_progress(task, "processedItems", batch.len()).await;
         }
+        completed_since_flush += 1;
 
         match result {
             Ok(translated) => {
-                merge_successful_packed_response(&mut report, batch, translated);
+                let batch_report = packed_batch_report(batch, translated);
+                let failed_count = packed_report_failed_item_count(&batch_report);
+                failed_items += failed_count;
+                apply_packed_translation_report(
+                    resource_states,
+                    batch_report.clone(),
+                    runtime.batch_type,
+                    runtime.is_plugin,
+                );
+                report.translated_items.extend(batch_report.translated_items);
+                report.failures.extend(batch_report.failures);
+                if failed_count > 0 {
+                    flush_changed_resource_states(runtime.state, runtime.paths, resource_states).await?;
+                }
+                if should_stop_batch_translate_for_failures(failed_items, config.batch_size, config.concurrency) {
+                    stop_scheduling = true;
+                }
             }
             Err(error) if error.to_string().contains(MANUAL_STOP) => return Err(error),
             Err(error) => {
+                let batch_failed_count = batch.len();
                 let mut grouped = HashMap::<usize, Vec<BatchTaskFailureItem>>::new();
                 for item in batch {
                     let resource_state_index =
@@ -6244,47 +6332,79 @@ where
                         .or_default()
                         .push(packed_failure_item(&item));
                 }
-                for (resource_state_index, items) in grouped {
-                    report.failures.push(PackedBatchFailure {
-                        resource_state_index,
-                        error_message: error.to_string(),
-                        items,
-                    });
+                let batch_report = PackedBatchReport {
+                    translated_items: Vec::new(),
+                    failures: grouped
+                        .into_iter()
+                        .map(|(resource_state_index, items)| PackedBatchFailure {
+                            resource_state_index,
+                            error_message: error.to_string(),
+                            items,
+                        })
+                        .collect(),
+                };
+                apply_packed_translation_report(
+                    resource_states,
+                    batch_report.clone(),
+                    runtime.batch_type,
+                    runtime.is_plugin,
+                );
+                report.failures.extend(batch_report.failures);
+                failed_items += batch_failed_count;
+                if should_stop_batch_translate_for_failures(failed_items, config.batch_size, config.concurrency) {
+                    stop_scheduling = true;
                 }
             }
         }
 
-        while next_batch < batches.len() && handles.len() < concurrency {
+        if completed_since_flush >= flush_every_batches {
+            flush_changed_resource_states(runtime.state, runtime.paths, resource_states).await?;
+            completed_since_flush = 0;
             if let Some(task) = &task {
-                ensure_not_cancelled(task).await?;
+                bump_source_revision(task).await;
             }
-            let batch = batches[next_batch].clone();
-            next_batch += 1;
-            let simplified: Vec<Value> = batch.iter().map(&simplify).collect();
-            let prompt = prompt.to_string();
-            let config = config.clone();
-            let task = task.clone();
-            handles.spawn(async move {
-                if let Some(task) = &task {
-                    ensure_not_cancelled(task).await?;
-                }
-                let result = call_chat_completion(&simplified, &prompt, &config).await;
-                if let Some(task) = &task {
-                    ensure_not_cancelled(task).await?;
-                }
-                Ok::<_, anyhow::Error>((batch, result))
-            });
         }
+
+        if !stop_scheduling {
+            while next_batch < batches.len() && handles.len() < concurrency {
+                if let Some(task) = &task {
+                    ensure_not_cancelled(task).await?;
+                }
+                let batch = batches[next_batch].clone();
+                next_batch += 1;
+                let simplified: Vec<Value> = batch.iter().map(&simplify).collect();
+                let prompt = prompt.to_string();
+                let config = config.clone();
+                let task = task.clone();
+                handles.spawn(async move {
+                    if let Some(task) = &task {
+                        ensure_not_cancelled(task).await?;
+                    }
+                    let result = call_chat_completion(&simplified, &prompt, &config).await;
+                    if let Some(task) = &task {
+                        ensure_not_cancelled(task).await?;
+                    }
+                    Ok::<_, anyhow::Error>((batch, result))
+                });
+            }
+        }
+    }
+    flush_changed_resource_states(runtime.state, runtime.paths, resource_states).await?;
+    if let Some(task) = &task {
+        bump_source_revision(task).await;
     }
 
     Ok(report)
 }
 
-fn merge_successful_packed_response(
-    report: &mut PackedBatchReport,
+fn packed_batch_report(
     batch: Vec<Value>,
     translated: Vec<TranslationPair>,
-) {
+) -> PackedBatchReport {
+    let mut report = PackedBatchReport {
+        translated_items: Vec::new(),
+        failures: Vec::new(),
+    };
     let translated_by_id = translated
         .into_iter()
         .map(|entry| (entry.i, entry.t))
@@ -6318,6 +6438,18 @@ fn merge_successful_packed_response(
             items,
         });
     }
+    report
+}
+
+#[cfg(test)]
+fn merge_successful_packed_response(
+    report: &mut PackedBatchReport,
+    batch: Vec<Value>,
+    translated: Vec<TranslationPair>,
+) {
+    let batch_report = packed_batch_report(batch, translated);
+    report.translated_items.extend(batch_report.translated_items);
+    report.failures.extend(batch_report.failures);
 }
 
 fn apply_packed_translation_report(
@@ -6355,6 +6487,7 @@ fn apply_packed_translation_report(
         if let Some(target_slot) = resource_state.translation_json.pointer_mut(&pointer) {
             *target_slot = Value::String(target.to_string());
             resource_state.processed_items += 1;
+            resource_state.dirty = true;
             resource_state.success_items.push(compact_success_item_key(&item, batch_type, is_plugin));
         }
     }
@@ -6372,6 +6505,27 @@ fn apply_packed_translation_report(
             items: failure.items,
         });
     }
+}
+
+async fn flush_changed_resource_states(
+    state: &AppState,
+    paths: &PersistencePaths,
+    resource_states: &mut [BatchResourceState],
+) -> Result<()> {
+    for resource_state in resource_states.iter_mut() {
+        if !resource_state.dirty {
+            continue;
+        }
+        save_translated_source_partial(
+            state,
+            paths,
+            &resource_state.source_id,
+            &resource_state.translation_json,
+        )
+        .await?;
+        resource_state.dirty = false;
+    }
+    Ok(())
 }
 
 fn compact_success_item_key(item: &Value, batch_type: &str, is_plugin: bool) -> String {
@@ -6657,11 +6811,7 @@ where
         return Ok(Vec::new());
     }
     let mut output = Vec::new();
-    let batch_size = config.batch_size.max(1);
-    let batches: Vec<Vec<Value>> = items
-        .chunks(batch_size)
-        .map(|batch| batch.to_vec())
-        .collect();
+    let batches = split_translation_batches(items, config.batch_size, config.batch_char_limit);
     let concurrency = config.concurrency.max(1).min(batches.len().max(1));
     let mut handles = JoinSet::new();
     let mut next_batch = 0usize;
@@ -6751,6 +6901,51 @@ where
         return Err(error);
     }
     Ok(output)
+}
+
+fn split_translation_batches(items: &[Value], batch_size: usize, batch_char_limit: usize) -> Vec<Vec<Value>> {
+    let batch_size = batch_size.max(1);
+    let mut batches = Vec::new();
+    for batch in items.chunks(batch_size) {
+        split_translation_batch_by_char_limit(batch.to_vec(), batch_char_limit, &mut batches);
+    }
+    batches
+}
+
+fn split_translation_batch_by_char_limit(
+    batch: Vec<Value>,
+    batch_char_limit: usize,
+    output: &mut Vec<Vec<Value>>,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    if batch_char_limit == 0
+        || batch.len() == 1
+        || translation_batch_source_char_count(&batch) <= batch_char_limit
+    {
+        output.push(batch);
+        return;
+    }
+
+    let mid = (batch.len() + 1) / 2;
+    let right = batch[mid..].to_vec();
+    let left = batch[..mid].to_vec();
+    split_translation_batch_by_char_limit(left, batch_char_limit, output);
+    split_translation_batch_by_char_limit(right, batch_char_limit, output);
+}
+
+fn translation_batch_source_char_count(batch: &[Value]) -> usize {
+    batch
+        .iter()
+        .map(|item| {
+            item.get("source")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .chars()
+                .count()
+        })
+        .sum()
 }
 
 #[derive(Debug, Clone)]
@@ -7525,7 +7720,11 @@ async fn handle_failure_retry(
     let retry: FailureRetryPayload = serde_json::from_value(payload.clone())?;
     let paths = paths(&retry.persistence.base_path);
     let scope = if is_plugin { "plugin" } else { "theme" };
-    let item_limit = translate_window_item_limit(retry.config.batch_size, retry.config.concurrency);
+    let item_limit = translate_window_item_limit(
+        retry.config.batch_size,
+        retry.config.concurrency,
+        retry.config.batch_window_multiplier,
+    );
     let mut retry_queue = load_retry_failures_for_scope(&paths, scope);
     let mut failed_retry_ids = HashSet::<String>::new();
     let mut processed_retry_ids = HashSet::<String>::new();
@@ -7699,6 +7898,10 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn default_translate_window_batch_multiplier() -> usize {
+    DEFAULT_TRANSLATE_WINDOW_BATCH_MULTIPLIER
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7711,9 +7914,11 @@ mod tests {
 
     #[test]
     fn translate_window_item_limit_feeds_concurrency_without_scaling_to_resources() {
-        assert_eq!(translate_window_item_limit(5, 3), 60);
-        assert_eq!(translate_window_item_limit(1, 3), 12);
-        assert_eq!(translate_window_item_limit(10, 0), 40);
+        assert_eq!(translate_window_item_limit(5, 3, 4), 60);
+        assert_eq!(translate_window_item_limit(1, 3, 4), 12);
+        assert_eq!(translate_window_item_limit(10, 0, 4), 40);
+        assert_eq!(translate_window_item_limit(5, 3, 2), 30);
+        assert_eq!(translate_window_item_limit(5, 3, 0), 15);
     }
 
     #[test]
@@ -7721,6 +7926,49 @@ mod tests {
         assert!(!should_stop_batch_translate_for_failures(499, 100, 5));
         assert!(should_stop_batch_translate_for_failures(500, 100, 5));
         assert!(should_stop_batch_translate_for_failures(1, 0, 0));
+    }
+
+    #[test]
+    fn translation_batches_split_by_item_count_then_source_character_limit() {
+        let items = vec![
+            json!({ "source": "abcd" }),
+            json!({ "source": "efgh" }),
+            json!({ "source": "ijk" }),
+            json!({ "source": "lmn" }),
+            json!({ "source": "op" }),
+        ];
+
+        let batches = split_translation_batches(&items, 5, 8);
+
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), items.len());
+        assert!(batches
+            .iter()
+            .all(|batch| batch.len() == 1 || translation_batch_source_char_count(batch) <= 8));
+        let flattened = batches
+            .iter()
+            .flatten()
+            .map(|item| item.get("source").and_then(Value::as_str).unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(flattened, vec!["abcd", "efgh", "ijk", "lmn", "op"]);
+    }
+
+    #[test]
+    fn translation_batches_leave_single_oversized_item_intact() {
+        let items = vec![
+            json!({ "source": "abcdefghijk" }),
+            json!({ "source": "xy" }),
+        ];
+
+        let batches = split_translation_batches(&items, 2, 5);
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 1);
+        assert_eq!(
+            batches[0][0].get("source").and_then(Value::as_str),
+            Some("abcdefghijk")
+        );
+        assert_eq!(batches[1].len(), 1);
     }
 
     #[test]
@@ -7928,6 +8176,8 @@ mod tests {
                 timeout_ms: 5_000,
                 response_format: "json_object".to_string(),
                 batch_size: 1,
+                batch_char_limit: 0,
+                batch_window_multiplier: 4,
                 overwrite_existing_translations: false,
                 concurrency: 1,
                 prompts: PromptConfig {
@@ -8107,6 +8357,8 @@ mod tests {
                 timeout_ms: 5_000,
                 response_format: "json_object".to_string(),
                 batch_size: 1,
+                batch_char_limit: 0,
+                batch_window_multiplier: 4,
                 overwrite_existing_translations: false,
                 concurrency: 1,
                 prompts: PromptConfig {
@@ -8149,6 +8401,359 @@ mod tests {
                 .get("translationProcessingComplete")
                 .and_then(Value::as_bool),
             Some(false)
+        );
+        let _ = fs::remove_dir_all(base_path);
+    }
+
+    #[tokio::test]
+    async fn batch_translate_records_request_failures_when_threshold_stops_task() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _request = read_test_http_request(&mut stream).await;
+            let body = "temporary failure";
+            let response = format!(
+                "HTTP/1.1 500 Internal Server Error\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+
+        let base_path = env::temp_dir().join(format!("i18n-batch-translate-request-failure-{}", nanoid!()));
+        let paths = paths(base_path.to_str().unwrap());
+        let source_id = "source-a";
+        let translation_json = json!({
+            "schemaVersion": 1,
+            "metadata": {
+                "plugin": "plugin-a",
+                "title": "Plugin A",
+                "version": "1.0.0",
+                "supportedVersions": "1.0.0",
+                "language": "zh-cn"
+            },
+            "dict": {
+                "main.js": {
+                    "ast": [],
+                    "regex": [
+                        { "source": "Hello", "target": "Hello" }
+                    ]
+                }
+            }
+        });
+        write_json_pretty(
+            &paths.meta_path,
+            &json!({
+                "schemaVersion": 2,
+                "sources": {
+                    source_id: {
+                        "id": source_id,
+                        "plugin": "plugin-a",
+                        "title": "Plugin A",
+                        "type": "plugin",
+                        "origin": "local",
+                        "isActive": true,
+                        "checksum": "",
+                        "translationVersion": "1.0.0",
+                        "translationFormatValid": true,
+                        "totalTranslationCount": 1,
+                        "pendingTranslationCount": 1,
+                        "translatedEntryCount": 0,
+                        "processedTranslationCount": 0,
+                        "unprocessedTranslationCount": 1,
+                        "translationProcessingComplete": false,
+                        "createdAt": 1,
+                        "updatedAt": 1
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        save_translation(&paths, source_id, &translation_json).unwrap();
+
+        let state = AppState {
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            persistence_lock: Arc::new(Mutex::new(())),
+            plugin_dir: base_path.clone(),
+            http: reqwest::Client::new(),
+            shutdown: Arc::new(Mutex::new(None)),
+        };
+        let task = Arc::new(TaskRuntime {
+            progress: Mutex::new(CompanionTaskProgress {
+                task_id: "task".to_string(),
+                scope: "plugin".to_string(),
+                mode: "translate".to_string(),
+                status: "running".to_string(),
+                current_label: String::new(),
+                processed_resources: 0,
+                total_resources: 1,
+                processed_items: 0,
+                total_items: 1,
+                success_count: 0,
+                failed_count: 0,
+                skipped_count: 0,
+                source_revision: 0,
+                record_revision: 0,
+                updated_at: 0,
+                error: None,
+            }),
+            cancel_requested: Mutex::new(false),
+        });
+        let batch = PluginBatchTranslatePayload {
+            persistence: PersistenceConfig {
+                base_path: base_path.to_string_lossy().to_string(),
+            },
+            resources: vec![CompanionBatchResource {
+                resource_id: "plugin-a".to_string(),
+                label: "Plugin A".to_string(),
+                source_id: Some(source_id.to_string()),
+            }],
+            config: CompanionTranslationConfig {
+                chat_completions_url: format!("http://{addr}/v1/chat/completions"),
+                api_key: "test-key".to_string(),
+                model: "test-model".to_string(),
+                timeout_ms: 5_000,
+                response_format: "json_object".to_string(),
+                batch_size: 1,
+                batch_char_limit: 0,
+                batch_window_multiplier: 4,
+                overwrite_existing_translations: false,
+                concurrency: 1,
+                prompts: PromptConfig {
+                    ast: String::new(),
+                    regex: String::new(),
+                    theme: String::new(),
+                },
+            },
+            checkpoint_key: "plugin:translate".to_string(),
+            concurrency: 1,
+            completed_resources: None,
+            processed_items: None,
+            total_items: Some(1),
+        };
+
+        let result = handle_batch_translate(&state, task.clone(), batch, true).await;
+
+        assert!(result.is_err());
+        let record = load_record(&paths);
+        let failures = record.get("failures").and_then(Value::as_array).unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].get("sourceId").and_then(Value::as_str),
+            Some(source_id)
+        );
+        assert_eq!(
+            failures[0].get("batchType").and_then(Value::as_str),
+            Some("regex")
+        );
+        assert_eq!(
+            failures[0]
+                .get("items")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        let _ = fs::remove_dir_all(base_path);
+    }
+
+    #[tokio::test]
+    async fn large_plugin_batch_translate_flushes_translation_file_after_each_concurrency_group() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (first_group_tx, mut first_group_rx) = mpsc::channel::<u64>(2);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+
+        tokio::spawn(async move {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let first_group_tx = first_group_tx.clone();
+                let release_rx = release_rx.clone();
+                tokio::spawn(async move {
+                    let request = read_test_http_request(&mut stream).await;
+                    let id = request_item_id(&request);
+                    if id >= 2 {
+                        if let Some(rx) = release_rx.lock().await.take() {
+                            let _ = rx.await;
+                        }
+                    }
+                    let content = format!("{{\"items\":[{{\"i\":{},\"t\":\"译文{}\"}}]}}", id, id);
+                    let body = json!({
+                        "choices": [{
+                            "message": { "content": content },
+                            "finish_reason": "stop"
+                        }]
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    if id < 2 {
+                        let _ = first_group_tx.send(id).await;
+                    }
+                });
+            }
+        });
+
+        let base_path = env::temp_dir().join(format!("i18n-large-plugin-flush-{}", nanoid!()));
+        let paths = paths(base_path.to_str().unwrap());
+        let source_id = "source-a";
+        let items = (0..4)
+            .map(|index| json!({ "source": format!("Source {index}"), "target": format!("Source {index}") }))
+            .collect::<Vec<_>>();
+        let translation_json = json!({
+            "schemaVersion": 1,
+            "metadata": {
+                "plugin": "plugin-a",
+                "title": "Large Plugin",
+                "version": "1.0.0",
+                "supportedVersions": "1.0.0",
+                "language": "zh-cn"
+            },
+            "dict": {
+                "main.js": {
+                    "ast": [],
+                    "regex": items
+                }
+            }
+        });
+        write_json_pretty(
+            &paths.meta_path,
+            &json!({
+                "schemaVersion": 2,
+                "sources": {
+                    source_id: {
+                        "id": source_id,
+                        "plugin": "plugin-a",
+                        "title": "Large Plugin",
+                        "type": "plugin",
+                        "origin": "local",
+                        "isActive": true,
+                        "checksum": "",
+                        "translationVersion": "1.0.0",
+                        "translationFormatValid": true,
+                        "totalTranslationCount": 4,
+                        "pendingTranslationCount": 4,
+                        "translatedEntryCount": 0,
+                        "processedTranslationCount": 0,
+                        "unprocessedTranslationCount": 4,
+                        "translationProcessingComplete": false,
+                        "createdAt": 1,
+                        "updatedAt": 1
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        save_translation(&paths, source_id, &translation_json).unwrap();
+        let source_file = paths.sources_dir.join(format!("{source_id}.json"));
+        let initial_mtime = fs::metadata(&source_file).unwrap().modified().unwrap();
+
+        let state = AppState {
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            persistence_lock: Arc::new(Mutex::new(())),
+            plugin_dir: base_path.clone(),
+            http: reqwest::Client::new(),
+            shutdown: Arc::new(Mutex::new(None)),
+        };
+        let task = Arc::new(TaskRuntime {
+            progress: Mutex::new(CompanionTaskProgress {
+                task_id: "task".to_string(),
+                scope: "plugin".to_string(),
+                mode: "translate".to_string(),
+                status: "running".to_string(),
+                current_label: String::new(),
+                processed_resources: 0,
+                total_resources: 1,
+                processed_items: 0,
+                total_items: 4,
+                success_count: 0,
+                failed_count: 0,
+                skipped_count: 0,
+                source_revision: 0,
+                record_revision: 0,
+                updated_at: 0,
+                error: None,
+            }),
+            cancel_requested: Mutex::new(false),
+        });
+        let batch = PluginBatchTranslatePayload {
+            persistence: PersistenceConfig {
+                base_path: base_path.to_string_lossy().to_string(),
+            },
+            resources: vec![CompanionBatchResource {
+                resource_id: "plugin-a".to_string(),
+                label: "Large Plugin".to_string(),
+                source_id: Some(source_id.to_string()),
+            }],
+            config: CompanionTranslationConfig {
+                chat_completions_url: format!("http://{addr}/v1/chat/completions"),
+                api_key: "test-key".to_string(),
+                model: "test-model".to_string(),
+                timeout_ms: 5_000,
+                response_format: "json_object".to_string(),
+                batch_size: 1,
+                batch_char_limit: 0,
+                batch_window_multiplier: 4,
+                overwrite_existing_translations: false,
+                concurrency: 2,
+                prompts: PromptConfig {
+                    ast: String::new(),
+                    regex: String::new(),
+                    theme: String::new(),
+                },
+            },
+            checkpoint_key: "plugin:translate".to_string(),
+            concurrency: 1,
+            completed_resources: None,
+            processed_items: None,
+            total_items: Some(4),
+        };
+        let task_handle = tokio::spawn({
+            let state = state.clone();
+            let task = task.clone();
+            async move { handle_batch_translate(&state, task, batch, true).await }
+        });
+
+        let _ = tokio_timeout(TokioDuration::from_secs(2), first_group_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = tokio_timeout(TokioDuration::from_secs(2), first_group_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        tokio_timeout(TokioDuration::from_secs(2), async {
+            loop {
+                let saved = read_translation(&paths, source_id).unwrap();
+                let first = saved
+                    .pointer("/dict/main.js/regex/0/target")
+                    .and_then(Value::as_str);
+                let second = saved
+                    .pointer("/dict/main.js/regex/1/target")
+                    .and_then(Value::as_str);
+                let modified = fs::metadata(&source_file).unwrap().modified().unwrap();
+                if first == Some("译文0") && second == Some("译文1") && modified > initial_mtime {
+                    break;
+                }
+                sleep(TokioDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("large plugin translations should flush to source file before the whole window completes");
+
+        let _ = release_tx.send(());
+        task_handle.await.unwrap().unwrap();
+
+        let saved = read_translation(&paths, source_id).unwrap();
+        assert_eq!(
+            saved.pointer("/dict/main.js/regex/3/target").and_then(Value::as_str),
+            Some("译文3")
         );
         let _ = fs::remove_dir_all(base_path);
     }
@@ -8389,6 +8994,7 @@ mod tests {
                 "timeoutMs": 1000,
                 "responseFormat": "json_object",
                 "batchSize": 2,
+                "batchCharLimit": 0,
                 "overwriteExistingTranslations": false,
                 "concurrency": 1,
                 "prompts": { "ast": "", "regex": "", "theme": "" }
@@ -8462,6 +9068,8 @@ mod tests {
             timeout_ms: 5_000,
             response_format: "json_object".to_string(),
             batch_size: 1,
+            batch_char_limit: 0,
+            batch_window_multiplier: 4,
             overwrite_existing_translations: false,
             concurrency: 2,
             prompts: PromptConfig {
@@ -8495,6 +9103,327 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn translate_packed_batches_stops_scheduling_new_batches_after_failure_threshold() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request_count = Arc::new(Mutex::new(0usize));
+        let server_request_count = request_count.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let server_request_count = server_request_count.clone();
+                tokio::spawn(async move {
+                    let request = read_test_http_request(&mut stream).await;
+                    let id = request_item_id(&request);
+                    *server_request_count.lock().await += 1;
+                    if id >= 2 {
+                        sleep(TokioDuration::from_millis(250)).await;
+                    }
+                    let content = if id < 2 {
+                        "{\"items\":[{\"i\":0,\"t\":\"\"}]}"
+                    } else {
+                        "{\"items\":[{\"i\":2,\"t\":\"译文2\"}]}"
+                    };
+                    let body = json!({
+                        "choices": [{
+                            "message": { "content": content },
+                            "finish_reason": "stop"
+                        }]
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let base_path = env::temp_dir().join(format!("i18n-no-new-batches-after-threshold-{}", nanoid!()));
+        let paths = paths(base_path.to_str().unwrap());
+        let state = AppState {
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            persistence_lock: Arc::new(Mutex::new(())),
+            plugin_dir: base_path.clone(),
+            http: reqwest::Client::new(),
+            shutdown: Arc::new(Mutex::new(None)),
+        };
+        let mut resource_states = vec![BatchResourceState {
+            original_index: 0,
+            resource: CompanionBatchResource {
+                resource_id: "plugin-a".to_string(),
+                label: "Plugin A".to_string(),
+                source_id: Some("source-a".to_string()),
+            },
+            source_id: "source-a".to_string(),
+            translation_json: json!({
+                "schemaVersion": 1,
+                "metadata": { "plugin": "plugin-a", "title": "Plugin A", "version": "1.0.0" },
+                "dict": { "main.js": { "ast": [], "regex": [] } }
+            }),
+            processed_items: 0,
+            dirty: false,
+            all_items: Vec::new(),
+            pending_items: Vec::new(),
+            success_items: Vec::new(),
+            failures: Vec::new(),
+        }];
+        let items = (0..4)
+            .map(|id| json!({
+                "id": id,
+                "resourceStateIndex": 0,
+                "file": "main.js",
+                "dictIndex": id,
+                "source": format!("Source {id}"),
+                "target": ""
+            }))
+            .collect::<Vec<_>>();
+        let config = CompanionTranslationConfig {
+            chat_completions_url: format!("http://{addr}/v1/chat/completions"),
+            api_key: "test-key".to_string(),
+            model: "test-model".to_string(),
+            timeout_ms: 5_000,
+            response_format: "json_object".to_string(),
+            batch_size: 1,
+            batch_char_limit: 0,
+            batch_window_multiplier: 4,
+            overwrite_existing_translations: false,
+            concurrency: 2,
+            prompts: PromptConfig {
+                ast: String::new(),
+                regex: String::new(),
+                theme: String::new(),
+            },
+        };
+
+        let report = translate_packed_batches(
+            &items,
+            &mut resource_states,
+            "prompt",
+            &config,
+            |item| json!({ "i": item["id"], "s": item["source"] }),
+            PackedBatchRuntime {
+                state: &state,
+                paths: &paths,
+                batch_type: "regex",
+                is_plugin: true,
+                flush_every_batches: config.concurrency,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(packed_report_failed_item_count(&report), 2);
+        assert_eq!(*request_count.lock().await, 3);
+        let _ = fs::remove_dir_all(base_path);
+    }
+
+    #[tokio::test]
+    async fn translate_packed_batches_replenishes_requests_inside_window() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = mpsc::channel::<u64>(3);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let request_tx = request_tx.clone();
+                let release_rx = release_rx.clone();
+                tokio::spawn(async move {
+                    let request = read_test_http_request(&mut stream).await;
+                    let id = request_item_id(&request);
+                    let _ = request_tx.send(id).await;
+                    if id == 0 {
+                        if let Some(rx) = release_rx.lock().await.take() {
+                            let _ = rx.await;
+                        }
+                    }
+                    let content = format!("{{\"items\":[{{\"i\":{},\"t\":\"译文{}\"}}]}}", id, id);
+                    let body = json!({
+                        "choices": [{
+                            "message": { "content": content },
+                            "finish_reason": "stop"
+                        }]
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let base_path = env::temp_dir().join(format!("i18n-replenish-requests-{}", nanoid!()));
+        let paths = paths(base_path.to_str().unwrap());
+        let state = AppState {
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            persistence_lock: Arc::new(Mutex::new(())),
+            plugin_dir: base_path.clone(),
+            http: reqwest::Client::new(),
+            shutdown: Arc::new(Mutex::new(None)),
+        };
+        let mut resource_states = vec![BatchResourceState {
+            original_index: 0,
+            resource: CompanionBatchResource {
+                resource_id: "plugin-a".to_string(),
+                label: "Plugin A".to_string(),
+                source_id: Some("source-a".to_string()),
+            },
+            source_id: "source-a".to_string(),
+            translation_json: json!({
+                "schemaVersion": 1,
+                "metadata": { "plugin": "plugin-a", "title": "Plugin A", "version": "1.0.0" },
+                "dict": { "main.js": { "ast": [], "regex": [] } }
+            }),
+            processed_items: 0,
+            dirty: false,
+            all_items: Vec::new(),
+            pending_items: Vec::new(),
+            success_items: Vec::new(),
+            failures: Vec::new(),
+        }];
+        let items = (0..3)
+            .map(|id| json!({
+                "id": id,
+                "resourceStateIndex": 0,
+                "file": "main.js",
+                "dictIndex": id,
+                "source": format!("Source {id}"),
+                "target": ""
+            }))
+            .collect::<Vec<_>>();
+        let config = CompanionTranslationConfig {
+            chat_completions_url: format!("http://{addr}/v1/chat/completions"),
+            api_key: "test-key".to_string(),
+            model: "test-model".to_string(),
+            timeout_ms: 5_000,
+            response_format: "json_object".to_string(),
+            batch_size: 1,
+            batch_char_limit: 0,
+            batch_window_multiplier: 4,
+            overwrite_existing_translations: false,
+            concurrency: 2,
+            prompts: PromptConfig {
+                ast: String::new(),
+                regex: String::new(),
+                theme: String::new(),
+            },
+        };
+        let task_handle = tokio::spawn({
+            let state = state.clone();
+            let paths = paths.clone();
+            async move {
+                translate_packed_batches(
+                    &items,
+                    &mut resource_states,
+                    "",
+                    &config,
+                    |item| json!({ "i": item["id"], "s": item["source"] }),
+                    PackedBatchRuntime {
+                        state: &state,
+                        paths: &paths,
+                        batch_type: "regex",
+                        is_plugin: true,
+                        flush_every_batches: config.concurrency,
+                    },
+                    None,
+                )
+                .await
+            }
+        });
+
+        let _ = tokio_timeout(TokioDuration::from_secs(2), request_rx.recv()).await.unwrap().unwrap();
+        let _ = tokio_timeout(TokioDuration::from_secs(2), request_rx.recv()).await.unwrap().unwrap();
+        let third_arrived_before_release = tokio_timeout(TokioDuration::from_millis(300), request_rx.recv()).await.ok().flatten().is_some();
+        let _ = release_tx.send(());
+        task_handle.await.unwrap().unwrap();
+
+        assert!(
+            third_arrived_before_release,
+            "a completed request should be replenished before the whole concurrency group finishes"
+        );
+        let _ = fs::remove_dir_all(base_path);
+    }
+
+    #[test]
+    fn plugin_apply_translation_can_apply_only_ast_or_regex() {
+        let base_path = env::temp_dir().join(format!("i18n-apply-kind-switches-{}", nanoid!()));
+        let plugin_dir = base_path.join("plugin");
+        let backup_base_path = base_path.join("plugin-data");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        let file_path = plugin_dir.join("main.js");
+        let source_code = r#"const title = "Hello"; console.log("World");"#;
+        fs::write(&file_path, source_code).unwrap();
+        let translation_json = json!({
+            "schemaVersion": 1,
+            "metadata": {
+                "plugin": "plugin-a",
+                "title": "Plugin A",
+                "version": "1.0.0"
+            },
+            "dict": {
+                "main.js": {
+                    "ast": [
+                        { "type": "VariableDeclarator", "name": "title", "source": "Hello", "target": "你好" }
+                    ],
+                    "regex": [
+                        { "source": "World", "target": "世界" }
+                    ]
+                }
+            }
+        });
+
+        apply_plugin_translation_blocking(PluginApplyTranslationPayload {
+            plugin_id: "plugin-a".to_string(),
+            plugin_dir: plugin_dir.to_string_lossy().to_string(),
+            backup_base_path: backup_base_path.to_string_lossy().to_string(),
+            translation_json: Some(translation_json.clone()),
+            persistence: None,
+            translation_source_id: None,
+            apply_ast: Some(true),
+            apply_regex: Some(false),
+        })
+        .unwrap();
+        let ast_only = fs::read_to_string(&file_path).unwrap();
+        assert!(ast_only.contains("你好"));
+        assert!(ast_only.contains("World"));
+        assert!(!ast_only.contains("世界"));
+
+        fs::write(&file_path, source_code).unwrap();
+        fs::remove_dir_all(backup_dir(backup_base_path.to_str().unwrap())).unwrap();
+
+        apply_plugin_translation_blocking(PluginApplyTranslationPayload {
+            plugin_id: "plugin-a".to_string(),
+            plugin_dir: plugin_dir.to_string_lossy().to_string(),
+            backup_base_path: backup_base_path.to_string_lossy().to_string(),
+            translation_json: Some(translation_json),
+            persistence: None,
+            translation_source_id: None,
+            apply_ast: Some(false),
+            apply_regex: Some(true),
+        })
+        .unwrap();
+        let regex_only = fs::read_to_string(&file_path).unwrap();
+        assert!(regex_only.contains("Hello"));
+        assert!(!regex_only.contains("你好"));
+        assert!(regex_only.contains("世界"));
+
+        let _ = fs::remove_dir_all(base_path);
+    }
     async fn serve_translate_value_batch_test_request(
         mut stream: tokio::net::TcpStream,
         slow_status_tx: mpsc::Sender<bool>,
@@ -8681,6 +9610,8 @@ mod tests {
             timeout_ms: 80,
             response_format: "json_object".to_string(),
             batch_size: 1,
+            batch_char_limit: 0,
+            batch_window_multiplier: 4,
             overwrite_existing_translations: false,
             concurrency: 1,
             prompts: PromptConfig {
@@ -8739,6 +9670,8 @@ mod tests {
             timeout_ms: 80,
             response_format: "json_object".to_string(),
             batch_size: 1,
+            batch_char_limit: 0,
+            batch_window_multiplier: 4,
             overwrite_existing_translations: false,
             concurrency: 1,
             prompts: PromptConfig {

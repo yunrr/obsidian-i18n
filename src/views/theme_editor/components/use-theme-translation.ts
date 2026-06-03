@@ -57,7 +57,7 @@ export const useThemeTranslation = () => {
         setBatchSize(i18n.settings.llmBatchSize?.toString() || '10');
         setConcurrencyLimit(i18n.settings.llmConcurrencyLimit?.toString() || '3');
         setTimeoutVal(i18n.settings.llmTimeout?.toString() || '60000');
-    }, [settingsUpdateTick, i18n.settings.llmLanguage, i18n.settings.llmStyle, i18n.settings.llmBatchSize, i18n.settings.llmConcurrencyLimit, i18n.settings.llmTimeout]);
+    }, [settingsUpdateTick, i18n.settings.llmLanguage, i18n.settings.llmStyle, i18n.settings.llmBatchSize, i18n.settings.llmBatchCharLimit, i18n.settings.llmConcurrencyLimit, i18n.settings.llmTimeout]);
 
     // Handlers
     const saveSettings = (updates: Partial<typeof i18n.settings>) => {

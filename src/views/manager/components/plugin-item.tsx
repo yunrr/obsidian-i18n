@@ -244,6 +244,12 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
         setReplacing(true);
         try {
             if (!activeSourceId) throw new Error(t('Manager.Common.Errors.ErrorDesc'));
+            const applyAst = i18n.settings.applyAstTranslations !== false;
+            const applyRegex = i18n.settings.applyRegexTranslations !== false;
+            if (!applyAst && !applyRegex) {
+                i18n.notice.warning(t('Common.Notices.NoApplyTranslationKinds'));
+                return;
+            }
             // @ts-ignore
             const backupBasePath = path.join(path.normalize(i18n.app.vault.adapter.getBasePath()), i18n.manifest.dir || '');
             const result = await i18n.companionWorkerManager.applyPluginTranslation({
@@ -252,6 +258,8 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
                 backupBasePath,
                 persistence: { basePath: i18n.sourceManager.getBasePath() },
                 translationSourceId: activeSourceId,
+                applyAst,
+                applyRegex,
             });
             if (!result.state) throw new Error(result.error || t('Manager.Common.Errors.ErrorDesc'));
             i18n.stateManager.setPluginState(plugin.id, {

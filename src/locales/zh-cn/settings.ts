@@ -15,6 +15,7 @@ export default {
         Ast: "AST 配置",
         Immersive: "沉浸翻译",
         Ai: "语言模型",
+        ExtractTranslate: "提取翻译",
         Share: "共建生态"
     },
     Basis: {
@@ -94,6 +95,8 @@ export default {
         ProfileHeader: "配置组",
         EnableTitle: "启用 RE 提取",
         EnableDesc: "关闭后提取时不生成 Regex 内容。",
+        ApplyTitle: "应用时替换 RE",
+        ApplyDesc: "关闭后，插件应用译文时不会替换 Regex 条目。",
         ProfileSelectTitle: "配置方案",
         ProfileSelectDesc: "选择当前使用的 RE 提取配置。",
         ProfileNamePlaceholder: "配置名称",
@@ -136,6 +139,8 @@ export default {
         ProfileHeader: "配置组",
         EnableTitle: "启用 AST 提取",
         EnableDesc: "关闭后提取时不生成 AST 内容。",
+        ApplyTitle: "应用时替换 AST",
+        ApplyDesc: "关闭后，插件应用译文时不会替换 AST 条目。",
         ProfileSelectTitle: "配置方案",
         ProfileSelectDesc: "选择当前使用的 AST 提取配置。",
         ProfileNamePlaceholder: "配置名称",
@@ -387,6 +392,21 @@ export default {
         // ── StepFun 专属 ──
         StepfunKeyTitle: "阶跃星辰 (StepFun) 密钥",
         StepfunModelDesc: "选择或输入阶跃星辰模型 (如 step-1-8k)。",
+    },
+    ExtractTranslate: {
+        ContentHeader: "翻译内容",
+        RequestHeader: "请求批次",
+        ManagerHeader: "批量管理器",
+        ExtractHeader: "提取策略",
+        BatchCharLimitTitle: "每批字符上限",
+        BatchCharLimitDesc: "只统计待翻译条目的原文字符数，不包含提示词。0 表示不限制；超过后按条目数递归对半拆分。",
+        BatchWindowMultiplierTitle: "窗口批次倍数",
+        BatchWindowMultiplierDesc: "每个批量翻译窗口最多容纳：窗口倍数 × 请求并发数 × 每批数量。窗口内请求会按并发补位，窗口完成后再写检查点并进入下一窗口。",
+        ChineseSkipTitle: "中文资源跳过策略",
+        ChineseSkipDesc: "控制批量提取时如何识别并跳过已是中文的插件或主题。",
+        ChineseSkipNone: "不跳过，所有资源一律提取",
+        ChineseSkipSource: "检查名称/简介和源文件中文",
+        ChineseSkipExtracted: "检查名称/简介和提取条目中文",
     },
     Share: {
         AuthTitle: "远程仓库",

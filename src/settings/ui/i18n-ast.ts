@@ -54,6 +54,17 @@ export default class I18nAST extends BaseSetting {
             );
 
         new Setting(containerEl)
+            .setName(t('Settings.Ast.ApplyTitle'))
+            .setDesc(t('Settings.Ast.ApplyDesc'))
+            .addToggle(toggle => toggle
+                .setValue(this.settings.applyAstTranslations !== false)
+                .onChange(async (value) => {
+                    this.settings.applyAstTranslations = value;
+                    await this.i18n.saveSettings();
+                })
+            );
+
+        new Setting(containerEl)
             .setName(t('Settings.Ast.ProfileSelectTitle'))
             .setDesc(t('Settings.Ast.ProfileSelectDesc'))
             .addDropdown(dropdown => {

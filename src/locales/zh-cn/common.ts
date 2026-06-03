@@ -54,6 +54,7 @@ export default {
         BatchTranslateSuccess: "批量翻译完成！",
         TranslateFail: "翻译失败: {{message}}",
         NoItemsToTranslate: "没有需要翻译的条目",
+        NoApplyTranslationKinds: "AST 和 RE 替换都已关闭，不执行替换",
         ThemeNotFound: "未找到主题",
         MainNotFound: "未找到文件 {{file}}",
         TaskCancelled: "翻译任务已取消",

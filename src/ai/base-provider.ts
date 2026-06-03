@@ -153,18 +153,39 @@ export abstract class BaseProvider implements ITranslationProvider {
     }
 
     /** 数组分段工具方法 */
-    protected splitIntoBatches<T>(arr: readonly T[]): T[][] {
+    protected splitIntoBatches<T extends { source?: string }>(arr: readonly T[]): T[][] {
         if (arr.length === 0) return [];
         const validBatchSize = Number.isFinite(useGlobalStoreInstance.getState().i18n.settings.llmBatchSize)
             ? Math.max(1, Math.floor(useGlobalStoreInstance.getState().i18n.settings.llmBatchSize))
             : 1;
+        const batchCharLimit = Number.isFinite(useGlobalStoreInstance.getState().i18n.settings.llmBatchCharLimit)
+            ? Math.max(0, Math.floor(useGlobalStoreInstance.getState().i18n.settings.llmBatchCharLimit))
+            : 0;
         const batches: T[][] = [];
-        for (let i = 0; i < arr.length; i += validBatchSize) batches.push(arr.slice(i, i + validBatchSize));
+        for (let i = 0; i < arr.length; i += validBatchSize) {
+            this.splitBatchByCharacterLimit(arr.slice(i, i + validBatchSize), batchCharLimit, batches);
+        }
         return batches;
     }
 
+    private splitBatchByCharacterLimit<T extends { source?: string }>(batch: readonly T[], charLimit: number, output: T[][]): void {
+        if (batch.length === 0) return;
+        if (charLimit <= 0 || batch.length === 1 || this.getBatchSourceCharacterCount(batch) <= charLimit) {
+            output.push([...batch]);
+            return;
+        }
+
+        const mid = Math.ceil(batch.length / 2);
+        this.splitBatchByCharacterLimit(batch.slice(0, mid), charLimit, output);
+        this.splitBatchByCharacterLimit(batch.slice(mid), charLimit, output);
+    }
+
+    private getBatchSourceCharacterCount<T extends { source?: string }>(batch: readonly T[]): number {
+        return batch.reduce((sum, item) => sum + Array.from(String(item.source || '')).length, 0);
+    }
+
     /** 通用的并行批处理执行器 */
-    protected async executeParallelBatches<T>(
+    protected async executeParallelBatches<T extends { source?: string }>(
         items: T[],
         callApi: (batch: T[], signal?: AbortSignal) => Promise<T[]>,
         onBatchComplete: (batchResult: T[], batchIndex: number, totalBatches: number) => void | Promise<void>,

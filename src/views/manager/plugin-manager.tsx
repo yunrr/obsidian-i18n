@@ -93,12 +93,9 @@ const EMPTY_BATCH_TASK_STATE: BatchTaskState = {
 const SOURCE_SYNC_THROTTLE_MS = 750;
 const BATCH_PROGRESS_POLL_MS = 120;
 
-const shouldTranslateText = (target?: string, source?: string) => !target || target.trim() === '' || target === source;
-const getUnprocessedTranslationCount = (source: Pick<PluginBatchResource, 'pendingTranslationCount' | 'unprocessedTranslationCount'> | null | undefined) => {
+const getPendingTranslationCount = (source: Pick<PluginBatchResource, 'pendingTranslationCount'> | null | undefined) => {
     if (!source) return 0;
-    return typeof source.unprocessedTranslationCount === 'number'
-        ? source.unprocessedTranslationCount
-        : source.pendingTranslationCount || 0;
+    return typeof source.pendingTranslationCount === 'number' ? source.pendingTranslationCount : 0;
 };
 const getTranslatedEntryCount = (source: Pick<PluginBatchResource, 'translatedEntryCount'> | null | undefined) => {
     return typeof source?.translatedEntryCount === 'number' ? source.translatedEntryCount : 0;
@@ -138,6 +135,8 @@ const getCompanionTranslationConfig = (settings: I18N['settings']): CompanionTra
         timeoutMs: settings.llmTimeout || 60000,
         responseFormat: settings.llmResponseFormat,
         batchSize: getPositiveInt(settings.llmBatchSize, 1),
+        batchCharLimit: Math.max(0, Math.floor(Number(settings.llmBatchCharLimit || 0))),
+        batchWindowMultiplier: getPositiveInt(settings.llmBatchWindowMultiplier, 4),
         overwriteExistingTranslations: settings.llmOverwriteExistingTranslations === true,
         concurrency: getPositiveInt(settings.llmConcurrencyLimit, 3),
         prompts: {
@@ -505,8 +504,8 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         const source = i18n.sourceManager.getSource(sourceId);
         if (!source || source.translationFormatValid === false) return null;
         return {
-            pendingTranslationCount: source.pendingTranslationCount || 0,
-            unprocessedTranslationCount: getUnprocessedTranslationCount(source),
+            pendingTranslationCount: getPendingTranslationCount(source),
+            unprocessedTranslationCount: typeof source.unprocessedTranslationCount === 'number' ? source.unprocessedTranslationCount : 0,
             totalTranslationCount: source.totalTranslationCount || 0,
         };
     }, [i18n.sourceManager]);
@@ -518,10 +517,9 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             const source = i18n.sourceManager.getSourceForPluginVersion(plugin.id, 'plugin', batchTranslationVersion);
             const counts = getPluginTranslationCounts(source?.id);
             if (!source || !counts) continue;
-            if (settings.llmOverwriteExistingTranslations !== true && !failedSourceIds.has(source.id) && counts.unprocessedTranslationCount === 0) continue;
             const itemCount = settings.llmOverwriteExistingTranslations === true
                 ? counts.totalTranslationCount
-                : counts.unprocessedTranslationCount;
+                : counts.pendingTranslationCount;
             if ((itemCount || 0) <= 0) continue;
             resources.set(plugin.id, {
                 resourceId: plugin.id,
@@ -564,7 +562,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                 if (!counts || !resource.sourceId) return [];
                 const itemCount = settings.llmOverwriteExistingTranslations === true
                     ? counts.totalTranslationCount
-                    : counts.unprocessedTranslationCount;
+                    : counts.pendingTranslationCount;
                 const remainingCount = itemCount || 0;
                 if (remainingCount <= 0) return [];
                 return [{
@@ -822,9 +820,9 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         const totalResources = resume ? pluginTranslateCheckpoint?.totalResources || resources.length : resources.length;
         const processedItems = resume ? pluginTranslateCheckpoint?.processedItems || 0 : 0;
         const totalItems = resume ? pluginTranslateCheckpoint?.totalItems || resources.reduce((sum, resource) => {
-            return sum + (settings.llmOverwriteExistingTranslations === true ? resource.totalTranslationCount || 0 : getUnprocessedTranslationCount(resource));
+            return sum + (settings.llmOverwriteExistingTranslations === true ? resource.totalTranslationCount || 0 : getPendingTranslationCount(resource));
         }, 0) : resources.reduce((sum, resource) => {
-            return sum + (settings.llmOverwriteExistingTranslations === true ? resource.totalTranslationCount || 0 : getUnprocessedTranslationCount(resource));
+            return sum + (settings.llmOverwriteExistingTranslations === true ? resource.totalTranslationCount || 0 : getPendingTranslationCount(resource));
         }, 0);
 
         setBatchTask({

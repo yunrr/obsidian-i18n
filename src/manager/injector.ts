@@ -87,6 +87,12 @@ export class InjectorManager {
         try {
             const sourceId = this.i18n.sourceManager.getActiveSourceId(plugin.id);
             if (!sourceId) return false;
+            const applyAst = this.i18n.settings.applyAstTranslations !== false;
+            const applyRegex = this.i18n.settings.applyRegexTranslations !== false;
+            if (!applyAst && !applyRegex) {
+                this.i18n.notice.warning(t('Common.Notices.NoApplyTranslationKinds'));
+                return false;
+            }
 
             // 交给 Rust worker 读取译文、备份、AST/Regex 替换和写回
             // @ts-ignore
@@ -97,6 +103,8 @@ export class InjectorManager {
                 backupBasePath,
                 persistence: { basePath: this.i18n.sourceManager.getBasePath() },
                 translationSourceId: sourceId,
+                applyAst,
+                applyRegex,
             });
             if (!result.state) return false;
 

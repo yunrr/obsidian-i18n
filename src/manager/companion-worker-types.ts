@@ -148,6 +148,8 @@ export interface CompanionPluginApplyTranslationRequest {
     translationJson?: PluginTranslationV1;
     persistence?: CompanionWorkerPersistenceConfig;
     translationSourceId?: string;
+    applyAst?: boolean;
+    applyRegex?: boolean;
 }
 
 export interface CompanionThemeApplyTranslationRequest {
@@ -285,6 +287,8 @@ export interface CompanionTranslationConfig {
     timeoutMs: number;
     responseFormat: string;
     batchSize: number;
+    batchCharLimit: number;
+    batchWindowMultiplier: number;
     overwriteExistingTranslations: boolean;
     concurrency: number;
     prompts: {
