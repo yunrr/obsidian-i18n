@@ -145,6 +145,8 @@ export default {
         SuccessDelete: "删除成功",
         SuccessIncrementalExtract: "增量提取完成",
         DiagnosisSuccess: "语法诊断通过",
+        DiagnosisCleanupRemoved: "诊断完成：已移除 {{count}} 个导致脚本失败的条目",
+        DiagnosisRuntimeBaselineFailed: "原始插件脚本也无法正常加载，已跳过运行级定位，仅保留静态清理结果。",
         ConfirmDeleteUnused: "确定删除这些冗余项吗？该操作不可撤销。",
         AiFixSuccess: "AI 修复成功"
     },

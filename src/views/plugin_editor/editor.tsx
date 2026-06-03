@@ -135,27 +135,6 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
 
     const getExtractionSettings = React.useCallback(() => getEffectiveExtractionSettings(i18n.settings), [i18n.settings]);
 
-    const applyRegexItems = React.useCallback((code: string, items: any[]) => {
-        let result = code;
-        for (const item of items) {
-            if (item.source && item.target && item.source !== item.target) {
-                result = result.split(item.source).join(item.target);
-            }
-        }
-        return result;
-    }, []);
-
-    const validateTargetSyntax = React.useCallback((target: string) => {
-        if (!target.includes('${') && !target.includes('`')) return true;
-        try {
-            // eslint-disable-next-line no-new-func
-            new Function(`return \`${target.replace(/`/g, '\\`')}\`;`);
-            return true;
-        } catch {
-            return false;
-        }
-    }, []);
-
     const validateSecurityText = React.useCallback((target: string) => {
         const issues: { severity: 'critical' | 'warning'; message: string }[] = [];
         if (!target) return issues;
@@ -345,221 +324,142 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
         setErrorItems([]);
         setHasChecked(true);
         try {
-            const { regexItems, astItems, metadata, currentFile, sourceCache, setSourceCache } = useRegexStore.getState();
+            await save(true);
+            const { metadata } = useRegexStore.getState();
             if (!metadata) {
                 notice.error(t('Editor.Errors.NoMetadata'));
                 return;
             }
 
             const pluginId = metadata.plugin;
-
-            if (!currentFile || !currentFile.endsWith('.js')) {
-                notice.info(t('Editor.Errors.NotJs'));
-                return;
-            }
-
             const state = i18n.stateManager.getPluginState(pluginId);
             const isApplied = !!(state && state.isApplied);
-
-            // 1. 获取源代码 (内存优先)
-            let originalCode: string | null = sourceCache[currentFile];
-            if (!originalCode) {
-                // 如果未译 (isApplied === false)，优先尝试从磁盘读取实际文件 (因为它就是原始代码)
-                if (!isApplied) {
-                    try {
-                        // @ts-ignore
-                        const manifest = i18n.app.plugins.manifests[pluginId];
-                        if (manifest) {
-                            // @ts-ignore
-                            const basePath = path.normalize(i18n.app.vault.adapter.getBasePath());
-                            const pluginDir = path.join(basePath, manifest.dir || '');
-                            const targetFilePath = path.join(pluginDir, currentFile);
-                            if (fs.existsSync(targetFilePath)) {
-                                originalCode = fs.readFileSync(targetFilePath, 'utf8');
-                            }
-                        }
-                    } catch (e) {
-                        console.warn("Failed to read original source from disk, falling back to backup.", e);
-                    }
-                }
-
-                // 如果仍为空 (已译或读取磁盘失败)，则从备份获取
-                if (!originalCode) {
-                    originalCode = await i18n.backupManager.getBackupContent(pluginId, currentFile);
-                }
-
-                if (originalCode) {
-                    setSourceCache(currentFile, originalCode);
-                }
+            // @ts-ignore
+            const manifest = i18n.app.plugins.manifests[pluginId];
+            if (!manifest) {
+                notice.error(t('Editor.Errors.NoManifest'));
+                return;
             }
-
-            if (!originalCode) {
-                notice.error(t('Editor.Errors.NoBackup'));
+            // @ts-ignore
+            const basePath = path.normalize(i18n.app.vault.adapter.getBasePath());
+            const pluginDir = path.join(basePath, manifest.dir || '');
+            const pluginTranslationPath = useGlobalStoreInstance.getState().editorPluginTranslationPath;
+            const sourceIdFromPath = pluginTranslationPath
+                ? path.basename(pluginTranslationPath, path.extname(pluginTranslationPath))
+                : '';
+            const activeSourceId = sourceIdFromPath || i18n.sourceManager.getActiveSourceId(pluginId);
+            if (!activeSourceId) {
+                notice.error(t('Editor.Errors.NoMetadata'));
                 return;
             }
 
-            const results: DiagnoseError[] = [];
+            // @ts-ignore
+            const pluginsApi = i18n.app.plugins;
+            const wasEnabled = pluginsApi.enabledPlugins.has(pluginId);
+            const applyAst = i18n.settings.applyAstTranslations !== false;
+            const applyRegex = i18n.settings.applyRegexTranslations !== false;
+            // @ts-ignore
+            const backupBasePath = path.join(basePath, i18n.manifest.dir || '');
 
-            // 2. 深度语法与试运行检测 (物理沙箱重载阶段)
-            try {
-                // @ts-ignore
-                const wasEnabled = i18n.app.plugins.enabledPlugins.has(pluginId);
-                // @ts-ignore
-                const basePath = path.normalize(i18n.app.vault.adapter.getBasePath());
-                // @ts-ignore
-                const manifest = i18n.app.plugins.manifests[pluginId];
-                if (!manifest) throw new Error("Manifest not found");
-                const pluginDir = path.join(basePath, manifest.dir || '');
-                const targetFilePath = path.join(pluginDir, currentFile);
-
+            const runProbe = async (probe: { files: Array<{ file: string; code: string }> }) => {
+                const originals = new Map<string, string | null>();
+                let success = false;
+                let error = '';
                 try {
-                    // 准备要测试的项
-                    const activeAstItems = astItems.filter(item => item.target && item.target !== item.source);
-                    const activeRegexItems = regexItems.filter(item => item.target && item.target !== item.source);
-
-                    if (activeAstItems.length === 0 && activeRegexItems.length === 0) {
-                        notice.success(t('Editor.Notices.DiagnosisSuccess'));
-                        return;
+                    for (const file of probe.files) {
+                        const targetPath = path.join(pluginDir, file.file);
+                        originals.set(file.file, fs.existsSync(targetPath) ? fs.readFileSync(targetPath, 'utf8') : null);
+                        fs.ensureDirSync(path.dirname(targetPath));
+                        fs.writeFileSync(targetPath, file.code, 'utf8');
                     }
 
-                    // 第一跑：纯静态语法与合规内容校验 (Static Compliance Scan)
-                    const { validateBracketBalance, validateVariableConsistency } = await import('./utils/validation-utils');
-
-                    for (const item of activeAstItems) {
-                        const source = item.source || '';
-                        const target = item.target || '';
-                        if (!validateTargetSyntax(target)) {
-                            results.push({ type: 'ast', id: item.id, source: (t('Editor.Errors.SyntaxError') || '语法错误') + ': ' + target, severity: 'error' });
-                        } else if (!validateBracketBalance(target)) {
-                            results.push({ type: 'ast', id: item.id, source: (t('Editor.Errors.BracketMismatch') || '括号不匹配') + ': ' + target, severity: 'error' });
-                        } else if (!validateVariableConsistency(source, target)) {
-                            results.push({ type: 'ast', id: item.id, source: (t('Editor.Errors.VariableMismatch') || '变量丢失') + ': ' + target, severity: 'error' });
-                        }
+                    if (pluginsApi.enabledPlugins.has(pluginId)) {
+                        await pluginsApi.disablePlugin(pluginId);
                     }
-
-                    for (const item of activeRegexItems) {
-                        const target = item.target || '';
-                        if (!validateBracketBalance(target)) {
-                            results.push({ type: 'regex', id: item.id, source: (t('Editor.Errors.BracketMismatch') || '括号不匹配') + ': ' + target, severity: 'error' });
-                        } else if (!validateVariableConsistency(item.source || '', target)) {
-                            results.push({ type: 'regex', id: item.id, source: (t('Editor.Errors.VariableMismatch') || '变量丢失') + ': ' + target, severity: 'error' });
-                        }
-                    }
-
-                    // 如果静态筛查出严重格式缺陷，直接中断并汇报，避免后续无意义的物理重启探险
-                    if (results.length > 0) {
-                        setErrorItems(results);
-                        notice.error(t('Editor.Errors.SyntaxErrorTotal', { count: results.length }));
-                        return; // 提前退出！！
-                    }
-
-                    // 环境联调测试函数 (将代码写入文件并在真实中拉起插件)
-                    const checkItemsDeep = async (checkAstItems: typeof activeAstItems, checkRegexItems: typeof activeRegexItems): Promise<boolean> => {
-                        try {
-                            const astResult = await i18n.companionWorkerManager.astReplace({
-                                code: originalCode,
-                                translations: checkAstItems,
-                            });
-                            const finalCode = applyRegexItems(astResult.code, checkRegexItems);
-
-                            // 第一步：快速语法检查把关
-                            try {
-                                // eslint-disable-next-line no-new-func
-                                new Function(finalCode);
-                            } catch {
-                                return false;
-                            }
-
-                            // 第二步：真实写入并沙箱重启验证
-                            fs.writeFileSync(targetFilePath, finalCode);
-                            // @ts-ignore
-                            if (i18n.app.plugins.enabledPlugins.has(pluginId)) {
-                                // @ts-ignore
-                                await i18n.app.plugins.disablePlugin(pluginId);
-                            }
-                            // @ts-ignore
-                            await i18n.app.plugins.enablePlugin(pluginId);
-
-                            // 必须判断组件真的拉起来了
-                            // @ts-ignore
-                            return !!i18n.app.plugins.plugins[pluginId];
-                        } catch (e) {
-                            return false; // 比如文件写入错误、重载抛错均视为拦截
-                        }
-                    };
-
-                    // 第一阶段：先尝试批量安全通过全测
-                    let batchSuccess = await checkItemsDeep(activeAstItems, activeRegexItems);
-
-                    // 第二阶段：如果批量失败，带 async 递归环境的二分分割盲搜
-                    if (!batchSuccess) {
-                        const findErrors = async (items: { type: 'ast' | 'regex', data: any }[]) => {
-                            if (items.length === 0) return;
-
-                            const currentAst = items.filter(i => i.type === 'ast').map(i => i.data);
-                            const currentRegex = items.filter(i => i.type === 'regex').map(i => i.data);
-
-                            if (await checkItemsDeep(currentAst, currentRegex)) return; // 这组没问题
-
-                            if (items.length === 1) {
-                                const err = items[0];
-                                if (err.type === 'ast' && !validateTargetSyntax(err.data.target)) {
-                                    results.push({ type: 'ast', id: err.data.id, source: err.data.source });
-                                } else {
-                                    results.push({ type: err.type, id: err.data.id, source: err.data.source });
-                                }
-                                return;
-                            }
-
-                            const mid = Math.floor(items.length / 2);
-                            await findErrors(items.slice(0, mid));
-                            await findErrors(items.slice(mid));
-                        };
-
-                        const allItems: { type: 'ast' | 'regex', data: any }[] = [
-                            ...activeAstItems.map(i => ({ type: 'ast' as const, data: i })),
-                            ...activeRegexItems.map(i => ({ type: 'regex' as const, data: i }))
-                        ];
-
-                        await findErrors(allItems);
-                    }
+                    await pluginsApi.enablePlugin(pluginId);
+                    success = pluginsApi.enabledPlugins.has(pluginId) && !!pluginsApi.plugins[pluginId];
+                } catch (e) {
+                    success = false;
+                    error = String(e);
                 } finally {
-                    // 【强制保证退出后复原】不论任何情况，确保目标恢复为原本的模样并重启
-                    try {
-                        if (originalCode) {
-                            fs.writeFileSync(targetFilePath, originalCode);
+                    for (const [file, content] of originals) {
+                        const targetPath = path.join(pluginDir, file);
+                        if (content === null) {
+                            if (fs.existsSync(targetPath)) fs.removeSync(targetPath);
+                        } else {
+                            fs.writeFileSync(targetPath, content, 'utf8');
                         }
-                        // @ts-ignore
-                        if (i18n.app.plugins.enabledPlugins.has(pluginId)) {
-                            // @ts-ignore
-                            await i18n.app.plugins.disablePlugin(pluginId);
+                    }
+                    try {
+                        if (pluginsApi.enabledPlugins.has(pluginId)) {
+                            await pluginsApi.disablePlugin(pluginId);
                         }
                         if (wasEnabled) {
-                            // @ts-ignore
-                            await i18n.app.plugins.enablePlugin(pluginId);
+                            await pluginsApi.enablePlugin(pluginId);
                         }
-                    } catch (e) {
-                        console.error("[i18n 深度诊断系统] 致命错误：环境清理失败！", e);
+                    } catch (restoreError) {
+                        console.error('[i18n] Failed to restore plugin state after diagnose probe:', restoreError);
                     }
                 }
-            } catch (e) {
-                console.error("Diagnostic process failed", e);
-                notice.error(t('Common.Status.Failure') + ': ' + e);
-                return;
+                return { success, error };
+            };
+
+            let response = await i18n.companionWorkerManager.startPluginDiagnoseCleanup({
+                pluginId,
+                pluginDir,
+                backupBasePath,
+                persistence: { basePath: i18n.sourceManager.getBasePath() },
+                translationSourceId: activeSourceId,
+                applyAst,
+                applyRegex,
+                runtimeProbe: true,
+                isApplied,
+            });
+
+            while (response.status === 'probe' && response.sessionId && response.probe) {
+                const probeResult = await runProbe(response.probe);
+                response = await i18n.companionWorkerManager.stepPluginDiagnoseCleanup({
+                    sessionId: response.sessionId,
+                    probeId: response.probe.probeId,
+                    success: probeResult.success,
+                    error: probeResult.error,
+                });
             }
 
+            i18n.sourceManager.reloadFromDisk();
+            const cleaned = i18n.sourceManager.readSourceFile(activeSourceId);
+            if (cleaned?.dict) {
+                useGlobalStoreInstance.setState({ editorPluginTranslation: cleaned });
+                useRegexStore.setState({ currentFile: '' });
+                setDictData(cleaned.dict);
+                const nextFile = cleaned.dict['main.js'] ? 'main.js' : Object.keys(cleaned.dict)[0] || '';
+                if (nextFile) setCurrentFile(nextFile);
+            }
+
+            const results: DiagnoseError[] = (response.removedItems || []).map((item) => ({
+                type: item.kind,
+                id: item.index,
+                source: item.source,
+                message: item.reason,
+                severity: 'error',
+            }));
             setErrorItems(results);
-            if (results.length === 0) {
+            if (response.status === 'baselineFailed') {
+                notice.warning(t('Editor.Notices.DiagnosisRuntimeBaselineFailed'));
+            } else if (results.length === 0) {
                 notice.success(t('Editor.Notices.DiagnosisSuccess'));
             } else {
-                notice.error(t('Editor.Errors.SyntaxErrorTotal', { count: results.length }));
+                notice.error(t('Editor.Notices.DiagnosisCleanupRemoved', { count: results.length }));
+            }
+            if (response.status === 'baselineFailed' && results.length > 0) {
+                notice.error(t('Editor.Notices.DiagnosisCleanupRemoved', { count: results.length }));
             }
         } catch (e) {
             notice.error(t('Common.Status.Failure') + ' ' + t('Editor.Notices.DiagnosisSuccess') + ': ' + e);
         } finally {
             setIsDiagnosing(false);
         }
-    }, [i18n, notice, t, isDiagnosing, applyRegexItems, validateTargetSyntax]);
+    }, [i18n, notice, t, isDiagnosing, save, setDictData, setCurrentFile]);
 
     const handleSecurityDiagnose = React.useCallback(async () => {
         if (isDiagnosing) return;

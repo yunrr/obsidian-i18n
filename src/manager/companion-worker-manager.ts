@@ -23,6 +23,9 @@ import type {
     CompanionGithubWriteRequest,
     CompanionGithubWriteResponse,
     CompanionPluginApplyTranslationRequest,
+    CompanionPluginDiagnoseCleanupResponse,
+    CompanionPluginDiagnoseCleanupStartRequest,
+    CompanionPluginDiagnoseCleanupStepRequest,
     CompanionProxyRequest,
     CompanionProxyResponse,
     CompanionSourceManagerRequest,
@@ -56,6 +59,9 @@ export type {
     CompanionGithubWriteRequest,
     CompanionExtractResult,
     CompanionPluginApplyTranslationRequest,
+    CompanionPluginDiagnoseCleanupResponse,
+    CompanionPluginDiagnoseCleanupStartRequest,
+    CompanionPluginDiagnoseCleanupStepRequest,
     CompanionPluginBatchExtractPayload,
     CompanionPluginBatchTranslatePayload,
     CompanionPluginExtractPayload,
@@ -167,6 +173,14 @@ export class CompanionWorkerManager {
 
     public async applyPluginTranslation(request: CompanionPluginApplyTranslationRequest): Promise<CompanionApplyTranslationResponse> {
         return this.runTask<CompanionApplyTranslationResponse>('plugin-apply-translation', request);
+    }
+
+    public async startPluginDiagnoseCleanup(request: CompanionPluginDiagnoseCleanupStartRequest): Promise<CompanionPluginDiagnoseCleanupResponse> {
+        return this.runTask<CompanionPluginDiagnoseCleanupResponse>('plugin-diagnose-cleanup-start', request);
+    }
+
+    public async stepPluginDiagnoseCleanup(request: CompanionPluginDiagnoseCleanupStepRequest): Promise<CompanionPluginDiagnoseCleanupResponse> {
+        return this.runTask<CompanionPluginDiagnoseCleanupResponse>('plugin-diagnose-cleanup-step', request);
     }
 
     public async applyThemeTranslation(request: CompanionThemeApplyTranslationRequest): Promise<CompanionApplyTranslationResponse> {

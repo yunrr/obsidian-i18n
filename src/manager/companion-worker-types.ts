@@ -170,6 +170,55 @@ export interface CompanionApplyTranslationResponse {
     error?: string;
 }
 
+export interface CompanionTranslationIssueItem {
+    file: string;
+    kind: 'ast' | 'regex';
+    index: number;
+    source: string;
+    target: string;
+    reason: string;
+}
+
+export interface CompanionRuntimeProbeFile {
+    file: string;
+    code: string;
+}
+
+export interface CompanionRuntimeProbeRequest {
+    probeId: string;
+    files: CompanionRuntimeProbeFile[];
+    label: string;
+}
+
+export interface CompanionPluginDiagnoseCleanupStartRequest {
+    pluginId: string;
+    pluginDir: string;
+    backupBasePath: string;
+    persistence: CompanionWorkerPersistenceConfig;
+    translationSourceId: string;
+    applyAst?: boolean;
+    applyRegex?: boolean;
+    runtimeProbe?: boolean;
+    isApplied?: boolean;
+}
+
+export interface CompanionPluginDiagnoseCleanupStepRequest {
+    sessionId: string;
+    probeId: string;
+    success: boolean;
+    error?: string;
+}
+
+export interface CompanionPluginDiagnoseCleanupResponse {
+    state: boolean;
+    status: 'probe' | 'completed' | 'cleaned' | 'baselineFailed';
+    sessionId?: string;
+    probe?: CompanionRuntimeProbeRequest;
+    removedItems: CompanionTranslationIssueItem[];
+    processedFiles: number;
+    translationVersion: string;
+}
+
 export interface CompanionSourceManagerRequest {
     persistence: CompanionWorkerPersistenceConfig;
     sourceId?: string;
@@ -482,4 +531,4 @@ export interface CompanionThemeFailureRetryPayload {
 
 export type CompanionAsyncTaskType = 'plugin-batch-extract' | 'theme-batch-extract' | 'plugin-batch-translate' | 'theme-batch-translate' | 'plugin-failure-retry' | 'theme-failure-retry' | 'cloud-backup-all';
 
-export type CompanionBatchTaskType = 'plugin-extract' | 'theme-extract' | 'plugin-translate' | 'theme-translate' | 'plugin-retry' | 'theme-retry' | 'ast-replace' | 'code-extract' | 'plugin-apply-translation' | 'theme-apply-translation' | 'source-read' | 'source-export' | 'source-import' | 'source-remove' | 'source-set-active' | 'source-index' | 'source-clear-batch-records' | CompanionCloudTaskType;
+export type CompanionBatchTaskType = 'plugin-extract' | 'theme-extract' | 'plugin-translate' | 'theme-translate' | 'plugin-retry' | 'theme-retry' | 'ast-replace' | 'code-extract' | 'plugin-apply-translation' | 'plugin-diagnose-cleanup-start' | 'plugin-diagnose-cleanup-step' | 'theme-apply-translation' | 'source-read' | 'source-export' | 'source-import' | 'source-remove' | 'source-set-active' | 'source-index' | 'source-clear-batch-records' | CompanionCloudTaskType;
