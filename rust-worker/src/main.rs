@@ -6586,20 +6586,21 @@ where
         .map(|batch| batch.to_vec())
         .collect();
     let concurrency = config.concurrency.max(1).min(batches.len().max(1));
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-    let mut handles = Vec::new();
+    let mut handles = JoinSet::new();
+    let mut next_batch = 0usize;
+    let mut first_error: Option<anyhow::Error> = None;
 
-    for batch in batches {
+    while next_batch < batches.len() && handles.len() < concurrency {
         if let Some(task) = &task {
             ensure_not_cancelled(task).await?;
         }
+        let batch = batches[next_batch].clone();
+        next_batch += 1;
         let simplified: Vec<Value> = batch.iter().map(&simplify).collect();
         let prompt = prompt.to_string();
         let config = config.clone();
         let task = task.clone();
-        let permit = semaphore.clone().acquire_owned().await?;
-        handles.push(tokio::spawn(async move {
-            let _permit = permit;
+        handles.spawn(async move {
             if let Some(task) = &task {
                 ensure_not_cancelled(task).await?;
             }
@@ -6608,24 +6609,69 @@ where
                 ensure_not_cancelled(task).await?;
             }
             Ok::<_, anyhow::Error>((batch, result))
-        }));
+        });
     }
 
-    for handle in handles {
-        let (batch, result) = handle.await??;
-        let translated = result?;
-        for item in &batch {
-            let id = item.get("id").and_then(Value::as_u64).unwrap_or(0);
-            let mut mapped = item.clone();
-            let target = translated
-                .iter()
-                .find(|entry| entry.i == id)
-                .map(|entry| entry.t.as_str())
-                .filter(|value| is_valid_translated_target(value))
-                .ok_or_else(|| anyhow!("翻译返回缺少部分条目或包含空译文"))?;
-            mapped["target"] = Value::String(target.to_string());
-            output.push(mapped);
+    while let Some(handle) = handles.join_next().await {
+        if let Some(task) = &task {
+            ensure_not_cancelled(task).await?;
         }
+        let (batch, result) = handle??;
+        if let Some(task) = &task {
+            increment_progress(task, "processedItems", batch.len()).await;
+        }
+        match result {
+            Ok(translated) => {
+                for item in &batch {
+                    let id = item.get("id").and_then(Value::as_u64).unwrap_or(0);
+                    let mut mapped = item.clone();
+                    let target = translated
+                        .iter()
+                        .find(|entry| entry.i == id)
+                        .map(|entry| entry.t.as_str())
+                        .filter(|value| is_valid_translated_target(value));
+                    let Some(target) = target else {
+                        if first_error.is_none() {
+                            first_error = Some(anyhow!("翻译返回缺少部分条目或包含空译文"));
+                        }
+                        continue;
+                    };
+                    mapped["target"] = Value::String(target.to_string());
+                    output.push(mapped);
+                }
+            }
+            Err(error) if error.to_string().contains(MANUAL_STOP) => return Err(error),
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+
+        while first_error.is_none() && next_batch < batches.len() && handles.len() < concurrency {
+            if let Some(task) = &task {
+                ensure_not_cancelled(task).await?;
+            }
+            let batch = batches[next_batch].clone();
+            next_batch += 1;
+            let simplified: Vec<Value> = batch.iter().map(&simplify).collect();
+            let prompt = prompt.to_string();
+            let config = config.clone();
+            let task = task.clone();
+            handles.spawn(async move {
+                if let Some(task) = &task {
+                    ensure_not_cancelled(task).await?;
+                }
+                let result = call_chat_completion(&simplified, &prompt, &config).await;
+                if let Some(task) = &task {
+                    ensure_not_cancelled(task).await?;
+                }
+                Ok::<_, anyhow::Error>((batch, result))
+            });
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
     }
     Ok(output)
 }
@@ -7241,6 +7287,7 @@ fn apply_plugin_retry_result(
         }
         Err(error) if error.to_string().contains(MANUAL_STOP) => return Err(error),
         Err(_) => {
+            *processed_items += failure_item_counts.values().sum::<usize>();
             for failure_id in failure_item_counts.keys() {
                 push_unique(failed_ids, failure_id.clone());
             }
@@ -7280,6 +7327,7 @@ fn apply_theme_retry_result(
         }
         Err(error) if error.to_string().contains(MANUAL_STOP) => return Err(error),
         Err(_) => {
+            *processed_items += failure_item_counts.values().sum::<usize>();
             for failure_id in failure_item_counts.keys() {
                 push_unique(failed_ids, failure_id.clone());
             }
@@ -7403,6 +7451,7 @@ async fn handle_failure_retry(
     let item_limit = translate_window_item_limit(retry.config.batch_size, retry.config.concurrency);
     let mut retry_queue = load_retry_failures_for_scope(&paths, scope);
     let mut failed_retry_ids = HashSet::<String>::new();
+    let mut processed_retry_ids = HashSet::<String>::new();
 
     while !retry_queue.is_empty() {
         if !is_task_active(&task).await {
@@ -7429,17 +7478,20 @@ async fn handle_failure_retry(
             let Some(mut translation_json) = read_translation(&paths, &first.source_id) else {
                 let skipped_ids = failures.iter().map(|failure| failure.id.clone()).collect::<Vec<_>>();
                 remove_failures(state, &paths, &skipped_ids).await?;
+                increment_progress(&task, "processedItems", retry_failure_item_count(&failures)).await;
                 increment_progress(&task, "skippedCount", failures.len()).await;
-                increment_progress(&task, "processedResources", failures.len()).await;
+                increment_progress(&task, "processedResources", count_new_retry_failures(&mut processed_retry_ids, &failures)).await;
                 bump_record_revision(&task).await;
                 continue;
             };
-            let payload = json!({ "resourceId": first.resource_id, "resourceLabel": first.resource_label, "sourceId": first.source_id, "failures": failures, "config": retry.config });
+            let payload = json!({ "resourceId": first.resource_id, "resourceLabel": first.resource_label, "sourceId": first.source_id, "failures": failures.clone(), "config": retry.config });
+            let processed_items_before = task.progress.lock().await.processed_items;
             let result = if is_plugin {
                 handle_plugin_retry(payload, Some(task.clone())).await
             } else {
                 handle_theme_retry(payload, Some(task.clone())).await
             }?;
+            let processed_items_after = task.progress.lock().await.processed_items;
             let updates = result
                 .get("updates")
                 .and_then(Value::as_array)
@@ -7467,13 +7519,15 @@ async fn handle_failure_retry(
                     }
                 }
             }
+            touch_progress(&task, json!({ "failedCount": failed_retry_ids.len() })).await;
             increment_progress(
                 &task,
                 "processedItems",
-                result
+                (result
                     .get("processedItems")
                     .and_then(Value::as_u64)
-                    .unwrap_or(0) as usize,
+                    .unwrap_or(0) as usize)
+                    .saturating_sub(processed_items_after.saturating_sub(processed_items_before)),
             )
             .await;
             increment_progress(
@@ -7492,16 +7546,21 @@ async fn handle_failure_retry(
                     .unwrap_or(0),
             )
             .await;
-            increment_progress(&task, "processedResources", completed_failure_ids.len()).await;
+            increment_progress(&task, "processedResources", count_new_retry_failures(&mut processed_retry_ids, &failures)).await;
             bump_source_revision(&task).await;
             bump_record_revision(&task).await;
         }
         prune_retry_window_from_queue(&mut retry_queue, &window);
     }
-    if is_task_active(&task).await {
-        increment_progress(&task, "failedCount", failed_retry_ids.len()).await;
-    }
     Ok(())
+}
+
+fn retry_failure_item_count(failures: &[BatchTaskFailureRecord]) -> usize {
+    failures.iter().map(|failure| failure.items.len()).sum()
+}
+
+fn count_new_retry_failures(seen: &mut HashSet<String>, failures: &[BatchTaskFailureRecord]) -> usize {
+    failures.iter().filter(|failure| seen.insert(failure.id.clone())).count()
 }
 
 fn calculate_checksum(value: &Value) -> Result<String> {
@@ -7568,6 +7627,7 @@ mod tests {
     use tokio::{
         io::AsyncWriteExt,
         net::TcpListener,
+        sync::mpsc,
         time::{sleep, Duration as TokioDuration},
     };
 
@@ -7725,6 +7785,121 @@ mod tests {
         let failures = record.get("failures").and_then(Value::as_array).unwrap();
         assert!(failures.is_empty());
     }
+
+    #[test]
+    fn plugin_retry_counts_attempted_items_when_batch_fails() {
+        let result: Result<Vec<Value>> = Err(anyhow!("AI offline"));
+        let mut updates = Vec::new();
+        let mut processed_items = 0usize;
+        let mut completed_ids = Vec::new();
+        let mut failed_ids = Vec::new();
+        let failure_item_counts = HashMap::from([
+            ("failure-a".to_string(), 2usize),
+            ("failure-b".to_string(), 1usize),
+        ]);
+
+        apply_plugin_retry_result(
+            result,
+            "regex",
+            &mut updates,
+            &mut processed_items,
+            &mut completed_ids,
+            &mut failed_ids,
+            &failure_item_counts,
+        )
+        .unwrap();
+
+        assert_eq!(processed_items, 3);
+        assert!(updates.is_empty());
+        assert!(completed_ids.is_empty());
+        assert!(failed_ids.contains(&"failure-a".to_string()));
+        assert!(failed_ids.contains(&"failure-b".to_string()));
+    }
+
+    #[tokio::test]
+    async fn failure_retry_missing_translation_advances_item_progress() {
+        let base_path = env::temp_dir().join(format!("i18n-retry-progress-{}", nanoid!()));
+        let paths = paths(base_path.to_str().unwrap());
+        write_json_pretty(
+            &paths.batch_task_record_path,
+            &json!({
+                "schemaVersion": 1,
+                "checkpoints": {},
+                "failures": [{
+                    "id": "failure-a",
+                    "scope": "plugin",
+                    "resourceId": "plugin-a",
+                    "resourceLabel": "Plugin A",
+                    "sourceId": "missing-source",
+                    "batchType": "regex",
+                    "errorMessage": "failed",
+                    "items": [
+                        { "source": "A", "target": "", "dictIndex": 0, "file": "main.js" },
+                        { "source": "B", "target": "", "dictIndex": 1, "file": "main.js" }
+                    ],
+                    "failedAt": 1
+                }],
+                "successBatches": [],
+                "updatedAt": 0
+            }),
+        )
+        .unwrap();
+        let state = AppState {
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            persistence_lock: Arc::new(Mutex::new(())),
+            plugin_dir: base_path.clone(),
+            http: reqwest::Client::new(),
+            shutdown: Arc::new(Mutex::new(None)),
+        };
+        let task = Arc::new(TaskRuntime {
+            progress: Mutex::new(CompanionTaskProgress {
+                task_id: "task".to_string(),
+                scope: "plugin".to_string(),
+                mode: "translate".to_string(),
+                status: "running".to_string(),
+                current_label: String::new(),
+                processed_resources: 0,
+                total_resources: 1,
+                processed_items: 0,
+                total_items: 2,
+                success_count: 0,
+                failed_count: 0,
+                skipped_count: 0,
+                source_revision: 0,
+                record_revision: 0,
+                updated_at: 0,
+                error: None,
+            }),
+            cancel_requested: Mutex::new(false),
+        });
+        let payload = json!({
+            "persistence": { "basePath": base_path.to_string_lossy() },
+            "config": {
+                "chatCompletionsUrl": "http://127.0.0.1",
+                "apiKey": "test",
+                "model": "test",
+                "timeoutMs": 1000,
+                "responseFormat": "json_object",
+                "batchSize": 2,
+                "overwriteExistingTranslations": false,
+                "concurrency": 1,
+                "prompts": { "ast": "", "regex": "", "theme": "" }
+            },
+            "concurrency": 1,
+            "totalResources": 1,
+            "totalItems": 2
+        });
+
+        handle_failure_retry(&state, task.clone(), payload, true)
+            .await
+            .unwrap();
+
+        let progress = task.progress.lock().await.clone();
+        assert_eq!(progress.processed_items, 2);
+        assert_eq!(progress.processed_resources, 1);
+        assert_eq!(progress.skipped_count, 1);
+        let _ = fs::remove_dir_all(base_path);
+    }
     #[tokio::test]
     async fn requesting_cancel_keeps_task_running_until_worker_exits() {
         let task = Arc::new(TaskRuntime {
@@ -7755,6 +7930,170 @@ mod tests {
         let progress = task.progress.lock().await.clone();
         assert_eq!(progress.status, "running");
         assert_eq!(progress.current_label, "正在停止");
+    }
+    #[tokio::test]
+    async fn translate_value_batches_waits_for_in_flight_requests_after_batch_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (slow_status_tx, mut slow_status_rx) = mpsc::channel::<bool>(1);
+
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let slow_status_tx = slow_status_tx.clone();
+                tokio::spawn(async move {
+                    serve_translate_value_batch_test_request(stream, slow_status_tx).await;
+                });
+            }
+        });
+
+        let config = CompanionTranslationConfig {
+            chat_completions_url: format!("http://{addr}/v1/chat/completions"),
+            api_key: "test-key".to_string(),
+            model: "test-model".to_string(),
+            timeout_ms: 5_000,
+            response_format: "json_object".to_string(),
+            batch_size: 1,
+            overwrite_existing_translations: false,
+            concurrency: 2,
+            prompts: PromptConfig {
+                ast: String::new(),
+                regex: String::new(),
+                theme: String::new(),
+            },
+        };
+
+        let result = translate_value_batches(
+            &[
+                json!({ "id": 0, "source": "bad" }),
+                json!({ "id": 1, "source": "slow" }),
+            ],
+            "prompt",
+            &config,
+            |item| json!({ "i": item["id"], "s": item["source"] }),
+            None,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let slow_request_was_cancelled =
+            tokio_timeout(TokioDuration::from_secs(2), slow_status_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            !slow_request_was_cancelled,
+            "a failed sibling batch should not abort an in-flight streaming request"
+        );
+    }
+
+    async fn serve_translate_value_batch_test_request(
+        mut stream: tokio::net::TcpStream,
+        slow_status_tx: mpsc::Sender<bool>,
+    ) {
+        let request = read_test_http_request(&mut stream).await;
+        let id = request_item_id(&request);
+        if id == 0 {
+            let event = json!({
+                "choices": [{ "delta": { "content": "{\"items\":[{\"i\":0,\"t\":\"\"}]}" }, "finish_reason": "stop" }]
+            });
+            let _ = stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {}\n\ndata: [DONE]\n\n",
+                        event
+                    )
+                    .as_bytes(),
+                )
+                .await;
+            return;
+        }
+
+        if stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .is_err()
+        {
+            let _ = slow_status_tx.send(true).await;
+            return;
+        }
+        let first_event = json!({
+            "choices": [{ "delta": { "content": "{\"items\":[" } }]
+        });
+        if stream
+            .write_all(format!("data: {}\n\n", first_event).as_bytes())
+            .await
+            .is_err()
+        {
+            let _ = slow_status_tx.send(true).await;
+            return;
+        }
+        let _ = stream.flush().await;
+
+        let mut probe = [0u8; 1];
+        let cancelled_before_finish = tokio::select! {
+            read = stream.read(&mut probe) => matches!(read, Ok(0) | Err(_)),
+            _ = sleep(TokioDuration::from_millis(250)) => false,
+        };
+        if cancelled_before_finish {
+            let _ = slow_status_tx.send(true).await;
+            return;
+        }
+
+        let second_event = json!({
+            "choices": [{ "delta": { "content": "{\"i\":1,\"t\":\"乙\"}]}" }, "finish_reason": "stop" }]
+        });
+        let write_failed = stream
+            .write_all(format!("data: {}\n\ndata: [DONE]\n\n", second_event).as_bytes())
+            .await
+            .is_err();
+        let _ = slow_status_tx.send(write_failed).await;
+    }
+
+    async fn read_test_http_request(stream: &mut tokio::net::TcpStream) -> String {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(header_end) = find_header_end(&buffer) {
+                let headers = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| line.split_once(':'))
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if buffer.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+        String::from_utf8(buffer).unwrap()
+    }
+
+    fn find_header_end(buffer: &[u8]) -> Option<usize> {
+        buffer.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    fn request_item_id(request: &str) -> u64 {
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let payload: Value = serde_json::from_str(body).unwrap();
+        let content = payload
+            .pointer("/messages/1/content")
+            .and_then(Value::as_str)
+            .unwrap();
+        let items: Vec<Value> = serde_json::from_str(content).unwrap();
+        items
+            .first()
+            .and_then(|item| item.get("i"))
+            .and_then(Value::as_u64)
+            .unwrap()
     }
     #[test]
     fn translate_checkpoint_keeps_unfinished_resources_when_stopped_mid_window() {
