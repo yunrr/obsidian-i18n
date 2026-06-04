@@ -6,6 +6,7 @@ import { DiagnosticModal } from "./diagnostic-modal";
 import { LLM_PROVIDERS, LLMProviderConfig } from "../../ai/constants";
 import { I18nSettings, LLMProfile } from "../data";
 import { OllamaTranslationService, OLLAMA_DEFAULT_URL } from "src/ai/ollama-translation-service";
+import { normalizeCompanionWorkerBasePort } from "src/manager/companion-worker-ports";
 
 export default class I18nLLMGeneric extends BaseSetting {
     private config: LLMProviderConfig;
@@ -275,16 +276,20 @@ export default class I18nLLMGeneric extends BaseSetting {
             .setName(t('Settings.Ai.CompanionPortTitle'))
             .setDesc(t('Settings.Ai.CompanionPortDesc'))
             .addText(text => {
-                text.setValue(String(this.settings.llmCompanionWorkerPort || 18743))
+                const normalizedPort = normalizeCompanionWorkerBasePort(this.settings.llmCompanionWorkerPort);
+                this.settings.llmCompanionWorkerPort = normalizedPort;
+                text.setValue(String(normalizedPort))
                     .onChange(async (value) => {
-                        const parsed = Number.parseInt(value, 10);
-                        this.settings.llmCompanionWorkerPort = Number.isFinite(parsed) ? Math.max(1, Math.min(65535, parsed)) : 18743;
+                        const normalized = normalizeCompanionWorkerBasePort(value);
+                        this.settings.llmCompanionWorkerPort = normalized;
+                        text.setValue(String(normalized));
                         this.i18n.companionWorkerManager?.stop();
                         await this.i18n.saveSettings();
                     });
                 text.inputEl.type = 'number';
                 text.inputEl.min = '1';
-                text.inputEl.max = '65535';
+                text.inputEl.max = '65533';
+                text.inputEl.step = '2';
             });
 
         new Setting(this.containerEl)

@@ -5,13 +5,16 @@ import { spawn } from 'child_process';
 import type { ChildProcess } from 'child_process';
 import type I18N from '../main';
 import {
-    getCompanionWorkerPortCandidates,
+    getCompanionWorkerPort,
     type WorkerBackend,
 } from './companion-worker-ports';
 import {
     classifyCompanionWorkerIdentity,
     type CompanionWorkerIdentityState,
 } from './companion-worker-identity';
+import {
+    waitForWorkerReadyOrExit,
+} from './companion-worker-lifecycle';
 import type {
     CompanionAsyncTaskType,
     CompanionApplyTranslationResponse,
@@ -387,42 +390,35 @@ export class CompanionWorkerManager {
 
     private async startBackendInner(backend: WorkerBackend): Promise<boolean> {
         try {
-            for (const port of this.getPortCandidates(backend)) {
-                const endpoint = `http://127.0.0.1:${port}`;
-                const identity = await this.getWorkerIdentity(backend, endpoint, 500);
-                if (identity === 'same') {
-                    this.runtimes[backend].endpoint = endpoint;
-                    return true;
-                }
-                if (identity === 'stale') {
-                    await this.stopWorkerEndpoint(endpoint).catch(() => undefined);
-                    if (await this.getWorkerIdentity(backend, endpoint, 500) !== 'missing') {
-                        continue;
-                    }
-                }
-                if (identity === 'other') {
-                    continue;
-                }
-
-                if (backend === 'rust') {
-                    if (!existsSync(this.rustWorkerPath)) {
-                        throw new Error(`Rust companion worker not found: ${this.rustWorkerPath}`);
-                    }
-                    if (await this.spawnWorker(backend, this.rustWorkerPath, [String(port)], port)) {
-                        return true;
-                    }
-                    continue;
-                }
-
-                if (!existsSync(this.cjsWorkerPath)) {
-                    throw new Error(`CJS companion worker not found: ${this.cjsWorkerPath}`);
-                }
-                const nodePath = this.plugin.settings.llmCompanionNodePath?.trim() || 'node';
-                if (await this.spawnWorker(backend, nodePath, [this.cjsWorkerPath, String(port)], port)) {
-                    return true;
+            const port = this.getPort(backend);
+            const endpoint = `http://127.0.0.1:${port}`;
+            const identity = await this.getWorkerIdentity(backend, endpoint, 150);
+            if (identity === 'same') {
+                this.runtimes[backend].endpoint = endpoint;
+                return true;
+            }
+            if (identity === 'other') {
+                throw new Error(`Local ${backend} companion worker port ${port} is used by another i18n plugin instance`);
+            }
+            if (identity === 'stale') {
+                await this.stopWorkerEndpoint(endpoint).catch(() => undefined);
+                if (await this.getWorkerIdentity(backend, endpoint, 150) !== 'missing') {
+                    return false;
                 }
             }
-            return false;
+
+            if (backend === 'rust') {
+                if (!existsSync(this.rustWorkerPath)) {
+                    throw new Error(`Rust companion worker not found: ${this.rustWorkerPath}`);
+                }
+                return this.spawnWorker(backend, this.rustWorkerPath, [String(port)], port);
+            }
+
+            if (!existsSync(this.cjsWorkerPath)) {
+                throw new Error(`CJS companion worker not found: ${this.cjsWorkerPath}`);
+            }
+            const nodePath = this.plugin.settings.llmCompanionNodePath?.trim() || 'node';
+            return this.spawnWorker(backend, nodePath, [this.cjsWorkerPath, String(port)], port);
         } catch (error) {
             console.warn(`[I18N Companion] Failed to start ${backend} worker`, error);
             await this.stopBackend(backend);
@@ -458,8 +454,20 @@ export class CompanionWorkerManager {
             }
         });
 
-        const ready = await this.isWorkerReady(backend, runtime.endpoint, 5000);
-        if (!ready) {
+        const ready = await waitForWorkerReadyOrExit({
+            timeoutMs: 5000,
+            pollIntervalMs: 150,
+            isReady: () => this.isWorkerReady(backend, runtime.endpoint, 500),
+            waitForExit: () => new Promise(resolve => {
+                if (worker.exitCode !== null || worker.signalCode !== null) {
+                    resolve(undefined);
+                    return;
+                }
+                worker.once('exit', resolve);
+                worker.once('error', resolve);
+            }),
+        });
+        if (ready !== 'ready') {
             runtime.endpoint = '';
             runtime.process = null;
             if (!worker.killed) worker.kill();
@@ -495,8 +503,8 @@ export class CompanionWorkerManager {
         }
     }
 
-    private getPortCandidates(backend: WorkerBackend): number[] {
-        return getCompanionWorkerPortCandidates(this.plugin.settings.llmCompanionWorkerPort, backend);
+    private getPort(backend: WorkerBackend): number {
+        return getCompanionWorkerPort(this.plugin.settings.llmCompanionWorkerPort, backend);
     }
 
     private async isWorkerReady(backend: WorkerBackend, endpoint: string, timeoutMs: number): Promise<boolean> {
