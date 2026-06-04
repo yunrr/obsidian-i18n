@@ -143,6 +143,14 @@ test('CJS worker renders plugin translation code without owning apply file write
         assert.match(payload.result.files[0].code, /世界/);
         assert.equal(payload.result.files[0].file, 'main.js');
         assert.equal(payload.result.processedFiles, undefined);
+        assert.equal(payload.result.diagnostics.totalCandidates, 2);
+        assert.equal(payload.result.diagnostics.astCandidates, 1);
+        assert.equal(payload.result.diagnostics.regexCandidates, 1);
+        assert.equal(payload.result.diagnostics.files.length, 1);
+        assert.equal(payload.result.diagnostics.files[0].file, 'main.js');
+        assert.equal(payload.result.diagnostics.files[0].astCandidates, 1);
+        assert.equal(payload.result.diagnostics.files[0].regexCandidates, 1);
+        assert.equal(typeof payload.result.diagnostics.files[0].regexReplaceMs, 'number');
     } finally {
         worker.kill();
         await Promise.race([

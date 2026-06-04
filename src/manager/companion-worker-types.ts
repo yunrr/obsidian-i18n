@@ -154,6 +154,7 @@ export interface CompanionPluginDiagnoseRenderProbeRequest {
 export interface CompanionPluginDiagnoseRenderProbeResponse {
     state: boolean;
     files: CompanionRuntimeProbeFile[];
+    diagnostics?: CompanionPluginRenderDiagnostics;
     error?: string;
 }
 
@@ -184,7 +185,44 @@ export interface CompanionApplyTranslationResponse {
     state: boolean;
     processedFiles: number;
     translationVersion: string;
+    diagnostics?: CompanionApplyDiagnostics;
     error?: string;
+}
+
+export interface CompanionApplyDiagnosticStage {
+    name: string;
+    durationMs: number;
+    detail?: string;
+}
+
+export interface CompanionPluginRenderFileDiagnostics {
+    file: string;
+    astCandidates: number;
+    regexCandidates: number;
+    astParseMs?: number;
+    astReplaceMs?: number;
+    regexReplaceMs?: number;
+    totalMs: number;
+}
+
+export interface CompanionPluginRenderDiagnostics {
+    totalMs: number;
+    fileCount: number;
+    totalCandidates: number;
+    astCandidates: number;
+    regexCandidates: number;
+    groupMs: number;
+    files: CompanionPluginRenderFileDiagnostics[];
+}
+
+export interface CompanionApplyDiagnostics {
+    totalMs: number;
+    fileCount: number;
+    totalCandidates: number;
+    astCandidates: number;
+    regexCandidates: number;
+    stages: CompanionApplyDiagnosticStage[];
+    cjs?: CompanionPluginRenderDiagnostics;
 }
 
 export interface CompanionTranslationIssueItem {

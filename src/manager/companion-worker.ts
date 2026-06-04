@@ -488,6 +488,8 @@ async function handleAstReplace(payload: CompanionAstReplaceRequest): Promise<Co
 
 async function handlePluginRenderTranslation(payload: CompanionPluginDiagnoseRenderProbeRequest): Promise<CompanionPluginDiagnoseRenderProbeResponse> {
     try {
+        const startedAt = Date.now();
+        const groupStartedAt = Date.now();
         const grouped = new Map<string, { ast: any[]; regex: any[] }>();
         for (const candidate of payload.candidates || []) {
             const entry = grouped.get(candidate.file) || { ast: [], regex: [] };
@@ -495,24 +497,59 @@ async function handlePluginRenderTranslation(payload: CompanionPluginDiagnoseRen
             if (candidate.kind === 'regex') entry.regex.push(candidate.item);
             grouped.set(candidate.file, entry);
         }
+        const groupMs = Date.now() - groupStartedAt;
+        const totalCandidates = (payload.candidates || []).length;
+        const astCandidates = (payload.candidates || []).filter(candidate => candidate.kind === 'ast').length;
+        const regexCandidates = (payload.candidates || []).filter(candidate => candidate.kind === 'regex').length;
+        const fileDiagnostics: NonNullable<CompanionPluginDiagnoseRenderProbeResponse['diagnostics']>['files'] = [];
 
         const files = (payload.files || []).map(file => {
+            const fileStartedAt = Date.now();
             let code = String(file.code || '');
             const translations = grouped.get(file.file);
+            const fileLog = {
+                file: file.file,
+                astCandidates: translations?.ast.length || 0,
+                regexCandidates: translations?.regex.length || 0,
+                astParseMs: undefined as number | undefined,
+                astReplaceMs: undefined as number | undefined,
+                regexReplaceMs: undefined as number | undefined,
+                totalMs: 0,
+            };
             if (translations?.ast.length) {
                 const astTranslator = new AstTranslator({} as any);
+                const astParseStartedAt = Date.now();
                 const ast = astTranslator.loadCode(code);
+                fileLog.astParseMs = Date.now() - astParseStartedAt;
                 if (!ast) throw new Error(`${file.file} AST parse failed`);
+                const astReplaceStartedAt = Date.now();
                 code = astTranslator.translate(ast, translations.ast as any);
+                fileLog.astReplaceMs = Date.now() - astReplaceStartedAt;
             }
             if (translations?.regex.length) {
                 const regexTranslator = new RegexTranslator({} as any);
+                const regexStartedAt = Date.now();
                 code = regexTranslator.translate(code, translations.regex as any);
+                fileLog.regexReplaceMs = Date.now() - regexStartedAt;
             }
+            fileLog.totalMs = Date.now() - fileStartedAt;
+            fileDiagnostics.push(fileLog);
             return { file: file.file, code };
         });
 
-        return { state: true, files };
+        return {
+            state: true,
+            files,
+            diagnostics: {
+                totalMs: Date.now() - startedAt,
+                fileCount: files.length,
+                totalCandidates,
+                astCandidates,
+                regexCandidates,
+                groupMs,
+                files: fileDiagnostics,
+            },
+        };
     } catch (error) {
         return {
             state: false,

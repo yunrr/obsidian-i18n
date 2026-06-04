@@ -1,5 +1,6 @@
 import * as path from 'path';
 import type I18N from 'src/main';
+import type { CompanionApplyDiagnostics } from 'src/manager/companion-worker-types';
 
 export type ApplyPluginTimingStage =
     | 'getCjsEndpoint'
@@ -8,7 +9,7 @@ export type ApplyPluginTimingStage =
     | 'enablePlugin'
     | 'refreshParent';
 
-export type ApplyPluginLogStage = 'flow' | ApplyPluginTimingStage;
+export type ApplyPluginLogStage = 'flow' | 'backendDiagnostics' | ApplyPluginTimingStage;
 export type ApplyPluginLogStatus = 'start' | 'success' | 'failure' | 'skipped';
 
 export interface ApplyPluginStageTiming {
@@ -67,7 +68,8 @@ export function getSlowestApplyPluginStage(timings: ApplyPluginStageTiming[]): A
 const applyPluginStageLabels: Record<ApplyPluginLogStage, string> = {
     flow: '应用译文',
     getCjsEndpoint: '获取 CJS 后端',
-    applyPluginTranslation: 'CJS 替换译文',
+    applyPluginTranslation: '后端应用译文',
+    backendDiagnostics: '后端诊断',
     disablePlugin: '禁用插件',
     enablePlugin: '启用插件',
     refreshParent: '刷新插件列表',
@@ -89,6 +91,10 @@ function formatApplyPluginLogMessage(event: Omit<ApplyPluginLogEvent, 'message'>
     if (event.status === 'success') return `${label}完成${durationText}`;
     if (event.status === 'skipped') return `${label}跳过${durationText}`;
     return `${label}失败${durationText}${event.error ? `：${event.error}` : ''}`;
+}
+
+function formatCandidateCounts(diagnostics: CompanionApplyDiagnostics): string {
+    return `files=${diagnostics.fileCount} candidates=${diagnostics.totalCandidates} ast=${diagnostics.astCandidates} regex=${diagnostics.regexCandidates}`;
 }
 
 export async function runPluginApplyTranslationFlow(options: ApplyPluginFlowOptions): Promise<ApplyPluginFlowResult> {
@@ -139,6 +145,50 @@ export async function runPluginApplyTranslationFlow(options: ApplyPluginFlowOpti
         }
     };
 
+    const emitBackendDiagnostics = (diagnostics?: CompanionApplyDiagnostics) => {
+        if (!diagnostics) return;
+        emitLog({
+            stage: 'backendDiagnostics',
+            status: 'success',
+            durationMs: diagnostics.totalMs,
+            message: `后端应用总览完成（${formatApplyPluginDuration(diagnostics.totalMs)}）：${formatCandidateCounts(diagnostics)}`,
+        });
+        for (const stage of diagnostics.stages || []) {
+            emitLog({
+                stage: 'backendDiagnostics',
+                status: 'success',
+                durationMs: stage.durationMs,
+                message: `Rust 阶段 ${stage.name} 完成（${formatApplyPluginDuration(stage.durationMs)}）${stage.detail ? `：${stage.detail}` : ''}`,
+            });
+        }
+        if (diagnostics.cjs) {
+            emitLog({
+                stage: 'backendDiagnostics',
+                status: 'success',
+                durationMs: diagnostics.cjs.totalMs,
+                message: `CJS 渲染总览完成（${formatApplyPluginDuration(diagnostics.cjs.totalMs)}）：files=${diagnostics.cjs.fileCount} candidates=${diagnostics.cjs.totalCandidates} ast=${diagnostics.cjs.astCandidates} regex=${diagnostics.cjs.regexCandidates}`,
+            });
+            for (const file of diagnostics.cjs.files || []) {
+                if (typeof file.astReplaceMs === 'number') {
+                    emitLog({
+                        stage: 'backendDiagnostics',
+                        status: 'success',
+                        durationMs: file.astReplaceMs,
+                        message: `CJS AST 替换完成（${formatApplyPluginDuration(file.astReplaceMs)}）：${file.file} ast=${file.astCandidates}`,
+                    });
+                }
+                if (typeof file.regexReplaceMs === 'number') {
+                    emitLog({
+                        stage: 'backendDiagnostics',
+                        status: 'success',
+                        durationMs: file.regexReplaceMs,
+                        message: `CJS Regex 替换完成（${formatApplyPluginDuration(file.regexReplaceMs)}）：${file.file} regex=${file.regexCandidates}`,
+                    });
+                }
+            }
+        }
+    };
+
     try {
         emitLog({ stage: 'flow', status: 'start' });
         if (!activeSourceId) throw new Error(messages.genericError);
@@ -169,6 +219,7 @@ export async function runPluginApplyTranslationFlow(options: ApplyPluginFlowOpti
             cjsEndpoint,
         }));
         if (!result.state) throw new Error(result.error || messages.genericError);
+        emitBackendDiagnostics(result.diagnostics);
         i18n.stateManager.setPluginState(plugin.id, {
             id: plugin.id,
             isApplied: true,

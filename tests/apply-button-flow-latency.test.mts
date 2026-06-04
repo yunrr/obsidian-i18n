@@ -62,6 +62,29 @@ function createApplyFlowHarness(delays: DelayMap = {}) {
                     state: true,
                     translationVersion: '2.0.0',
                     processedFiles: 1,
+                    diagnostics: {
+                        totalMs: 8400,
+                        fileCount: 1,
+                        totalCandidates: 2,
+                        astCandidates: 1,
+                        regexCandidates: 1,
+                        stages: [
+                            { name: 'rust.collectCandidates', durationMs: 25, detail: 'total=2 ast=1 regex=1 files=1' },
+                            { name: 'rust.requestCjsRender', durationMs: 8300, detail: 'files=1 candidates=2' },
+                        ],
+                        cjs: {
+                            totalMs: 8200,
+                            files: [
+                                {
+                                    file: 'main.js',
+                                    astCandidates: 1,
+                                    regexCandidates: 1,
+                                    astReplaceMs: 120,
+                                    regexReplaceMs: 8000,
+                                },
+                            ],
+                        },
+                    },
                 };
             },
         },
@@ -161,6 +184,12 @@ test('apply button flow records per-stage timings and restores loading after suc
             ['getCjsEndpoint', 'success', 120],
             ['applyPluginTranslation', 'start', undefined],
             ['applyPluginTranslation', 'success', 8420],
+            ['backendDiagnostics', 'success', 8400],
+            ['backendDiagnostics', 'success', 25],
+            ['backendDiagnostics', 'success', 8300],
+            ['backendDiagnostics', 'success', 8200],
+            ['backendDiagnostics', 'success', 120],
+            ['backendDiagnostics', 'success', 8000],
             ['disablePlugin', 'start', undefined],
             ['disablePlugin', 'success', 35],
             ['enablePlugin', 'start', undefined],

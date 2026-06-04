@@ -22,7 +22,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use swc_common::{sync::Lrc, FileName, SourceMap};
 use swc_ecma_ast::*;
@@ -185,6 +185,68 @@ struct ApplyTranslationResponse {
     state: bool,
     processed_files: usize,
     translation_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<ApplyDiagnostics>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplyDiagnosticStage {
+    name: String,
+    duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginRenderFileDiagnostics {
+    file: String,
+    ast_candidates: usize,
+    regex_candidates: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ast_parse_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ast_replace_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    regex_replace_ms: Option<u64>,
+    total_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginRenderDiagnostics {
+    total_ms: u64,
+    file_count: usize,
+    total_candidates: usize,
+    ast_candidates: usize,
+    regex_candidates: usize,
+    group_ms: u64,
+    files: Vec<PluginRenderFileDiagnostics>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginRenderTranslationResponse {
+    state: bool,
+    files: Vec<RuntimeProbeFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<PluginRenderDiagnostics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplyDiagnostics {
+    total_ms: u64,
+    file_count: usize,
+    total_candidates: usize,
+    ast_candidates: usize,
+    regex_candidates: usize,
+    stages: Vec<ApplyDiagnosticStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cjs: Option<PluginRenderDiagnostics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -4918,12 +4980,16 @@ fn write_apply_translation_files(
     Ok(processed_files)
 }
 
+fn elapsed_ms(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
 async fn request_cjs_render_probe(
     client: &reqwest::Client,
     endpoint: &str,
     files: Vec<RuntimeProbeFile>,
     candidates: &[TranslationCandidate],
-) -> Result<Vec<RuntimeProbeFile>> {
+) -> Result<PluginRenderTranslationResponse> {
     let endpoint = endpoint.trim_end_matches('/');
     let response = client
         .post(format!("{endpoint}/task"))
@@ -4960,20 +5026,15 @@ async fn request_cjs_render_probe(
             .unwrap_or("CJS 替换失败");
         bail!("{error}");
     }
-    serde_json::from_value::<Vec<RuntimeProbeFile>>(
-        result
-            .get("files")
-            .cloned()
-            .ok_or_else(|| anyhow!("CJS 替换缺少 files"))?,
-    )
-    .context("CJS 替换 files 类型错误")
+    serde_json::from_value::<PluginRenderTranslationResponse>(result)
+        .context("CJS 替换 result 类型错误")
 }
 
 async fn render_apply_translation_files_with_cjs(
     cjs_endpoint: &str,
     files: Vec<RuntimeProbeFile>,
     candidates: &[TranslationCandidate],
-) -> Result<Vec<RuntimeProbeFile>> {
+) -> Result<PluginRenderTranslationResponse> {
     request_cjs_render_probe(&reqwest::Client::new(), cjs_endpoint, files, candidates).await
 }
 
@@ -5029,16 +5090,27 @@ fn resolve_apply_translation_json(
 async fn apply_plugin_translation(
     payload: PluginApplyTranslationPayload,
 ) -> Result<ApplyTranslationResponse> {
+    let total_started_at = Instant::now();
+    let mut stages = Vec::new();
+
+    let stage_started_at = Instant::now();
     let translation_json = resolve_apply_translation_json(
         payload.translation_json,
         payload.persistence,
         payload.translation_source_id,
     )?;
+    stages.push(ApplyDiagnosticStage {
+        name: "rust.resolveTranslation".to_string(),
+        duration_ms: elapsed_ms(stage_started_at),
+        detail: None,
+    });
     let dict = translation_json
         .get("dict")
         .and_then(Value::as_object)
         .ok_or_else(|| anyhow!("translationJson.dict missing"))?;
     let files = dict.keys().cloned().collect::<Vec<_>>();
+
+    let stage_started_at = Instant::now();
     create_plugin_backup(
         &payload.backup_base_path,
         &payload.plugin_id,
@@ -5046,9 +5118,15 @@ async fn apply_plugin_translation(
         &files,
         false,
     )?;
+    stages.push(ApplyDiagnosticStage {
+        name: "rust.createBackup".to_string(),
+        duration_ms: elapsed_ms(stage_started_at),
+        detail: Some(format!("files={}", files.len())),
+    });
     let apply_ast = payload.apply_ast.unwrap_or(true);
     let apply_regex = payload.apply_regex.unwrap_or(true);
 
+    let stage_started_at = Instant::now();
     let mut source_files = Vec::new();
     for (file, file_dict) in dict {
         let target_file_path = safe_join(&payload.plugin_dir, file)?;
@@ -5064,6 +5142,11 @@ async fn apply_plugin_translation(
             code: Some(file_string),
         });
     }
+    stages.push(ApplyDiagnosticStage {
+        name: "rust.readSourceFiles".to_string(),
+        duration_ms: elapsed_ms(stage_started_at),
+        detail: Some(format!("files={}", source_files.len())),
+    });
 
     if source_files.is_empty() {
         return Ok(ApplyTranslationResponse {
@@ -5074,6 +5157,15 @@ async fn apply_plugin_translation(
                 .and_then(Value::as_str)
                 .unwrap_or("0.0.0")
                 .to_string(),
+            diagnostics: Some(ApplyDiagnostics {
+                total_ms: elapsed_ms(total_started_at),
+                file_count: 0,
+                total_candidates: 0,
+                ast_candidates: 0,
+                regex_candidates: 0,
+                stages,
+                cjs: None,
+            }),
         });
     }
 
@@ -5085,10 +5177,32 @@ async fn apply_plugin_translation(
         .iter()
         .map(|file| file.file.clone())
         .collect::<HashSet<_>>();
+    let stage_started_at = Instant::now();
     let candidates = collect_translation_candidates(&translation_json, apply_ast, apply_regex)
         .into_iter()
         .filter(|candidate| source_file_set.contains(&candidate.file))
         .collect::<Vec<_>>();
+    let ast_candidates = candidates
+        .iter()
+        .filter(|candidate| candidate.kind == "ast")
+        .count();
+    let regex_candidates = candidates
+        .iter()
+        .filter(|candidate| candidate.kind == "regex")
+        .count();
+    stages.push(ApplyDiagnosticStage {
+        name: "rust.collectCandidates".to_string(),
+        duration_ms: elapsed_ms(stage_started_at),
+        detail: Some(format!(
+            "total={} ast={} regex={} files={}",
+            candidates.len(),
+            ast_candidates,
+            regex_candidates,
+            source_files.len()
+        )),
+    });
+    let source_file_count = source_files.len();
+    let mut cjs_diagnostics = None;
     let rendered_files = if candidates.is_empty() {
         source_files
     } else {
@@ -5098,10 +5212,30 @@ async fn apply_plugin_translation(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow!("cjsEndpoint missing"))?;
-        render_apply_translation_files_with_cjs(cjs_endpoint, source_files, &candidates).await?
+        let stage_started_at = Instant::now();
+        let cjs_response =
+            render_apply_translation_files_with_cjs(cjs_endpoint, source_files, &candidates).await?;
+        stages.push(ApplyDiagnosticStage {
+            name: "rust.requestCjsRender".to_string(),
+            duration_ms: elapsed_ms(stage_started_at),
+            detail: Some(format!(
+                "files={} candidates={}",
+                source_file_count,
+                candidates.len()
+            )),
+        });
+        cjs_diagnostics = cjs_response.diagnostics;
+        cjs_response.files
     };
+
+    let stage_started_at = Instant::now();
     let processed_files =
         write_apply_translation_files(&payload.plugin_dir, rendered_files, &expected_files)?;
+    stages.push(ApplyDiagnosticStage {
+        name: "rust.writeFiles".to_string(),
+        duration_ms: elapsed_ms(stage_started_at),
+        detail: Some(format!("files={processed_files}")),
+    });
 
     Ok(ApplyTranslationResponse {
         state: true,
@@ -5111,6 +5245,15 @@ async fn apply_plugin_translation(
             .and_then(Value::as_str)
             .unwrap_or("0.0.0")
             .to_string(),
+        diagnostics: Some(ApplyDiagnostics {
+            total_ms: elapsed_ms(total_started_at),
+            file_count: source_file_count,
+            total_candidates: candidates.len(),
+            ast_candidates,
+            regex_candidates,
+            stages,
+            cjs: cjs_diagnostics,
+        }),
     })
 }
 
@@ -5151,6 +5294,7 @@ fn apply_theme_translation_blocking(
             .and_then(Value::as_str)
             .unwrap_or("1.0.0")
             .to_string(),
+        diagnostics: None,
     })
 }
 
@@ -15129,7 +15273,25 @@ mod tests {
                                 "file": "main.js",
                                 "code": "const marker = \"from-cjs\";"
                             }
-                        ]
+                        ],
+                        "diagnostics": {
+                            "totalMs": 44,
+                            "fileCount": 1,
+                            "totalCandidates": 2,
+                            "astCandidates": 1,
+                            "regexCandidates": 1,
+                            "groupMs": 4,
+                            "files": [
+                                {
+                                    "file": "main.js",
+                                    "astCandidates": 1,
+                                    "regexCandidates": 1,
+                                    "astReplaceMs": 10,
+                                    "regexReplaceMs": 30,
+                                    "totalMs": 40
+                                }
+                            ]
+                        }
                     }
                 }),
             )
@@ -15178,6 +15340,39 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.get("state").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            response
+                .pointer("/diagnostics/totalCandidates")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            response
+                .pointer("/diagnostics/astCandidates")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            response
+                .pointer("/diagnostics/regexCandidates")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            response
+                .pointer("/diagnostics/stages")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().any(|item| {
+                    item.get("name").and_then(Value::as_str) == Some("rust.requestCjsRender")
+                })),
+            Some(true)
+        );
+        assert_eq!(
+            response
+                .pointer("/diagnostics/cjs/files/0/regexReplaceMs")
+                .and_then(Value::as_u64),
+            Some(30)
+        );
         assert_eq!(
             fs::read_to_string(base_path.join("plugin").join("main.js")).unwrap(),
             "const marker = \"from-cjs\";"
