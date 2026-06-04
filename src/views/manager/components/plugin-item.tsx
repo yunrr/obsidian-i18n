@@ -252,6 +252,7 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
             }
             // @ts-ignore
             const backupBasePath = path.join(path.normalize(i18n.app.vault.adapter.getBasePath()), i18n.manifest.dir || '');
+            const cjsEndpoint = await i18n.companionWorkerManager.getCjsEndpoint();
             const result = await i18n.companionWorkerManager.applyPluginTranslation({
                 pluginId: plugin.id,
                 pluginDir,
@@ -260,6 +261,7 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
                 translationSourceId: activeSourceId,
                 applyAst,
                 applyRegex,
+                cjsEndpoint,
             });
             if (!result.state) throw new Error(result.error || t('Manager.Common.Errors.ErrorDesc'));
             i18n.stateManager.setPluginState(plugin.id, {

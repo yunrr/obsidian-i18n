@@ -332,6 +332,7 @@ export class CompanionWorkerManager {
             type === 'theme-batch-extract' ||
             type === 'code-extract' ||
             type === 'ast-replace' ||
+            type === 'plugin-render-translation' ||
             type === 'plugin-diagnose-render-probe'
         ) {
             return 'cjs';

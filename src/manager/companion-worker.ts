@@ -22,7 +22,6 @@ import type {
     CompanionCodeExtractResponse,
     CompanionPluginDiagnoseRenderProbeRequest,
     CompanionPluginDiagnoseRenderProbeResponse,
-    CompanionPluginApplyTranslationRequest,
     CompanionPluginExtractPayload,
     CompanionPluginExtractResult,
     CompanionThemeExtractPayload,
@@ -487,7 +486,7 @@ async function handleAstReplace(payload: CompanionAstReplaceRequest): Promise<Co
     }
 }
 
-async function handlePluginDiagnoseRenderProbe(payload: CompanionPluginDiagnoseRenderProbeRequest): Promise<CompanionPluginDiagnoseRenderProbeResponse> {
+async function handlePluginRenderTranslation(payload: CompanionPluginDiagnoseRenderProbeRequest): Promise<CompanionPluginDiagnoseRenderProbeResponse> {
     try {
         const grouped = new Map<string, { ast: any[]; regex: any[] }>();
         for (const candidate of payload.candidates || []) {
@@ -518,58 +517,6 @@ async function handlePluginDiagnoseRenderProbe(payload: CompanionPluginDiagnoseR
         return {
             state: false,
             files: [],
-            error: error instanceof Error ? error.message : String(error),
-        };
-    }
-}
-
-async function handlePluginApplyTranslation(payload: CompanionPluginApplyTranslationRequest) {
-    try {
-        const translationJson = payload.translationJson || (
-            payload.persistence && payload.translationSourceId
-                ? await readTranslationFile<PluginTranslationV1>(getPersistencePaths(payload.persistence.basePath), payload.translationSourceId)
-                : null
-        );
-        if (!translationJson) throw new Error('翻译文件不存在');
-        const dict = translationJson.dict || {};
-        const files = Object.keys(dict);
-        await createWorkerBackup(payload.backupBasePath, payload.pluginId, payload.pluginDir, files);
-        const applyAst = payload.applyAst !== false;
-        const applyRegex = payload.applyRegex !== false;
-
-        let processedFiles = 0;
-        for (const file of files) {
-            const targetFilePath = safeJoin(payload.pluginDir, file);
-            if (!await fs.pathExists(targetFilePath)) continue;
-
-            let fileString = await readWorkerBackupContent(payload.backupBasePath, payload.pluginId, file)
-                || await fs.readFile(targetFilePath, 'utf8');
-            const fileDict = dict[file];
-
-            if (applyAst && fileDict?.ast?.length) {
-                const astTranslator = new AstTranslator({} as any);
-                const ast = astTranslator.loadCode(fileString);
-                if (ast) fileString = astTranslator.translate(ast, fileDict.ast as any);
-            }
-            if (applyRegex && fileDict?.regex?.length) {
-                const regexTranslator = new RegexTranslator({} as any);
-                fileString = regexTranslator.translate(fileString, fileDict.regex as any);
-            }
-
-            await fs.writeFile(targetFilePath, fileString);
-            processedFiles++;
-        }
-
-        return {
-            state: true,
-            processedFiles,
-            translationVersion: translationJson.metadata?.version || '0.0.0',
-        };
-    } catch (error) {
-        return {
-            state: false,
-            processedFiles: 0,
-            translationVersion: payload.translationJson?.metadata?.version || '0.0.0',
             error: error instanceof Error ? error.message : String(error),
         };
     }
@@ -2048,8 +1995,7 @@ async function handleTask(type: string, payload: any) {
     if (type === 'theme-extract') return handleThemeExtract(payload);
     if (type === 'code-extract') return handleCodeExtract(payload);
     if (type === 'ast-replace') return handleAstReplace(payload);
-    if (type === 'plugin-diagnose-render-probe') return handlePluginDiagnoseRenderProbe(payload);
-    if (type === 'plugin-apply-translation') return handlePluginApplyTranslation(payload);
+    if (type === 'plugin-render-translation' || type === 'plugin-diagnose-render-probe') return handlePluginRenderTranslation(payload);
     if (type === 'theme-apply-translation') return handleThemeApplyTranslation(payload);
     if (type === 'source-read') return handleSourceRead(payload);
     if (type === 'plugin-translate') return handlePluginTranslate(payload);

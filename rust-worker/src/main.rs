@@ -111,6 +111,8 @@ struct PluginApplyTranslationPayload {
     apply_ast: Option<bool>,
     #[serde(default)]
     apply_regex: Option<bool>,
+    #[serde(default)]
+    cjs_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4883,12 +4885,96 @@ async fn handle_code_extract(payload: Value) -> Result<Value> {
 }
 
 async fn handle_plugin_apply_translation(payload: Value) -> Result<Value> {
-    tokio::task::spawn_blocking(move || {
-        let payload: PluginApplyTranslationPayload = serde_json::from_value(payload)?;
-        let response = apply_plugin_translation_blocking(payload)?;
-        Ok(serde_json::to_value(response)?)
-    })
-    .await?
+    let payload: PluginApplyTranslationPayload = serde_json::from_value(payload)?;
+    let response = apply_plugin_translation(payload).await?;
+    Ok(serde_json::to_value(response)?)
+}
+
+fn write_apply_translation_files(
+    plugin_dir: &str,
+    files: Vec<RuntimeProbeFile>,
+    expected_files: &[String],
+) -> Result<usize> {
+    let mut rendered_by_file = files
+        .into_iter()
+        .map(|file| (file.file.clone(), file))
+        .collect::<HashMap<_, _>>();
+    let mut processed_files = 0usize;
+    for file_name in expected_files {
+        let target_file_path = safe_join(plugin_dir, file_name)?;
+        if !target_file_path.exists() {
+            continue;
+        }
+        let file = rendered_by_file
+            .remove(file_name)
+            .ok_or_else(|| anyhow!("CJS apply replacement missing file: {file_name}"))?;
+        let code = file
+            .code
+            .ok_or_else(|| anyhow!("CJS apply replacement missing code: {file_name}"))?;
+        fs::write(&target_file_path, code)
+            .with_context(|| format!("failed to write {}", target_file_path.display()))?;
+        processed_files += 1;
+    }
+    Ok(processed_files)
+}
+
+async fn request_cjs_render_probe(
+    client: &reqwest::Client,
+    endpoint: &str,
+    files: Vec<RuntimeProbeFile>,
+    candidates: &[TranslationCandidate],
+) -> Result<Vec<RuntimeProbeFile>> {
+    let endpoint = endpoint.trim_end_matches('/');
+    let response = client
+        .post(format!("{endpoint}/task"))
+        .json(&json!({
+            "type": "plugin-render-translation",
+            "payload": {
+                "files": files,
+                "candidates": candidates,
+            }
+        }))
+        .send()
+        .await
+        .context("CJS 替换请求失败")?;
+    let payload: Value = response.json().await.context("CJS 替换响应解析失败")?;
+    if !payload.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let error = payload
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("CJS 替换失败");
+        bail!("{error}");
+    }
+    let result = payload
+        .get("result")
+        .cloned()
+        .ok_or_else(|| anyhow!("CJS 替换缺少 result"))?;
+    if !result
+        .get("state")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let error = result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("CJS 替换失败");
+        bail!("{error}");
+    }
+    serde_json::from_value::<Vec<RuntimeProbeFile>>(
+        result
+            .get("files")
+            .cloned()
+            .ok_or_else(|| anyhow!("CJS 替换缺少 files"))?,
+    )
+    .context("CJS 替换 files 类型错误")
+}
+
+async fn render_apply_translation_files_with_cjs(
+    cjs_endpoint: &str,
+    files: Vec<RuntimeProbeFile>,
+    candidates: &[TranslationCandidate],
+) -> Result<Vec<RuntimeProbeFile>> {
+    request_cjs_render_probe(&reqwest::Client::new(), cjs_endpoint, files, candidates).await
 }
 
 async fn handle_theme_apply_translation(payload: Value) -> Result<Value> {
@@ -4940,7 +5026,7 @@ fn resolve_apply_translation_json(
     read_translation(&paths, &source_id).ok_or_else(|| anyhow!("翻译文件不存在"))
 }
 
-fn apply_plugin_translation_blocking(
+async fn apply_plugin_translation(
     payload: PluginApplyTranslationPayload,
 ) -> Result<ApplyTranslationResponse> {
     let translation_json = resolve_apply_translation_json(
@@ -4963,34 +5049,59 @@ fn apply_plugin_translation_blocking(
     let apply_ast = payload.apply_ast.unwrap_or(true);
     let apply_regex = payload.apply_regex.unwrap_or(true);
 
-    let mut processed_files = 0usize;
+    let mut source_files = Vec::new();
     for (file, file_dict) in dict {
         let target_file_path = safe_join(&payload.plugin_dir, file)?;
         if !target_file_path.exists() {
             continue;
         }
-        let mut file_string =
+        let file_string =
             read_backup_content(&payload.backup_base_path, &payload.plugin_id, file)?
                 .unwrap_or_else(|| fs::read_to_string(&target_file_path).unwrap_or_default());
-
-        if apply_ast {
-            if let Some(ast) = file_dict.get("ast").and_then(Value::as_array) {
-                if !ast.is_empty() {
-                    file_string = replace_ast_items_swc(&file_string, ast)?;
-                }
-            }
-        }
-        if apply_regex {
-            if let Some(regex) = file_dict.get("regex").and_then(Value::as_array) {
-                if !regex.is_empty() {
-                    file_string = apply_regex_translations(&file_string, regex);
-                }
-            }
-        }
-        fs::write(&target_file_path, file_string)
-            .with_context(|| format!("failed to write {}", target_file_path.display()))?;
-        processed_files += 1;
+        let _ = file_dict;
+        source_files.push(RuntimeProbeFile {
+            file: file.clone(),
+            code: Some(file_string),
+        });
     }
+
+    if source_files.is_empty() {
+        return Ok(ApplyTranslationResponse {
+            state: true,
+            processed_files: 0,
+            translation_version: translation_json
+                .pointer("/metadata/version")
+                .and_then(Value::as_str)
+                .unwrap_or("0.0.0")
+                .to_string(),
+        });
+    }
+
+    let expected_files = source_files
+        .iter()
+        .map(|file| file.file.clone())
+        .collect::<Vec<_>>();
+    let source_file_set = source_files
+        .iter()
+        .map(|file| file.file.clone())
+        .collect::<HashSet<_>>();
+    let candidates = collect_translation_candidates(&translation_json, apply_ast, apply_regex)
+        .into_iter()
+        .filter(|candidate| source_file_set.contains(&candidate.file))
+        .collect::<Vec<_>>();
+    let rendered_files = if candidates.is_empty() {
+        source_files
+    } else {
+        let cjs_endpoint = payload
+            .cjs_endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("cjsEndpoint missing"))?;
+        render_apply_translation_files_with_cjs(cjs_endpoint, source_files, &candidates).await?
+    };
+    let processed_files =
+        write_apply_translation_files(&payload.plugin_dir, rendered_files, &expected_files)?;
 
     Ok(ApplyTranslationResponse {
         state: true,
@@ -14782,8 +14893,38 @@ mod tests {
         let _ = fs::remove_dir_all(base_path);
     }
 
-    #[test]
-    fn plugin_apply_translation_can_apply_only_ast_or_regex() {
+    #[tokio::test]
+    async fn plugin_apply_translation_can_apply_only_ast_or_regex() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = mpsc::channel::<String>(2);
+        tokio::spawn(async move {
+            for code in [
+                r#"const title = "你好"; console.log("World");"#,
+                r#"const title = "Hello"; console.log("世界");"#,
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_test_http_request(&mut stream).await;
+                let _ = request_tx.send(request).await;
+                write_test_http_json_response(
+                    &mut stream,
+                    "200 OK",
+                    &json!({
+                        "ok": true,
+                        "result": {
+                            "state": true,
+                            "files": [
+                                {
+                                    "file": "main.js",
+                                    "code": code
+                                }
+                            ]
+                        }
+                    }),
+                )
+                .await;
+            }
+        });
         let base_path = env::temp_dir().join(format!("i18n-apply-kind-switches-{}", nanoid!()));
         let plugin_dir = base_path.join("plugin");
         let backup_base_path = base_path.join("plugin-data");
@@ -14810,7 +14951,7 @@ mod tests {
             }
         });
 
-        apply_plugin_translation_blocking(PluginApplyTranslationPayload {
+        apply_plugin_translation(PluginApplyTranslationPayload {
             plugin_id: "plugin-a".to_string(),
             plugin_dir: plugin_dir.to_string_lossy().to_string(),
             backup_base_path: backup_base_path.to_string_lossy().to_string(),
@@ -14819,17 +14960,35 @@ mod tests {
             translation_source_id: None,
             apply_ast: Some(true),
             apply_regex: Some(false),
+            cjs_endpoint: Some(format!("http://{addr}")),
         })
+        .await
         .unwrap();
         let ast_only = fs::read_to_string(&file_path).unwrap();
         assert!(ast_only.contains("你好"));
         assert!(ast_only.contains("World"));
         assert!(!ast_only.contains("世界"));
+        let ast_request = request_rx.recv().await.unwrap();
+        let ast_body: Value =
+            serde_json::from_str(ast_request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            ast_body
+                .pointer("/payload/candidates")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            ast_body
+                .pointer("/payload/candidates/0/kind")
+                .and_then(Value::as_str),
+            Some("ast")
+        );
 
         fs::write(&file_path, source_code).unwrap();
         fs::remove_dir_all(backup_dir(backup_base_path.to_str().unwrap())).unwrap();
 
-        apply_plugin_translation_blocking(PluginApplyTranslationPayload {
+        apply_plugin_translation(PluginApplyTranslationPayload {
             plugin_id: "plugin-a".to_string(),
             plugin_dir: plugin_dir.to_string_lossy().to_string(),
             backup_base_path: backup_base_path.to_string_lossy().to_string(),
@@ -14838,18 +14997,59 @@ mod tests {
             translation_source_id: None,
             apply_ast: Some(false),
             apply_regex: Some(true),
+            cjs_endpoint: Some(format!("http://{addr}")),
         })
+        .await
         .unwrap();
         let regex_only = fs::read_to_string(&file_path).unwrap();
         assert!(regex_only.contains("Hello"));
         assert!(!regex_only.contains("你好"));
         assert!(regex_only.contains("世界"));
+        let regex_request = request_rx.recv().await.unwrap();
+        let regex_body: Value =
+            serde_json::from_str(regex_request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            regex_body
+                .pointer("/payload/candidates")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            regex_body
+                .pointer("/payload/candidates/0/kind")
+                .and_then(Value::as_str),
+            Some("regex")
+        );
 
         let _ = fs::remove_dir_all(base_path);
     }
 
-    #[test]
-    fn plugin_apply_translation_reads_persisted_source_and_writes_plugin_file() {
+    #[tokio::test]
+    async fn plugin_apply_translation_reads_persisted_source_and_writes_plugin_file() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_test_http_request(&mut stream).await;
+            write_test_http_json_response(
+                &mut stream,
+                "200 OK",
+                &json!({
+                    "ok": true,
+                    "result": {
+                        "state": true,
+                        "files": [
+                            {
+                                "file": "main.js",
+                                "code": r#"const title = "你好"; console.log("世界");"#
+                            }
+                        ]
+                    }
+                }),
+            )
+            .await;
+        });
         let base_path = env::temp_dir().join(format!("i18n-apply-persisted-source-{}", nanoid!()));
         let plugin_dir = base_path.join("plugin");
         let source_base_path = base_path.join("source-data");
@@ -14882,7 +15082,7 @@ mod tests {
         });
         save_translation(&paths(source_base_path.to_str().unwrap()), source_id, &translation_json).unwrap();
 
-        let response = apply_plugin_translation_blocking(PluginApplyTranslationPayload {
+        let response = apply_plugin_translation(PluginApplyTranslationPayload {
             plugin_id: "plugin-a".to_string(),
             plugin_dir: plugin_dir.to_string_lossy().to_string(),
             backup_base_path: backup_base_path.to_string_lossy().to_string(),
@@ -14893,7 +15093,9 @@ mod tests {
             translation_source_id: Some(source_id.to_string()),
             apply_ast: Some(true),
             apply_regex: Some(true),
+            cjs_endpoint: Some(format!("http://{addr}")),
         })
+        .await
         .unwrap();
 
         assert!(response.state);
@@ -14905,6 +15107,103 @@ mod tests {
 
         let _ = fs::remove_dir_all(base_path);
     }
+
+    #[tokio::test]
+    async fn plugin_apply_translation_uses_cjs_for_code_replacement() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = mpsc::channel::<String>(1);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_test_http_request(&mut stream).await;
+            let _ = request_tx.send(request).await;
+            write_test_http_json_response(
+                &mut stream,
+                "200 OK",
+                &json!({
+                    "ok": true,
+                    "result": {
+                        "state": true,
+                        "files": [
+                            {
+                                "file": "main.js",
+                                "code": "const marker = \"from-cjs\";"
+                            }
+                        ]
+                    }
+                }),
+            )
+            .await;
+        });
+
+        let base_path = env::temp_dir().join(format!("i18n-apply-cjs-replace-{}", nanoid!()));
+        let plugin_dir = base_path.join("plugin");
+        let backup_base_path = base_path.join("plugin-data");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("main.js"),
+            r#"const title = "Hello"; console.log("World");"#,
+        )
+        .unwrap();
+
+        let translation_json = json!({
+            "schemaVersion": 1,
+            "metadata": {
+                "plugin": "plugin-a",
+                "title": "Plugin A",
+                "version": "1.0.0"
+            },
+            "dict": {
+                "main.js": {
+                    "ast": [
+                        { "type": "VariableDeclarator", "name": "title", "source": "Hello", "target": "你好" }
+                    ],
+                    "regex": [
+                        { "source": "World", "target": "世界" }
+                    ]
+                }
+            }
+        });
+
+        let response = handle_plugin_apply_translation(json!({
+            "pluginId": "plugin-a",
+            "pluginDir": plugin_dir,
+            "backupBasePath": backup_base_path,
+            "translationJson": translation_json,
+            "applyAst": true,
+            "applyRegex": true,
+            "cjsEndpoint": format!("http://{addr}"),
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(response.get("state").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            fs::read_to_string(base_path.join("plugin").join("main.js")).unwrap(),
+            "const marker = \"from-cjs\";"
+        );
+        let request = request_rx.recv().await.unwrap();
+        let body: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            body.get("type").and_then(Value::as_str),
+            Some("plugin-render-translation")
+        );
+        assert_eq!(
+            body.pointer("/payload/files/0/code").and_then(Value::as_str),
+            Some(r#"const title = "Hello"; console.log("World");"#)
+        );
+        assert_eq!(
+            body.pointer("/payload/candidates/0/kind").and_then(Value::as_str),
+            Some("ast")
+        );
+        assert_eq!(
+            body.pointer("/payload/candidates/1/kind").and_then(Value::as_str),
+            Some("regex")
+        );
+
+        let _ = fs::remove_dir_all(base_path);
+    }
+
     async fn serve_translate_value_batch_test_request(
         mut stream: tokio::net::TcpStream,
         slow_status_tx: mpsc::Sender<bool>,
