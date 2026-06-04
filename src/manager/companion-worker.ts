@@ -20,6 +20,8 @@ import type {
     CompanionAstReplaceResponse,
     CompanionCodeExtractRequest,
     CompanionCodeExtractResponse,
+    CompanionPluginDiagnoseRenderProbeRequest,
+    CompanionPluginDiagnoseRenderProbeResponse,
     CompanionPluginApplyTranslationRequest,
     CompanionPluginExtractPayload,
     CompanionPluginExtractResult,
@@ -52,12 +54,24 @@ import { handlePluginExtractCore, handleThemeExtractCore } from './companion-ext
 
 const port = Number(process.argv[2]) || 18743;
 const host = '127.0.0.1';
-const maxBodyBytes = 100 * 1024 * 1024;
+const companionWorkerProtocolVersion = 2;
+const defaultMaxBodyBytes = 128 * 1024 * 1024;
+const configuredMaxBodyBytes = Number(process.env.I18N_COMPANION_MAX_BODY_BYTES || '');
+const maxBodyBytes = Number.isFinite(configuredMaxBodyBytes) && configuredMaxBodyBytes > 0
+    ? Math.floor(configuredMaxBodyBytes)
+    : defaultMaxBodyBytes;
 const extractCheckpointEveryResources = 100;
 const extractCheckpointEveryMs = 10_000;
 const extractThreadScript = path.join(__dirname, 'i18n-companion-extract-thread.cjs');
 
 type JsonRecord = Record<string, any>;
+
+class BodyLimitError extends Error {
+    constructor(limit: number) {
+        super(`请求体过大，请求上限为 ${Math.round(limit / 1024 / 1024)} MB`);
+        this.name = 'BodyLimitError';
+    }
+}
 
 function send(res: http.ServerResponse, status: number, payload: unknown) {
     const body = JSON.stringify(payload);
@@ -72,16 +86,23 @@ function readBody(req: http.IncomingMessage): Promise<string> {
     return new Promise((resolve, reject) => {
         const chunks: Buffer[] = [];
         let size = 0;
+        let tooLarge = false;
         req.on('data', chunk => {
             size += chunk.length;
             if (size > maxBodyBytes) {
-                reject(new Error('请求体过大'));
-                req.destroy();
+                tooLarge = true;
+                chunks.length = 0;
                 return;
             }
-            chunks.push(Buffer.from(chunk));
+            if (!tooLarge) chunks.push(Buffer.from(chunk));
         });
-        req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+        req.on('end', () => {
+            if (tooLarge) {
+                reject(new BodyLimitError(maxBodyBytes));
+                return;
+            }
+            resolve(Buffer.concat(chunks).toString('utf8'));
+        });
         req.on('error', reject);
     });
 }
@@ -463,6 +484,42 @@ async function handleAstReplace(payload: CompanionAstReplaceRequest): Promise<Co
         return { state: true, code: translator.translate(ast, payload.translations as any) };
     } catch (error) {
         return { state: false, code: payload.code, error: error instanceof Error ? error.message : String(error) };
+    }
+}
+
+async function handlePluginDiagnoseRenderProbe(payload: CompanionPluginDiagnoseRenderProbeRequest): Promise<CompanionPluginDiagnoseRenderProbeResponse> {
+    try {
+        const grouped = new Map<string, { ast: any[]; regex: any[] }>();
+        for (const candidate of payload.candidates || []) {
+            const entry = grouped.get(candidate.file) || { ast: [], regex: [] };
+            if (candidate.kind === 'ast') entry.ast.push(candidate.item);
+            if (candidate.kind === 'regex') entry.regex.push(candidate.item);
+            grouped.set(candidate.file, entry);
+        }
+
+        const files = (payload.files || []).map(file => {
+            let code = String(file.code || '');
+            const translations = grouped.get(file.file);
+            if (translations?.ast.length) {
+                const astTranslator = new AstTranslator({} as any);
+                const ast = astTranslator.loadCode(code);
+                if (!ast) throw new Error(`${file.file} AST parse failed`);
+                code = astTranslator.translate(ast, translations.ast as any);
+            }
+            if (translations?.regex.length) {
+                const regexTranslator = new RegexTranslator({} as any);
+                code = regexTranslator.translate(code, translations.regex as any);
+            }
+            return { file: file.file, code };
+        });
+
+        return { state: true, files };
+    } catch (error) {
+        return {
+            state: false,
+            files: [],
+            error: error instanceof Error ? error.message : String(error),
+        };
     }
 }
 
@@ -1991,6 +2048,7 @@ async function handleTask(type: string, payload: any) {
     if (type === 'theme-extract') return handleThemeExtract(payload);
     if (type === 'code-extract') return handleCodeExtract(payload);
     if (type === 'ast-replace') return handleAstReplace(payload);
+    if (type === 'plugin-diagnose-render-probe') return handlePluginDiagnoseRenderProbe(payload);
     if (type === 'plugin-apply-translation') return handlePluginApplyTranslation(payload);
     if (type === 'theme-apply-translation') return handleThemeApplyTranslation(payload);
     if (type === 'source-read') return handleSourceRead(payload);
@@ -2038,7 +2096,12 @@ if (process.argv[2] === 'stdio-task') {
             }
 
             if (req.method === 'GET' && req.url === '/identity') {
-                send(res, 200, { ok: true, pluginDir: process.cwd() });
+                send(res, 200, {
+                    ok: true,
+                    backend: 'cjs',
+                    protocolVersion: companionWorkerProtocolVersion,
+                    pluginDir: process.cwd(),
+                });
                 return;
             }
 
@@ -2091,7 +2154,8 @@ if (process.argv[2] === 'stdio-task') {
 
             send(res, 404, { ok: false, error: 'not found' });
         } catch (error) {
-            send(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
+            const status = error instanceof BodyLimitError ? 413 : 500;
+            send(res, status, { ok: false, error: error instanceof Error ? error.message : String(error) });
         }
     });
 

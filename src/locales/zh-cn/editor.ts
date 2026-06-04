@@ -51,7 +51,12 @@ export default {
         PunctuationCheck: "标点检查",
         ExpectedConsumption: "预期消耗",
         LineNumber: "行 {{line}}",
-        PreflightSwitchCooldown: "插件开关间隔 (ms)"
+        PreflightSwitchCooldown: "插件开关间隔 (ms)",
+        PreflightTimeoutGrace: "超时判定 (ms)",
+        DiagnosisPhase: "阶段",
+        DiagnosisPhaseBaseline: "基准",
+        DiagnosisQueueGroups: "堆数",
+        DiagnosisCurrentGroupItems: "本堆条目"
     },
     Actions: {
         BatchTranslate: "开始批量翻译 ({{count}})",
@@ -141,6 +146,7 @@ export default {
         SuccessDelete: "删除成功",
         SuccessIncrementalExtract: "增量提取完成",
         DiagnosisSuccess: "运行前检查通过",
+        DiagnosisFailed: "运行前检查失败",
         DiagnosisIssuesFound: "运行前检查完成：发现 {{count}} 个导致脚本失败的条目",
         DiagnosisCleanupApplied: "已清理 {{count}} 个问题条目，并写入问题记录文件",
         DiagnosisRuntimeBaselineFailed: "原始插件脚本也无法正常加载，已跳过运行级定位，仅保留静态清理结果。",

@@ -271,6 +271,7 @@ export interface I18nSettings {
     themeViewMode: 'list' | 'grid'; // 主题管理器视图模式
     autoSave: boolean;        // 编辑器是否开启自动保存
     preflightPluginSwitchCooldownMs: number; // 运行前检查插件开关冷却时间 (毫秒)
+    preflightPluginTimeoutGraceMs: number; // 运行前检查插件开关超时判定余量 (毫秒)
 
     // ==============================
     // 自动化设置 (AutoManager)
@@ -649,6 +650,7 @@ export const DEFAULT_SETTINGS: I18nSettings = {
     themeViewMode: 'grid',
     autoSave: true,
     preflightPluginSwitchCooldownMs: 3000,
+    preflightPluginTimeoutGraceMs: 2000,
 
     // ==============================
     // 自动化设置 (AutoManager)

@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
+    body::{to_bytes, Body},
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
@@ -15,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     env, fs,
     io::{Read as IoRead, Write as IoWrite},
     net::SocketAddr,
@@ -37,12 +38,14 @@ use tokio::{
 use url::Url;
 
 const HOST: &str = "127.0.0.1";
+const COMPANION_WORKER_PROTOCOL_VERSION: u32 = 2;
 const MANUAL_STOP: &str = "批量任务已手动停止";
 const EXTRACT_CHECKPOINT_EVERY_RESOURCES: usize = 100;
 const EXTRACT_CHECKPOINT_EVERY_MS: u64 = 10_000;
 const MAX_EXTRACT_CPU_CONCURRENCY: usize = 32;
 const CLOUD_BACKUP_CHUNK_SIZE: usize = 20;
 const DEFAULT_TRANSLATE_WINDOW_BATCH_MULTIPLIER: usize = 4;
+const MAX_JSON_BODY_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone)]
 struct AppState {
@@ -119,6 +122,10 @@ struct PluginDiagnoseCleanupStartPayload {
     persistence: PersistenceConfig,
     translation_source_id: String,
     #[serde(default)]
+    draft: Option<PluginDiagnoseDraftPayload>,
+    #[serde(default)]
+    cjs_endpoint: Option<String>,
+    #[serde(default)]
     apply_ast: Option<bool>,
     #[serde(default)]
     apply_regex: Option<bool>,
@@ -126,6 +133,15 @@ struct PluginDiagnoseCleanupStartPayload {
     runtime_probe: Option<bool>,
     #[serde(default)]
     is_applied: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginDiagnoseDraftPayload {
+    #[serde(default)]
+    dict: Option<Value>,
+    #[serde(default)]
+    metadata: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,7 +209,8 @@ struct TranslationCleanupReport {
 #[serde(rename_all = "camelCase")]
 struct RuntimeProbeFile {
     file: String,
-    code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +219,14 @@ struct RuntimeProbeRequest {
     probe_id: String,
     files: Vec<RuntimeProbeFile>,
     label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct DiagnoseProgress {
+    phase: String,
+    queue_groups: usize,
+    current_group_items: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,9 +239,11 @@ struct PluginDiagnoseCleanupResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     probe: Option<RuntimeProbeRequest>,
     issue_items: Vec<TranslationIssueItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     cleared_items: Vec<TranslationIssueItem>,
     processed_files: usize,
     translation_version: String,
+    progress: DiagnoseProgress,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -603,20 +630,116 @@ struct SwcAstConfig {
 impl SwcAstConfig {
     fn from_settings(settings: &ExtractionSettings) -> Self {
         let assignments = if settings.ast_assignments.is_empty() {
-            vec!["overwriteName", "innerHTML", "outerHTML", "title", "alt", "placeholder", "textContent", "innerText", "ariaLabel", "nodeValue", "buttonText", "confirmText", "cancelText", "labelText"]
-                .into_iter().map(str::to_string).collect()
+            vec![
+                "overwriteName",
+                "innerHTML",
+                "outerHTML",
+                "title",
+                "alt",
+                "placeholder",
+                "textContent",
+                "innerText",
+                "ariaLabel",
+                "nodeValue",
+                "buttonText",
+                "confirmText",
+                "cancelText",
+                "labelText",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
         } else {
             settings.ast_assignments.clone()
         };
         let functions = if settings.ast_functions.is_empty() {
-            vec!["Notice", "setTitle", "setContent", "setName", "setDesc", "setButtonText", "setPlaceholder", "setTooltip", "addOption", "addOptions", "addHeading", "addText", "setHint", "setWarning", "setText", "appendText", "createEl", "createDiv", "createSpan", "addCommand", "insertText", "replaceRange", "replaceSelection", "log", "error", "warn", "info", "alert", "confirm", "prompt", "renderMarkdown", "setLabel", "setConfirmText", "setCancelText"]
-                .into_iter().map(str::to_string).collect()
+            vec![
+                "Notice",
+                "setTitle",
+                "setContent",
+                "setName",
+                "setDesc",
+                "setButtonText",
+                "setPlaceholder",
+                "setTooltip",
+                "addOption",
+                "addOptions",
+                "addHeading",
+                "addText",
+                "setHint",
+                "setWarning",
+                "setText",
+                "appendText",
+                "createEl",
+                "createDiv",
+                "createSpan",
+                "addCommand",
+                "insertText",
+                "replaceRange",
+                "replaceSelection",
+                "log",
+                "error",
+                "warn",
+                "info",
+                "alert",
+                "confirm",
+                "prompt",
+                "renderMarkdown",
+                "setLabel",
+                "setConfirmText",
+                "setCancelText",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
         } else {
             settings.ast_functions.clone()
         };
         let keys = if settings.ast_keys.is_empty() {
-            vec!["name", "description", "text", "placeholder", "label", "tooltip", "title", "header", "desc", "message", "buttontext", "aria-label", "heading", "content", "tab", "caption", "subtitle", "summary", "info", "warning", "error", "success", "hint", "instructions", "link", "selection", "annotation", "search", "speech", "page", "empty", "detail", "body", "option", "notice", "confirmText", "cancelText", "ariaLabel", "buttonText"]
-                .into_iter().map(str::to_string).collect()
+            vec![
+                "name",
+                "description",
+                "text",
+                "placeholder",
+                "label",
+                "tooltip",
+                "title",
+                "header",
+                "desc",
+                "message",
+                "buttontext",
+                "aria-label",
+                "heading",
+                "content",
+                "tab",
+                "caption",
+                "subtitle",
+                "summary",
+                "info",
+                "warning",
+                "error",
+                "success",
+                "hint",
+                "instructions",
+                "link",
+                "selection",
+                "annotation",
+                "search",
+                "speech",
+                "page",
+                "empty",
+                "detail",
+                "body",
+                "option",
+                "notice",
+                "confirmText",
+                "cancelText",
+                "ariaLabel",
+                "buttonText",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
         } else {
             settings.ast_keys.clone()
         };
@@ -749,29 +872,28 @@ struct PersistencePaths {
     batch_task_record_path: PathBuf,
     diagnose_checkpoint_path: PathBuf,
     diagnose_issue_record_path: PathBuf,
+    diagnose_originals_dir: PathBuf,
 }
 
 #[derive(Debug, Clone)]
 struct DiagnoseCleanupSession {
     paths: PersistencePaths,
     plugin_id: String,
+    plugin_dir: String,
+    cjs_endpoint: Option<String>,
     translation_source_id: String,
     translation_json: Value,
     source_by_file: HashMap<String, String>,
+    original_files: HashMap<String, Option<String>>,
     issue_items: Vec<TranslationIssueItem>,
     cleared_runtime_candidates: Vec<TranslationCandidate>,
     pending_candidates: Vec<TranslationCandidate>,
     probe_map: HashMap<String, Vec<TranslationCandidate>>,
-    runtime_probe_queue: Vec<Vec<TranslationCandidate>>,
-    combo_fallback_groups: Vec<ComboFallbackGroup>,
-    pairwise_tested_group_signatures: HashSet<String>,
+    probe_files: HashMap<String, Vec<String>>,
+    phase_order: Vec<String>,
+    active_phase_index: usize,
+    phase_queues: HashMap<String, VecDeque<Vec<TranslationCandidate>>>,
     processed_files: usize,
-}
-
-#[derive(Debug, Clone)]
-struct ComboFallbackGroup {
-    candidates: Vec<TranslationCandidate>,
-    issue_count_at_start: usize,
 }
 
 #[tokio::main]
@@ -795,7 +917,21 @@ async fn main() -> Result<()> {
         shutdown,
     };
 
-    let app = Router::new()
+    let app = app_router(state);
+
+    let addr: SocketAddr = format!("{HOST}:{port}").parse()?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    println!("ready {HOST}:{port}");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = shutdown_rx.await;
+        })
+        .await?;
+    Ok(())
+}
+
+fn app_router(state: AppState) -> Router {
+    Router::new()
         .route("/health", get(health))
         .route("/identity", get(identity_route))
         .route("/resources/plugins", get(discover_plugins_route))
@@ -809,17 +945,7 @@ async fn main() -> Result<()> {
         .route("/task/status", get(task_status_route))
         .route("/task/cancel", post(task_cancel_route))
         .route("/shutdown", post(shutdown_route))
-        .with_state(state);
-
-    let addr: SocketAddr = format!("{HOST}:{port}").parse()?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    println!("ready {HOST}:{port}");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = shutdown_rx.await;
-        })
-        .await?;
-    Ok(())
+        .with_state(state)
 }
 
 fn watch_stdin_shutdown(shutdown: Arc<Mutex<Option<oneshot::Sender<()>>>>) {
@@ -848,6 +974,8 @@ async fn identity_route(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({
         "ok": true,
         "pid": std::process::id(),
+        "backend": "rust",
+        "protocolVersion": COMPANION_WORKER_PROTOCOL_VERSION,
         "pluginDir": state.plugin_dir.to_string_lossy(),
     }))
 }
@@ -879,8 +1007,12 @@ async fn discover_themes_route(State(state): State<AppState>) -> impl IntoRespon
 
 async fn github_read_route(
     State(state): State<AppState>,
-    Json(payload): Json<GithubReadRequest>,
+    body: Body,
 ) -> impl IntoResponse {
+    let payload = match read_json_body::<GithubReadRequest>(body).await {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
     match github_read(&state, payload).await {
         Ok(result) => Json(json!({ "ok": true, "result": result })).into_response(),
         Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
@@ -889,15 +1021,23 @@ async fn github_read_route(
 
 async fn github_write_route(
     State(state): State<AppState>,
-    Json(payload): Json<GithubWriteRequest>,
+    body: Body,
 ) -> impl IntoResponse {
+    let payload = match read_json_body::<GithubWriteRequest>(body).await {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
     match github_write(&state, payload).await {
         Ok(result) => Json(json!({ "ok": true, "result": result })).into_response(),
         Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
 }
 
-async fn automation_match_route(Json(payload): Json<AutomationMatchRequest>) -> impl IntoResponse {
+async fn automation_match_route(body: Body) -> impl IntoResponse {
+    let payload = match read_json_body::<AutomationMatchRequest>(body).await {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
     match select_best_translation(payload) {
         Ok(result) => Json(json!({ "ok": true, "result": result })).into_response(),
         Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
@@ -926,11 +1066,18 @@ fn obsidian_dir(state: &AppState) -> Result<PathBuf> {
 async fn discover_plugins(state: &AppState) -> Result<Vec<Value>> {
     let obsidian_dir = obsidian_dir(state)?;
     let plugins_dir = obsidian_dir.join("plugins");
-    let current_plugin_id = read_json_file(&state.plugin_dir.join("manifest.json"))
-        .and_then(|manifest| manifest.get("id").and_then(Value::as_str).map(str::to_string));
+    let current_plugin_id =
+        read_json_file(&state.plugin_dir.join("manifest.json")).and_then(|manifest| {
+            manifest
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
     let mut plugins = Vec::new();
 
-    for entry in fs::read_dir(&plugins_dir).with_context(|| format!("failed to read {}", plugins_dir.display()))? {
+    for entry in fs::read_dir(&plugins_dir)
+        .with_context(|| format!("failed to read {}", plugins_dir.display()))?
+    {
         let entry = entry?;
         let file_type = entry.file_type()?;
         if !file_type.is_dir() {
@@ -945,7 +1092,10 @@ async fn discover_plugins(state: &AppState) -> Result<Vec<Value>> {
         let Some(mut manifest) = read_json_file(&manifest_doc) else {
             continue;
         };
-        let id = manifest.get("id").and_then(Value::as_str).unwrap_or_default();
+        let id = manifest
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         if current_plugin_id.as_deref() == Some(id) {
             continue;
         }
@@ -965,7 +1115,13 @@ async fn discover_plugins(state: &AppState) -> Result<Vec<Value>> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_lowercase()
-            .cmp(&right.pointer("/manifest/name").and_then(Value::as_str).unwrap_or_default().to_lowercase())
+            .cmp(
+                &right
+                    .pointer("/manifest/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_lowercase(),
+            )
     });
     Ok(plugins)
 }
@@ -979,7 +1135,9 @@ async fn discover_themes(state: &AppState) -> Result<Vec<Value>> {
 
     let mut themes = Vec::new();
     let mut modern_theme_names = HashSet::new();
-    for entry in fs::read_dir(&themes_dir).with_context(|| format!("failed to read {}", themes_dir.display()))? {
+    for entry in fs::read_dir(&themes_dir)
+        .with_context(|| format!("failed to read {}", themes_dir.display()))?
+    {
         let entry = entry?;
         let file_type = entry.file_type()?;
         if !file_type.is_dir() {
@@ -1000,9 +1158,17 @@ async fn discover_themes(state: &AppState) -> Result<Vec<Value>> {
         }));
     }
 
-    for entry in fs::read_dir(&themes_dir).with_context(|| format!("failed to read {}", themes_dir.display()))? {
+    for entry in fs::read_dir(&themes_dir)
+        .with_context(|| format!("failed to read {}", themes_dir.display()))?
+    {
         let entry = entry?;
-        if !entry.file_type()?.is_file() || !entry.path().extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("css")) {
+        if !entry.file_type()?.is_file()
+            || !entry
+                .path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("css"))
+        {
             continue;
         }
         let path = entry.path();
@@ -1030,7 +1196,13 @@ async fn discover_themes(state: &AppState) -> Result<Vec<Value>> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_lowercase()
-            .cmp(&right.get("name").and_then(Value::as_str).unwrap_or_default().to_lowercase())
+            .cmp(
+                &right
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_lowercase(),
+            )
     });
     Ok(themes)
 }
@@ -1109,7 +1281,8 @@ fn count_chinese_unicode_escapes(text: &str, limit: usize) -> usize {
 }
 
 fn has_chinese_text(text: &str) -> bool {
-    text.chars().any(|ch| is_chinese_code_point(ch as u32)) || count_chinese_unicode_escapes(text, 1) > 0
+    text.chars().any(|ch| is_chinese_code_point(ch as u32))
+        || count_chinese_unicode_escapes(text, 1) > 0
 }
 
 fn has_chinese_run_pattern(
@@ -1123,15 +1296,16 @@ fn has_chinese_run_pattern(
     let mut run_length = 0;
     let mut index = 0;
 
-    let flush_run = |run_length: &mut usize, matched_runs: &mut usize, has_required_run: &mut bool| {
-        if *run_length >= min_run_length {
-            *matched_runs += 1;
-        }
-        if *run_length >= required_run_length {
-            *has_required_run = true;
-        }
-        *run_length = 0;
-    };
+    let flush_run =
+        |run_length: &mut usize, matched_runs: &mut usize, has_required_run: &mut bool| {
+            if *run_length >= min_run_length {
+                *matched_runs += 1;
+            }
+            if *run_length >= required_run_length {
+                *has_required_run = true;
+            }
+            *run_length = 0;
+        };
 
     while index < text.len() {
         let escape_len = chinese_unicode_escape_len(text, index);
@@ -1186,11 +1360,17 @@ fn has_extracted_translation_content(sources: &[String]) -> bool {
 
 fn regex_list(patterns: &[String], defaults: &[&str]) -> Vec<Regex> {
     let source = if patterns.is_empty() {
-        defaults.iter().map(|item| item.to_string()).collect::<Vec<_>>()
+        defaults
+            .iter()
+            .map(|item| item.to_string())
+            .collect::<Vec<_>>()
     } else {
         patterns.to_vec()
     };
-    source.iter().filter_map(|pattern| Regex::new(pattern).ok()).collect()
+    source
+        .iter()
+        .filter_map(|pattern| Regex::new(pattern).ok())
+        .collect()
 }
 
 fn is_valid_text_with_options(
@@ -1311,7 +1491,10 @@ fn contains_word(list: &[String], word: &str) -> bool {
 }
 
 fn previous_assignment_name(code: &str, before_index: usize) -> Option<String> {
-    let start = code[..before_index].rfind(['\n', ';', '{', '}']).map(|index| index + 1).unwrap_or(0);
+    let start = code[..before_index]
+        .rfind(['\n', ';', '{', '}'])
+        .map(|index| index + 1)
+        .unwrap_or(0);
     let prefix = &code[start..before_index];
     let patterns = [
         r"\.\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*$",
@@ -1329,7 +1512,10 @@ fn previous_assignment_name(code: &str, before_index: usize) -> Option<String> {
 }
 
 fn previous_object_key_name(code: &str, before_index: usize) -> Option<String> {
-    let start = code[..before_index].rfind(['\n', ',', '{', '(']).map(|index| index + 1).unwrap_or(0);
+    let start = code[..before_index]
+        .rfind(['\n', ',', '{', '('])
+        .map(|index| index + 1)
+        .unwrap_or(0);
     let prefix = &code[start..before_index];
     let patterns = [
         r"([A-Za-z_$][A-Za-z0-9_$]*)\s*:\s*$",
@@ -1347,14 +1533,21 @@ fn previous_object_key_name(code: &str, before_index: usize) -> Option<String> {
 }
 
 fn previous_variable_name(code: &str, before_index: usize) -> Option<String> {
-    let start = code[..before_index].rfind(['\n', ';', '{', '}']).map(|index| index + 1).unwrap_or(0);
+    let start = code[..before_index]
+        .rfind(['\n', ';', '{', '}'])
+        .map(|index| index + 1)
+        .unwrap_or(0);
     let prefix = &code[start..before_index];
     let re = Regex::new(r"(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*$").ok()?;
-    re.captures(prefix).and_then(|captures| captures.get(1).map(|m| m.as_str().to_string()))
+    re.captures(prefix)
+        .and_then(|captures| captures.get(1).map(|m| m.as_str().to_string()))
 }
 
 fn call_name_before(code: &str, before_index: usize) -> Option<(String, bool)> {
-    let start = code[..before_index].rfind(['\n', ';', '{', '}']).map(|index| index + 1).unwrap_or(0);
+    let start = code[..before_index]
+        .rfind(['\n', ';', '{', '}'])
+        .map(|index| index + 1)
+        .unwrap_or(0);
     let prefix = &code[start..before_index];
     let re = Regex::new(r"(new\s+)?([A-Za-z_$][A-Za-z0-9_$.]*)\s*\([^()]*$").ok()?;
     re.captures(prefix).and_then(|captures| {
@@ -1370,14 +1563,40 @@ fn call_name_before(code: &str, before_index: usize) -> Option<(String, bool)> {
     })
 }
 
-fn builtin_regex_extract(code: &str, settings: &ExtractionSettings, reject: &[Regex], valid: &[Regex]) -> Vec<Value> {
+fn builtin_regex_extract(
+    code: &str,
+    settings: &ExtractionSettings,
+    reject: &[Regex],
+    valid: &[Regex],
+) -> Vec<Value> {
     let watched_calls = [
-        "Notice", "log", "error", "setText", "setButtonText", "setName", "setDesc", "setPlaceholder",
-        "setTooltip", "appendText", "setTitle", "addHeading", "renderMarkdown",
+        "Notice",
+        "log",
+        "error",
+        "setText",
+        "setButtonText",
+        "setName",
+        "setDesc",
+        "setPlaceholder",
+        "setTooltip",
+        "appendText",
+        "setTitle",
+        "addHeading",
+        "renderMarkdown",
     ];
     let watched_fields = [
-        "textContent", "innerText", "name", "description", "selection", "annotation", "link", "text",
-        "search", "speech", "page", "settings",
+        "textContent",
+        "innerText",
+        "name",
+        "description",
+        "selection",
+        "annotation",
+        "link",
+        "text",
+        "search",
+        "speech",
+        "page",
+        "settings",
     ];
     let mut seen = HashSet::new();
     let mut items = Vec::new();
@@ -1397,7 +1616,9 @@ fn builtin_regex_extract(code: &str, settings: &ExtractionSettings, reject: &[Re
             matched_context = watched_calls.contains(&name.as_str());
         }
         if !matched_context {
-            if let Some(name) = previous_assignment_name(code, quote_index).or_else(|| previous_object_key_name(code, quote_index)) {
+            if let Some(name) = previous_assignment_name(code, quote_index)
+                .or_else(|| previous_object_key_name(code, quote_index))
+            {
                 matched_context = watched_fields.contains(&name.as_str());
             }
         }
@@ -1499,7 +1720,13 @@ fn swc_expr_name(expr: &Expr) -> Option<String> {
     }
 }
 
-fn push_swc_match(matches: &mut Vec<AstMatch>, config: &SwcAstConfig, node_type: &str, name: &str, expr: &Expr) {
+fn push_swc_match(
+    matches: &mut Vec<AstMatch>,
+    config: &SwcAstConfig,
+    node_type: &str,
+    name: &str,
+    expr: &Expr,
+) {
     let Some(source) = swc_string_source(expr) else {
         return;
     };
@@ -1512,7 +1739,11 @@ fn push_swc_match(matches: &mut Vec<AstMatch>, config: &SwcAstConfig, node_type:
     }
 }
 
-fn visit_object_arg_properties(matches: &mut Vec<AstMatch>, config: &SwcAstConfig, object: &ObjectLit) {
+fn visit_object_arg_properties(
+    matches: &mut Vec<AstMatch>,
+    config: &SwcAstConfig,
+    object: &ObjectLit,
+) {
     for prop in &object.props {
         if let PropOrSpread::Prop(prop) = prop {
             if let Prop::KeyValue(key_value) = &**prop {
@@ -1537,7 +1768,13 @@ impl Visit for SwcExtractVisitor<'_> {
             let name = ident.id.sym.to_string();
             if self.config.assignments.contains(&name) {
                 if let Some(init) = node.init.as_deref() {
-                    push_swc_match(&mut self.matches, self.config, "VariableDeclarator", &name, init);
+                    push_swc_match(
+                        &mut self.matches,
+                        self.config,
+                        "VariableDeclarator",
+                        &name,
+                        init,
+                    );
                 }
             }
         }
@@ -1547,7 +1784,13 @@ impl Visit for SwcExtractVisitor<'_> {
     fn visit_assign_expr(&mut self, node: &AssignExpr) {
         if let Some(name) = swc_assign_name(&node.left) {
             if self.config.assignments.contains(&name) {
-                push_swc_match(&mut self.matches, self.config, "AssignmentExpression", &name, &node.right);
+                push_swc_match(
+                    &mut self.matches,
+                    self.config,
+                    "AssignmentExpression",
+                    &name,
+                    &node.right,
+                );
             }
         }
         node.visit_children_with(self);
@@ -1557,7 +1800,13 @@ impl Visit for SwcExtractVisitor<'_> {
         if let Prop::KeyValue(key_value) = node {
             if let Some(name) = swc_prop_name(&key_value.key) {
                 if self.config.keys.contains(&name) {
-                    push_swc_match(&mut self.matches, self.config, "ObjectProperty", &name, &key_value.value);
+                    push_swc_match(
+                        &mut self.matches,
+                        self.config,
+                        "ObjectProperty",
+                        &name,
+                        &key_value.value,
+                    );
                 }
             }
         }
@@ -1569,8 +1818,16 @@ impl Visit for SwcExtractVisitor<'_> {
             if self.config.functions.contains(&name) {
                 for arg in &node.args {
                     match &*arg.expr {
-                        Expr::Object(object) => visit_object_arg_properties(&mut self.matches, self.config, object),
-                        expr => push_swc_match(&mut self.matches, self.config, "CallExpression", &name, expr),
+                        Expr::Object(object) => {
+                            visit_object_arg_properties(&mut self.matches, self.config, object)
+                        }
+                        expr => push_swc_match(
+                            &mut self.matches,
+                            self.config,
+                            "CallExpression",
+                            &name,
+                            expr,
+                        ),
                     }
                 }
             }
@@ -1583,8 +1840,16 @@ impl Visit for SwcExtractVisitor<'_> {
             if self.config.functions.contains(&name) {
                 for arg in node.args.iter().flatten() {
                     match &*arg.expr {
-                        Expr::Object(object) => visit_object_arg_properties(&mut self.matches, self.config, object),
-                        expr => push_swc_match(&mut self.matches, self.config, "NewExpression", &name, expr),
+                        Expr::Object(object) => {
+                            visit_object_arg_properties(&mut self.matches, self.config, object)
+                        }
+                        expr => push_swc_match(
+                            &mut self.matches,
+                            self.config,
+                            "NewExpression",
+                            &name,
+                            expr,
+                        ),
                     }
                 }
             }
@@ -1596,7 +1861,10 @@ impl Visit for SwcExtractVisitor<'_> {
 fn extract_ast_items_swc(code: &str, settings: &ExtractionSettings) -> Result<Vec<Value>> {
     let (_, module) = parse_swc_module(code)?;
     let config = SwcAstConfig::from_settings(settings);
-    let mut visitor = SwcExtractVisitor { config: &config, matches: Vec::new() };
+    let mut visitor = SwcExtractVisitor {
+        config: &config,
+        matches: Vec::new(),
+    };
     module.visit_with(&mut visitor);
     let mut seen = HashSet::new();
     let mut matches = visitor
@@ -1617,8 +1885,22 @@ fn extract_ast_items_swc(code: &str, settings: &ExtractionSettings) -> Result<Ve
         })
         .collect::<Vec<_>>();
     matches.sort_by(|left, right| {
-        let left_key = format!("{}:{}", left.get("type").and_then(Value::as_str).unwrap_or_default(), left.get("name").and_then(Value::as_str).unwrap_or_default());
-        let right_key = format!("{}:{}", right.get("type").and_then(Value::as_str).unwrap_or_default(), right.get("name").and_then(Value::as_str).unwrap_or_default());
+        let left_key = format!(
+            "{}:{}",
+            left.get("type").and_then(Value::as_str).unwrap_or_default(),
+            left.get("name").and_then(Value::as_str).unwrap_or_default()
+        );
+        let right_key = format!(
+            "{}:{}",
+            right
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            right
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        );
         left_key.cmp(&right_key)
     });
     Ok(matches)
@@ -1626,20 +1908,116 @@ fn extract_ast_items_swc(code: &str, settings: &ExtractionSettings) -> Result<Ve
 
 fn extract_ast_items_heuristic(code: &str, settings: &ExtractionSettings) -> Vec<Value> {
     let assignments = if settings.ast_assignments.is_empty() {
-        vec!["overwriteName", "innerHTML", "outerHTML", "title", "alt", "placeholder", "textContent", "innerText", "ariaLabel", "nodeValue", "buttonText", "confirmText", "cancelText", "labelText"]
-            .into_iter().map(str::to_string).collect()
+        vec![
+            "overwriteName",
+            "innerHTML",
+            "outerHTML",
+            "title",
+            "alt",
+            "placeholder",
+            "textContent",
+            "innerText",
+            "ariaLabel",
+            "nodeValue",
+            "buttonText",
+            "confirmText",
+            "cancelText",
+            "labelText",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
     } else {
         settings.ast_assignments.clone()
     };
     let functions = if settings.ast_functions.is_empty() {
-        vec!["Notice", "setTitle", "setContent", "setName", "setDesc", "setButtonText", "setPlaceholder", "setTooltip", "addOption", "addOptions", "addHeading", "addText", "setHint", "setWarning", "setText", "appendText", "createEl", "createDiv", "createSpan", "addCommand", "insertText", "replaceRange", "replaceSelection", "log", "error", "warn", "info", "alert", "confirm", "prompt", "renderMarkdown", "setLabel", "setConfirmText", "setCancelText"]
-            .into_iter().map(str::to_string).collect()
+        vec![
+            "Notice",
+            "setTitle",
+            "setContent",
+            "setName",
+            "setDesc",
+            "setButtonText",
+            "setPlaceholder",
+            "setTooltip",
+            "addOption",
+            "addOptions",
+            "addHeading",
+            "addText",
+            "setHint",
+            "setWarning",
+            "setText",
+            "appendText",
+            "createEl",
+            "createDiv",
+            "createSpan",
+            "addCommand",
+            "insertText",
+            "replaceRange",
+            "replaceSelection",
+            "log",
+            "error",
+            "warn",
+            "info",
+            "alert",
+            "confirm",
+            "prompt",
+            "renderMarkdown",
+            "setLabel",
+            "setConfirmText",
+            "setCancelText",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
     } else {
         settings.ast_functions.clone()
     };
     let keys = if settings.ast_keys.is_empty() {
-        vec!["name", "description", "text", "placeholder", "label", "tooltip", "title", "header", "desc", "message", "buttontext", "aria-label", "heading", "content", "tab", "caption", "subtitle", "summary", "info", "warning", "error", "success", "hint", "instructions", "link", "selection", "annotation", "search", "speech", "page", "empty", "detail", "body", "option", "notice", "confirmText", "cancelText", "ariaLabel", "buttonText"]
-            .into_iter().map(str::to_string).collect()
+        vec![
+            "name",
+            "description",
+            "text",
+            "placeholder",
+            "label",
+            "tooltip",
+            "title",
+            "header",
+            "desc",
+            "message",
+            "buttontext",
+            "aria-label",
+            "heading",
+            "content",
+            "tab",
+            "caption",
+            "subtitle",
+            "summary",
+            "info",
+            "warning",
+            "error",
+            "success",
+            "hint",
+            "instructions",
+            "link",
+            "selection",
+            "annotation",
+            "search",
+            "speech",
+            "page",
+            "empty",
+            "detail",
+            "body",
+            "option",
+            "notice",
+            "confirmText",
+            "cancelText",
+            "ariaLabel",
+            "buttonText",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
     } else {
         settings.ast_keys.clone()
     };
@@ -1667,27 +2045,48 @@ fn extract_ast_items_heuristic(code: &str, settings: &ExtractionSettings) -> Vec
 
         if let Some(name) = previous_assignment_name(code, quote_index) {
             if contains_word(&assignments, &name) {
-                ast_match = Some(AstMatch { node_type: "AssignmentExpression".to_string(), name, source: source.clone() });
+                ast_match = Some(AstMatch {
+                    node_type: "AssignmentExpression".to_string(),
+                    name,
+                    source: source.clone(),
+                });
             }
         }
         if ast_match.is_none() {
             if let Some(name) = previous_object_key_name(code, quote_index) {
                 if contains_word(&keys, &name) {
-                    ast_match = Some(AstMatch { node_type: "ObjectProperty".to_string(), name, source: source.clone() });
+                    ast_match = Some(AstMatch {
+                        node_type: "ObjectProperty".to_string(),
+                        name,
+                        source: source.clone(),
+                    });
                 }
             }
         }
         if ast_match.is_none() {
             if let Some(name) = previous_variable_name(code, quote_index) {
                 if contains_word(&assignments, &name) {
-                    ast_match = Some(AstMatch { node_type: "VariableDeclarator".to_string(), name, source: source.clone() });
+                    ast_match = Some(AstMatch {
+                        node_type: "VariableDeclarator".to_string(),
+                        name,
+                        source: source.clone(),
+                    });
                 }
             }
         }
         if ast_match.is_none() {
             if let Some((name, is_new)) = call_name_before(code, quote_index) {
                 if contains_word(&functions, &name) {
-                    ast_match = Some(AstMatch { node_type: if is_new { "NewExpression" } else { "CallExpression" }.to_string(), name, source: source.clone() });
+                    ast_match = Some(AstMatch {
+                        node_type: if is_new {
+                            "NewExpression"
+                        } else {
+                            "CallExpression"
+                        }
+                        .to_string(),
+                        name,
+                        source: source.clone(),
+                    });
                 }
             }
         }
@@ -1707,8 +2106,22 @@ fn extract_ast_items_heuristic(code: &str, settings: &ExtractionSettings) -> Vec
         index = end_index;
     }
     matches.sort_by(|left, right| {
-        let left_key = format!("{}:{}", left.get("type").and_then(Value::as_str).unwrap_or_default(), left.get("name").and_then(Value::as_str).unwrap_or_default());
-        let right_key = format!("{}:{}", right.get("type").and_then(Value::as_str).unwrap_or_default(), right.get("name").and_then(Value::as_str).unwrap_or_default());
+        let left_key = format!(
+            "{}:{}",
+            left.get("type").and_then(Value::as_str).unwrap_or_default(),
+            left.get("name").and_then(Value::as_str).unwrap_or_default()
+        );
+        let right_key = format!(
+            "{}:{}",
+            right
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            right
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        );
         left_key.cmp(&right_key)
     });
     matches
@@ -1743,7 +2156,13 @@ fn swc_set_expr_string(expr: &mut Expr, target: &str) {
     }
 }
 
-fn lookup_ast_replacement(strict: &HashMap<String, String>, loose: &HashMap<String, String>, node_type: &str, name: &str, expr: &Expr) -> Option<String> {
+fn lookup_ast_replacement(
+    strict: &HashMap<String, String>,
+    loose: &HashMap<String, String>,
+    node_type: &str,
+    name: &str,
+    expr: &Expr,
+) -> Option<String> {
     let source = swc_string_source(expr)?;
     strict
         .get(&format!("{node_type}:{name}:{source}"))
@@ -1752,18 +2171,34 @@ fn lookup_ast_replacement(strict: &HashMap<String, String>, loose: &HashMap<Stri
         .cloned()
 }
 
-fn replace_expr_if_matches(strict: &HashMap<String, String>, loose: &HashMap<String, String>, node_type: &str, name: &str, expr: &mut Box<Expr>) {
+fn replace_expr_if_matches(
+    strict: &HashMap<String, String>,
+    loose: &HashMap<String, String>,
+    node_type: &str,
+    name: &str,
+    expr: &mut Box<Expr>,
+) {
     if let Some(target) = lookup_ast_replacement(strict, loose, node_type, name, expr) {
         swc_set_expr_string(expr, &target);
     }
 }
 
-fn replace_object_arg_properties(strict: &HashMap<String, String>, loose: &HashMap<String, String>, object: &mut ObjectLit) {
+fn replace_object_arg_properties(
+    strict: &HashMap<String, String>,
+    loose: &HashMap<String, String>,
+    object: &mut ObjectLit,
+) {
     for prop in &mut object.props {
         if let PropOrSpread::Prop(prop) = prop {
             if let Prop::KeyValue(key_value) = &mut **prop {
                 let name = swc_prop_name(&key_value.key).unwrap_or_else(|| "prop".to_string());
-                replace_expr_if_matches(strict, loose, "ObjectProperty", &name, &mut key_value.value);
+                replace_expr_if_matches(
+                    strict,
+                    loose,
+                    "ObjectProperty",
+                    &name,
+                    &mut key_value.value,
+                );
             }
         }
     }
@@ -1778,7 +2213,13 @@ impl VisitMut for SwcReplaceVisitor<'_> {
     fn visit_mut_var_declarator(&mut self, node: &mut VarDeclarator) {
         if let Pat::Ident(ident) = &node.name {
             if let Some(init) = node.init.as_mut() {
-                replace_expr_if_matches(self.strict, self.loose, "VariableDeclarator", &ident.id.sym.to_string(), init);
+                replace_expr_if_matches(
+                    self.strict,
+                    self.loose,
+                    "VariableDeclarator",
+                    &ident.id.sym.to_string(),
+                    init,
+                );
             }
         }
         node.visit_mut_children_with(self);
@@ -1786,7 +2227,13 @@ impl VisitMut for SwcReplaceVisitor<'_> {
 
     fn visit_mut_assign_expr(&mut self, node: &mut AssignExpr) {
         if let Some(name) = swc_assign_name(&node.left) {
-            replace_expr_if_matches(self.strict, self.loose, "AssignmentExpression", &name, &mut node.right);
+            replace_expr_if_matches(
+                self.strict,
+                self.loose,
+                "AssignmentExpression",
+                &name,
+                &mut node.right,
+            );
         }
         node.visit_mut_children_with(self);
     }
@@ -1794,7 +2241,13 @@ impl VisitMut for SwcReplaceVisitor<'_> {
     fn visit_mut_prop(&mut self, node: &mut Prop) {
         if let Prop::KeyValue(key_value) = node {
             let name = swc_prop_name(&key_value.key).unwrap_or_else(|| "prop".to_string());
-            replace_expr_if_matches(self.strict, self.loose, "ObjectProperty", &name, &mut key_value.value);
+            replace_expr_if_matches(
+                self.strict,
+                self.loose,
+                "ObjectProperty",
+                &name,
+                &mut key_value.value,
+            );
         }
         node.visit_mut_children_with(self);
     }
@@ -1803,8 +2256,16 @@ impl VisitMut for SwcReplaceVisitor<'_> {
         let name = swc_callee_name(&node.callee).unwrap_or_else(|| "func".to_string());
         for arg in &mut node.args {
             match &mut *arg.expr {
-                Expr::Object(object) => replace_object_arg_properties(self.strict, self.loose, object),
-                _ => replace_expr_if_matches(self.strict, self.loose, "CallExpression", &name, &mut arg.expr),
+                Expr::Object(object) => {
+                    replace_object_arg_properties(self.strict, self.loose, object)
+                }
+                _ => replace_expr_if_matches(
+                    self.strict,
+                    self.loose,
+                    "CallExpression",
+                    &name,
+                    &mut arg.expr,
+                ),
             }
         }
         node.visit_mut_children_with(self);
@@ -1814,8 +2275,16 @@ impl VisitMut for SwcReplaceVisitor<'_> {
         let name = swc_expr_name(&node.callee).unwrap_or_else(|| "new".to_string());
         for arg in node.args.iter_mut().flatten() {
             match &mut *arg.expr {
-                Expr::Object(object) => replace_object_arg_properties(self.strict, self.loose, object),
-                _ => replace_expr_if_matches(self.strict, self.loose, "NewExpression", &name, &mut arg.expr),
+                Expr::Object(object) => {
+                    replace_object_arg_properties(self.strict, self.loose, object)
+                }
+                _ => replace_expr_if_matches(
+                    self.strict,
+                    self.loose,
+                    "NewExpression",
+                    &name,
+                    &mut arg.expr,
+                ),
             }
         }
         node.visit_mut_children_with(self);
@@ -1827,17 +2296,29 @@ fn replace_ast_items_swc(code: &str, translations: &[Value]) -> Result<String> {
     let mut strict = HashMap::new();
     let mut loose = HashMap::new();
     for item in translations {
-        let source = item.get("source").and_then(Value::as_str).unwrap_or_default();
-        let target = item.get("target").and_then(Value::as_str).unwrap_or_default();
+        let source = item
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let target = item
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         if source.is_empty() || target.is_empty() || source == target {
             continue;
         }
-        if let (Some(node_type), Some(name)) = (item.get("type").and_then(Value::as_str), item.get("name").and_then(Value::as_str)) {
+        if let (Some(node_type), Some(name)) = (
+            item.get("type").and_then(Value::as_str),
+            item.get("name").and_then(Value::as_str),
+        ) {
             strict.insert(format!("{node_type}:{name}:{source}"), target.to_string());
         }
         loose.insert(source.to_string(), target.to_string());
     }
-    module.visit_mut_with(&mut SwcReplaceVisitor { strict: &strict, loose: &loose });
+    module.visit_mut_with(&mut SwcReplaceVisitor {
+        strict: &strict,
+        loose: &loose,
+    });
 
     let mut output = Vec::new();
     {
@@ -1864,7 +2345,10 @@ fn extract_regex_items(code: &str, settings: &ExtractionSettings) -> Vec<Value> 
         return Vec::new();
     }
     let patterns = if settings.re_datas.is_empty() {
-        DEFAULT_REGEX_PATTERNS.iter().map(|item| item.to_string()).collect::<Vec<_>>()
+        DEFAULT_REGEX_PATTERNS
+            .iter()
+            .map(|item| item.to_string())
+            .collect::<Vec<_>>()
     } else {
         settings.re_datas.clone()
     };
@@ -1899,7 +2383,9 @@ fn extract_regex_items(code: &str, settings: &ExtractionSettings) -> Vec<Value> 
                 continue;
             };
             let source = unescape_simple_js_string(source);
-            if !is_valid_regex_text(&source, settings.re_length, &reject, &valid) || seen.contains(&source) {
+            if !is_valid_regex_text(&source, settings.re_length, &reject, &valid)
+                || seen.contains(&source)
+            {
                 continue;
             }
             seen.insert(source.clone());
@@ -1920,7 +2406,11 @@ fn extract_theme_items(theme_css: &str) -> Vec<Value> {
         };
         for field in field_re.captures_iter(content) {
             let field_type = field.get(1).map(|m| m.as_str()).unwrap_or_default();
-            let source = field.get(2).or_else(|| field.get(3)).map(|m| m.as_str()).unwrap_or_default();
+            let source = field
+                .get(2)
+                .or_else(|| field.get(3))
+                .map(|m| m.as_str())
+                .unwrap_or_default();
             if source.trim().is_empty() || !seen.insert(source.to_string()) {
                 continue;
             }
@@ -1947,11 +2437,7 @@ const DEFAULT_REJECT_PATTERNS: &[&str] = &[
     r"^[\w./\\-]+/[\w./\\-]+$",
 ];
 
-const DEFAULT_VALID_PATTERNS: &[&str] = &[
-    r"\s",
-    r"[^\x00-\x7F]",
-    r"[!?,;:。！？，；：]\s*$",
-];
+const DEFAULT_VALID_PATTERNS: &[&str] = &[r"\s", r"[^\x00-\x7F]", r"[!?,;:。！？，；：]\s*$"];
 
 const DEFAULT_REGEX_PATTERNS: &[&str] = &[
     r#"(Notice|log|error|setText|setButtonText|setName|setDesc|setPlaceholder|setTooltip|appendText|setTitle|addHeading|renderMarkdown)\(\s*(['"`])((?:[^\\]|\\.)*?)\2\s*\)"#,
@@ -1960,8 +2446,12 @@ const DEFAULT_REGEX_PATTERNS: &[&str] = &[
 
 async fn proxy_route(
     State(state): State<AppState>,
-    Json(payload): Json<CompanionProxyRequest>,
+    body: Body,
 ) -> impl IntoResponse {
+    let payload = match read_json_body::<CompanionProxyRequest>(body).await {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
     match proxy(&state, payload).await {
         Ok(response) => Json(json!({ "ok": true, "response": response })).into_response(),
         Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
@@ -1970,8 +2460,12 @@ async fn proxy_route(
 
 async fn task_route(
     State(state): State<AppState>,
-    Json(payload): Json<Value>,
+    body: Body,
 ) -> impl IntoResponse {
+    let payload = match read_json_body::<Value>(body).await {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
     let task_type = payload
         .get("type")
         .and_then(Value::as_str)
@@ -1985,8 +2479,12 @@ async fn task_route(
 
 async fn task_start_route(
     State(state): State<AppState>,
-    Json(payload): Json<Value>,
+    body: Body,
 ) -> impl IntoResponse {
+    let payload = match read_json_body::<Value>(body).await {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
     let task_type = payload
         .get("type")
         .and_then(Value::as_str)
@@ -2021,8 +2519,12 @@ async fn task_status_route(
 
 async fn task_cancel_route(
     State(state): State<AppState>,
-    Json(payload): Json<Value>,
+    body: Body,
 ) -> impl IntoResponse {
+    let payload = match read_json_body::<Value>(body).await {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
     let task_id = payload
         .get("taskId")
         .and_then(Value::as_str)
@@ -2043,6 +2545,27 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> axum::respo
         Json(json!({ "ok": false, "error": message.into() })),
     )
         .into_response()
+}
+
+async fn read_json_body<T>(body: Body) -> std::result::Result<T, axum::response::Response>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let bytes = to_bytes(body, MAX_JSON_BODY_BYTES)
+        .await
+        .map_err(|error| {
+            let message = if error.to_string().contains("length limit") {
+                format!(
+                    "请求体过大，请求上限为 {} MB",
+                    MAX_JSON_BODY_BYTES / 1024 / 1024
+                )
+            } else {
+                format!("读取请求体失败: {error}")
+            };
+            error_response(StatusCode::PAYLOAD_TOO_LARGE, message)
+        })?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| error_response(StatusCode::BAD_REQUEST, format!("JSON 解析失败: {error}")))
 }
 
 async fn get_task(state: &AppState, task_id: &str) -> Option<Arc<TaskRuntime>> {
@@ -2100,8 +2623,22 @@ fn create_initial_progress(
 
     CompanionTaskProgress {
         task_id,
-        scope: if is_cloud { "cloud" } else if is_theme { "theme" } else { "plugin" }.to_string(),
-        mode: if is_cloud { "backup" } else if is_extract { "extract" } else { "translate" }.to_string(),
+        scope: if is_cloud {
+            "cloud"
+        } else if is_theme {
+            "theme"
+        } else {
+            "plugin"
+        }
+        .to_string(),
+        mode: if is_cloud {
+            "backup"
+        } else if is_extract {
+            "extract"
+        } else {
+            "translate"
+        }
+        .to_string(),
         status: "queued".to_string(),
         current_label: String::new(),
         processed_resources: payload
@@ -2340,14 +2877,51 @@ fn response_headers(headers: &HeaderMap) -> HashMap<String, String> {
 async fn github_read(state: &AppState, payload: GithubReadRequest) -> Result<GithubReadResponse> {
     match payload.operation.as_str() {
         "getUser" => github_get_user(state, &payload).await,
-        "checkRepoExists" => github_get_json(state, &payload, github_repo_url(&required(&payload.username, "username")?, &required(&payload.repo_name, "repoName")?)).await,
-        "getRepoInfo" => github_get_json(state, &payload, github_repo_url(&required(&payload.owner, "owner")?, &required(&payload.repo, "repo")?)).await,
-        "getLatestRelease" => github_get_json(state, &payload, format!("{}/releases/latest", github_repo_url(&required(&payload.owner, "owner")?, &required(&payload.repo, "repo")?))).await,
+        "checkRepoExists" => {
+            github_get_json(
+                state,
+                &payload,
+                github_repo_url(
+                    &required(&payload.username, "username")?,
+                    &required(&payload.repo_name, "repoName")?,
+                ),
+            )
+            .await
+        }
+        "getRepoInfo" => {
+            github_get_json(
+                state,
+                &payload,
+                github_repo_url(
+                    &required(&payload.owner, "owner")?,
+                    &required(&payload.repo, "repo")?,
+                ),
+            )
+            .await
+        }
+        "getLatestRelease" => {
+            github_get_json(
+                state,
+                &payload,
+                format!(
+                    "{}/releases/latest",
+                    github_repo_url(
+                        &required(&payload.owner, "owner")?,
+                        &required(&payload.repo, "repo")?
+                    )
+                ),
+            )
+            .await
+        }
         "getFileContent" => github_get_file_content(state, &payload).await,
-        "getFileContentWithFallback" => github_get_file_content_with_fallback(state, &payload).await,
+        "getFileContentWithFallback" => {
+            github_get_file_content_with_fallback(state, &payload).await
+        }
         "getRawContent" => github_get_raw_content(state, &payload).await,
         "downloadAsset" => github_download_asset(state, &payload).await,
-        "checkHasOpenRegistrationIssue" => github_check_open_registration_issue(state, &payload).await,
+        "checkHasOpenRegistrationIssue" => {
+            github_check_open_registration_issue(state, &payload).await
+        }
         "getFileCommits" => github_get_file_commits(state, &payload).await,
         "getFileAtCommit" => github_get_file_at_commit(state, &payload).await,
         "getRepoTree" => github_get_repo_tree(state, &payload).await,
@@ -2356,7 +2930,10 @@ async fn github_read(state: &AppState, payload: GithubReadRequest) -> Result<Git
     }
 }
 
-async fn github_write(state: &AppState, payload: GithubWriteRequest) -> Result<GithubWriteResponse> {
+async fn github_write(
+    state: &AppState,
+    payload: GithubWriteRequest,
+) -> Result<GithubWriteResponse> {
     match payload.operation.as_str() {
         "createRepo" => github_create_repo(state, &payload).await,
         "initRepoStructure" => github_init_repo_structure(state, &payload).await,
@@ -2371,7 +2948,10 @@ async fn github_write(state: &AppState, payload: GithubWriteRequest) -> Result<G
     }
 }
 
-async fn github_create_repo(state: &AppState, payload: &GithubWriteRequest) -> Result<GithubWriteResponse> {
+async fn github_create_repo(
+    state: &AppState,
+    payload: &GithubWriteRequest,
+) -> Result<GithubWriteResponse> {
     if token_missing(&payload.token) {
         return Ok(github_failure("GitHub Token 缺失"));
     }
@@ -2391,16 +2971,26 @@ async fn github_create_repo(state: &AppState, payload: &GithubWriteRequest) -> R
     .await
 }
 
-async fn github_init_repo_structure(state: &AppState, payload: &GithubWriteRequest) -> Result<GithubWriteResponse> {
+async fn github_init_repo_structure(
+    state: &AppState,
+    payload: &GithubWriteRequest,
+) -> Result<GithubWriteResponse> {
     if token_missing(&payload.token) {
         return Ok(github_failure("GitHub Token 缺失"));
     }
     let owner = required(&payload.owner, "owner")?;
     let repo = required(&payload.repo, "repo")?;
-    let check_url = format!("{}/contents/metadata.json?t={}", github_repo_url(&owner, &repo), now_ms());
+    let check_url = format!(
+        "{}/contents/metadata.json?t={}",
+        github_repo_url(&owner, &repo),
+        now_ms()
+    );
     let check_response = github_write_get_response(state, payload, check_url).await?;
     if check_response.status().as_u16() < 400 {
-        return Ok(success_with_status(Value::String("already initialized".to_string()), Some(check_response.status().as_u16())));
+        return Ok(success_with_status(
+            Value::String("already initialized".to_string()),
+            Some(check_response.status().as_u16()),
+        ));
     }
 
     let mut upload_payload = payload.clone();
@@ -2411,7 +3001,10 @@ async fn github_init_repo_structure(state: &AppState, payload: &GithubWriteReque
     github_upload_file(state, &upload_payload).await
 }
 
-async fn github_upload_file(state: &AppState, payload: &GithubWriteRequest) -> Result<GithubWriteResponse> {
+async fn github_upload_file(
+    state: &AppState,
+    payload: &GithubWriteRequest,
+) -> Result<GithubWriteResponse> {
     if token_missing(&payload.token) {
         return Ok(github_failure("GitHub Token 缺失"));
     }
@@ -2424,11 +3017,19 @@ async fn github_upload_file(state: &AppState, payload: &GithubWriteRequest) -> R
     let mut sha = payload.sha.clone().unwrap_or_default();
 
     if sha.is_empty() {
-        let check_url = format!("{}/contents/{path}?ref={branch}&t={}", github_repo_url(&owner, &repo), now_ms());
+        let check_url = format!(
+            "{}/contents/{path}?ref={branch}&t={}",
+            github_repo_url(&owner, &repo),
+            now_ms()
+        );
         if let Ok(check_response) = github_write_get_response(state, payload, check_url).await {
             if check_response.status().as_u16() == 200 {
                 if let Ok(data) = response_body_value(check_response).await {
-                    sha = data.get("sha").and_then(Value::as_str).unwrap_or_default().to_string();
+                    sha = data
+                        .get("sha")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
                 }
             }
         }
@@ -2453,7 +3054,10 @@ async fn github_upload_file(state: &AppState, payload: &GithubWriteRequest) -> R
     .await
 }
 
-async fn github_delete_file(state: &AppState, payload: &GithubWriteRequest) -> Result<GithubWriteResponse> {
+async fn github_delete_file(
+    state: &AppState,
+    payload: &GithubWriteRequest,
+) -> Result<GithubWriteResponse> {
     if token_missing(&payload.token) {
         return Ok(github_failure("GitHub Token 缺失"));
     }
@@ -2462,7 +3066,11 @@ async fn github_delete_file(state: &AppState, payload: &GithubWriteRequest) -> R
     let path = required(&payload.path, "path")?;
     let message = required(&payload.message, "message")?;
     let branch = payload.branch.as_deref().unwrap_or("main");
-    let check_url = format!("{}/contents/{path}?ref={branch}&t={}", github_repo_url(&owner, &repo), now_ms());
+    let check_url = format!(
+        "{}/contents/{path}?ref={branch}&t={}",
+        github_repo_url(&owner, &repo),
+        now_ms()
+    );
     let check_response = github_write_get_response(state, payload, check_url).await?;
     if check_response.status().as_u16() != 200 {
         return Ok(github_failure("GitHub 文件不存在"));
@@ -2487,12 +3095,18 @@ async fn github_delete_file(state: &AppState, payload: &GithubWriteRequest) -> R
     .await
 }
 
-async fn github_post_issue(state: &AppState, payload: &GithubWriteRequest) -> Result<GithubWriteResponse> {
+async fn github_post_issue(
+    state: &AppState,
+    payload: &GithubWriteRequest,
+) -> Result<GithubWriteResponse> {
     if token_missing(&payload.token) {
         return Ok(github_failure("GitHub Token 缺失"));
     }
     let owner = payload.target_owner.as_deref().unwrap_or("eondrcode");
-    let repo = payload.target_repo.as_deref().unwrap_or("obsidian-i18n-resources");
+    let repo = payload
+        .target_repo
+        .as_deref()
+        .unwrap_or("obsidian-i18n-resources");
     let title = required(&payload.title, "title")?;
     let body = required(&payload.body, "body")?;
     let labels = payload
@@ -2516,7 +3130,10 @@ async fn github_post_issue(state: &AppState, payload: &GithubWriteRequest) -> Re
     .await
 }
 
-async fn github_create_tree(state: &AppState, payload: &GithubWriteRequest) -> Result<GithubWriteResponse> {
+async fn github_create_tree(
+    state: &AppState,
+    payload: &GithubWriteRequest,
+) -> Result<GithubWriteResponse> {
     if token_missing(&payload.token) {
         return Ok(github_failure("GitHub Token 缺失"));
     }
@@ -2538,7 +3155,10 @@ async fn github_create_tree(state: &AppState, payload: &GithubWriteRequest) -> R
     .await
 }
 
-async fn github_create_commit(state: &AppState, payload: &GithubWriteRequest) -> Result<GithubWriteResponse> {
+async fn github_create_commit(
+    state: &AppState,
+    payload: &GithubWriteRequest,
+) -> Result<GithubWriteResponse> {
     if token_missing(&payload.token) {
         return Ok(github_failure("GitHub Token 缺失"));
     }
@@ -2562,7 +3182,10 @@ async fn github_create_commit(state: &AppState, payload: &GithubWriteRequest) ->
     .await
 }
 
-async fn github_update_ref(state: &AppState, payload: &GithubWriteRequest) -> Result<GithubWriteResponse> {
+async fn github_update_ref(
+    state: &AppState,
+    payload: &GithubWriteRequest,
+) -> Result<GithubWriteResponse> {
     if token_missing(&payload.token) {
         return Ok(github_failure("GitHub Token 缺失"));
     }
@@ -2584,7 +3207,10 @@ async fn github_update_ref(state: &AppState, payload: &GithubWriteRequest) -> Re
     .await
 }
 
-async fn github_batch_upload_files(state: &AppState, payload: &GithubWriteRequest) -> Result<GithubWriteResponse> {
+async fn github_batch_upload_files(
+    state: &AppState,
+    payload: &GithubWriteRequest,
+) -> Result<GithubWriteResponse> {
     if token_missing(&payload.token) {
         return Ok(github_failure("GitHub Token 缺失"));
     }
@@ -2592,14 +3218,29 @@ async fn github_batch_upload_files(state: &AppState, payload: &GithubWriteReques
     let repo = required(&payload.repo, "repo")?;
     let files = payload.files.clone().unwrap_or_default();
     if files.is_empty() {
-        return Ok(success_with_status(Value::String("no files to upload".to_string()), None));
+        return Ok(success_with_status(
+            Value::String("no files to upload".to_string()),
+            None,
+        ));
     }
     let message = required(&payload.message, "message")?;
     let branch = payload.branch.as_deref().unwrap_or("main");
 
-    let ref_res = github_write_get_json(state, payload, format!("{}/git/refs/heads/{branch}?t={}", github_repo_url(&owner, &repo), now_ms())).await?;
+    let ref_res = github_write_get_json(
+        state,
+        payload,
+        format!(
+            "{}/git/refs/heads/{branch}?t={}",
+            github_repo_url(&owner, &repo),
+            now_ms()
+        ),
+    )
+    .await?;
     if !ref_res.state {
-        return Ok(github_failure(format!("获取分支信息失败: {}", ref_res.data)));
+        return Ok(github_failure(format!(
+            "获取分支信息失败: {}",
+            ref_res.data
+        )));
     }
     let last_commit_sha = ref_res
         .data
@@ -2611,11 +3252,17 @@ async fn github_batch_upload_files(state: &AppState, payload: &GithubWriteReques
     let commit_detail = github_write_get_json(
         state,
         payload,
-        format!("{}/git/commits/{last_commit_sha}", github_repo_url(&owner, &repo)),
+        format!(
+            "{}/git/commits/{last_commit_sha}",
+            github_repo_url(&owner, &repo)
+        ),
     )
     .await?;
     if !commit_detail.state {
-        return Ok(github_failure(format!("获取提交信息失败: {}", commit_detail.data)));
+        return Ok(github_failure(format!(
+            "获取提交信息失败: {}",
+            commit_detail.data
+        )));
     }
     let base_tree_sha = commit_detail
         .data
@@ -2626,12 +3273,14 @@ async fn github_batch_upload_files(state: &AppState, payload: &GithubWriteReques
 
     let tree_items = files
         .iter()
-        .map(|file| json!({
-            "path": file.path,
-            "mode": "100644",
-            "type": "blob",
-            "content": file.content,
-        }))
+        .map(|file| {
+            json!({
+                "path": file.path,
+                "mode": "100644",
+                "type": "blob",
+                "content": file.content,
+            })
+        })
         .collect::<Vec<_>>();
     let new_tree = github_write_json_request(
         state,
@@ -2667,7 +3316,10 @@ async fn github_batch_upload_files(state: &AppState, payload: &GithubWriteReques
     )
     .await?;
     if !new_commit.state {
-        return Ok(github_failure(format!("创建 Commit 失败: {}", new_commit.data)));
+        return Ok(github_failure(format!(
+            "创建 Commit 失败: {}",
+            new_commit.data
+        )));
     }
     let new_commit_sha = new_commit
         .data
@@ -2694,7 +3346,11 @@ async fn github_batch_upload_files(state: &AppState, payload: &GithubWriteReques
     Ok(update_ref)
 }
 
-async fn github_write_get_json(state: &AppState, payload: &GithubWriteRequest, url: String) -> Result<GithubWriteResponse> {
+async fn github_write_get_json(
+    state: &AppState,
+    payload: &GithubWriteRequest,
+    url: String,
+) -> Result<GithubWriteResponse> {
     let response = github_write_get_response(state, payload, url).await?;
     github_response_from_response(response, None).await
 }
@@ -2707,7 +3363,9 @@ async fn github_write_get_response(
     let mut request = state
         .http
         .get(url)
-        .timeout(Duration::from_millis(payload.timeout_ms.unwrap_or(10_000).max(1000)))
+        .timeout(Duration::from_millis(
+            payload.timeout_ms.unwrap_or(10_000).max(1000),
+        ))
         .header("accept", "application/vnd.github.v3+json")
         .header("user-agent", "obsidian-i18n-companion");
     if let Some(token) = payload.token.as_deref().filter(|token| !token.is_empty()) {
@@ -2726,7 +3384,9 @@ async fn github_write_json_request(
     let mut request = state
         .http
         .request(method.parse()?, url)
-        .timeout(Duration::from_millis(payload.timeout_ms.unwrap_or(10_000).max(1000)))
+        .timeout(Duration::from_millis(
+            payload.timeout_ms.unwrap_or(10_000).max(1000),
+        ))
         .header("accept", "application/vnd.github.v3+json")
         .header("content-type", "application/json")
         .header("user-agent", "obsidian-i18n-companion");
@@ -2751,8 +3411,12 @@ fn github_failure(message: impl Into<String>) -> GithubWriteResponse {
     }
 }
 
-async fn github_get_user(state: &AppState, payload: &GithubReadRequest) -> Result<GithubReadResponse> {
-    let response = github_api_get(state, payload, "https://api.github.com/user".to_string()).await?;
+async fn github_get_user(
+    state: &AppState,
+    payload: &GithubReadRequest,
+) -> Result<GithubReadResponse> {
+    let response =
+        github_api_get(state, payload, "https://api.github.com/user".to_string()).await?;
     let scopes = response
         .headers()
         .get("x-oauth-scopes")
@@ -2766,11 +3430,19 @@ async fn github_get_user(state: &AppState, payload: &GithubReadRequest) -> Resul
     github_response_from_response(response, Some(scopes)).await
 }
 
-async fn github_get_file_content(state: &AppState, payload: &GithubReadRequest) -> Result<GithubReadResponse> {
+async fn github_get_file_content(
+    state: &AppState,
+    payload: &GithubReadRequest,
+) -> Result<GithubReadResponse> {
     let owner = required(&payload.owner, "owner")?;
     let repo = required(&payload.repo, "repo")?;
     let path = required(&payload.path, "path")?;
-    let mut url = format!("{}/contents/{}?t={}", github_repo_url(&owner, &repo), path, now_ms());
+    let mut url = format!(
+        "{}/contents/{}?t={}",
+        github_repo_url(&owner, &repo),
+        path,
+        now_ms()
+    );
     if let Some(reference) = payload.r#ref.as_deref().or(payload.branch.as_deref()) {
         url.push_str("&ref=");
         url.push_str(reference);
@@ -2778,7 +3450,10 @@ async fn github_get_file_content(state: &AppState, payload: &GithubReadRequest) 
     github_get_json(state, payload, url).await
 }
 
-async fn github_get_file_content_with_fallback(state: &AppState, payload: &GithubReadRequest) -> Result<GithubReadResponse> {
+async fn github_get_file_content_with_fallback(
+    state: &AppState,
+    payload: &GithubReadRequest,
+) -> Result<GithubReadResponse> {
     let branch = payload.branch.clone().unwrap_or_else(|| "main".to_string());
     let mut content_payload = payload.clone();
     content_payload.r#ref = Some(branch.clone());
@@ -2787,10 +3462,15 @@ async fn github_get_file_content_with_fallback(state: &AppState, payload: &Githu
         Ok(response) if response.state => {
             if let Some(content) = response.data.get("content").and_then(Value::as_str) {
                 let decoded = decode_github_content(content)?;
-                return Ok(success_with_status(parse_text_or_json(decoded), response.status));
+                return Ok(success_with_status(
+                    parse_text_or_json(decoded),
+                    response.status,
+                ));
             }
             if let Some(download_url) = response.data.get("download_url").and_then(Value::as_str) {
-                if let Ok(raw_response) = github_get_url(state, payload, download_url.to_string()).await {
+                if let Ok(raw_response) =
+                    github_get_url(state, payload, download_url.to_string()).await
+                {
                     let status = raw_response.status().as_u16();
                     let text = raw_response.text().await?;
                     return Ok(success_with_status(parse_text_or_json(text), Some(status)));
@@ -2820,14 +3500,20 @@ async fn github_get_file_content_with_fallback(state: &AppState, payload: &Githu
     }
 }
 
-async fn github_get_raw_content(state: &AppState, payload: &GithubReadRequest) -> Result<GithubReadResponse> {
+async fn github_get_raw_content(
+    state: &AppState,
+    payload: &GithubReadRequest,
+) -> Result<GithubReadResponse> {
     let owner = required(&payload.owner, "owner")?;
     let repo = required(&payload.repo, "repo")?;
     let path = required(&payload.path, "path")?;
     let branch = payload.branch.as_deref().unwrap_or("main");
     let url = wrap_github_raw_proxy(
         &payload.github_proxy_url,
-        &format!("https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}?t={}", now_ms()),
+        &format!(
+            "https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}?t={}",
+            now_ms()
+        ),
     );
     let response = github_get_url(state, payload, url).await?;
     let status = response.status().as_u16();
@@ -2845,7 +3531,10 @@ async fn github_get_raw_content(state: &AppState, payload: &GithubReadRequest) -
     Ok(success_with_status(parse_text_or_json(text), Some(status)))
 }
 
-async fn github_download_asset(state: &AppState, payload: &GithubReadRequest) -> Result<GithubReadResponse> {
+async fn github_download_asset(
+    state: &AppState,
+    payload: &GithubReadRequest,
+) -> Result<GithubReadResponse> {
     let url = required(&payload.url, "url")?;
     let response = github_get_url(state, payload, url).await?;
     let status = response.status().as_u16();
@@ -2859,10 +3548,16 @@ async fn github_download_asset(state: &AppState, payload: &GithubReadRequest) ->
             has_open_issue: None,
         });
     }
-    Ok(success_with_status(Value::String(response.text().await?), Some(status)))
+    Ok(success_with_status(
+        Value::String(response.text().await?),
+        Some(status),
+    ))
 }
 
-async fn github_check_open_registration_issue(state: &AppState, payload: &GithubReadRequest) -> Result<GithubReadResponse> {
+async fn github_check_open_registration_issue(
+    state: &AppState,
+    payload: &GithubReadRequest,
+) -> Result<GithubReadResponse> {
     if payload.token.as_deref().unwrap_or_default().is_empty() {
         return Ok(GithubReadResponse {
             state: false,
@@ -2896,8 +3591,14 @@ async fn github_check_open_registration_issue(state: &AppState, payload: &Github
     let issues = response_body_value(response).await?;
     let has_open_issue = issues.as_array().is_some_and(|items| {
         items.iter().any(|issue| {
-            issue.get("title").and_then(Value::as_str).is_some_and(|title| title.contains(&repo_address))
-                || issue.get("body").and_then(Value::as_str).is_some_and(|body| body.contains(&repo_address))
+            issue
+                .get("title")
+                .and_then(Value::as_str)
+                .is_some_and(|title| title.contains(&repo_address))
+                || issue
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .is_some_and(|body| body.contains(&repo_address))
         })
     });
     Ok(GithubReadResponse {
@@ -2910,17 +3611,27 @@ async fn github_check_open_registration_issue(state: &AppState, payload: &Github
     })
 }
 
-async fn github_get_file_commits(state: &AppState, payload: &GithubReadRequest) -> Result<GithubReadResponse> {
+async fn github_get_file_commits(
+    state: &AppState,
+    payload: &GithubReadRequest,
+) -> Result<GithubReadResponse> {
     let owner = required(&payload.owner, "owner")?;
     let repo = required(&payload.repo, "repo")?;
     let path = required(&payload.path, "path")?;
     let page = payload.page.unwrap_or(1);
     let per_page = payload.per_page.unwrap_or(20);
-    let url = format!("{}/commits?path={path}&page={page}&per_page={per_page}&t={}", github_repo_url(&owner, &repo), now_ms());
+    let url = format!(
+        "{}/commits?path={path}&page={page}&per_page={per_page}&t={}",
+        github_repo_url(&owner, &repo),
+        now_ms()
+    );
     github_get_json(state, payload, url).await
 }
 
-async fn github_get_file_at_commit(state: &AppState, payload: &GithubReadRequest) -> Result<GithubReadResponse> {
+async fn github_get_file_at_commit(
+    state: &AppState,
+    payload: &GithubReadRequest,
+) -> Result<GithubReadResponse> {
     let owner = required(&payload.owner, "owner")?;
     let repo = required(&payload.repo, "repo")?;
     let path = required(&payload.path, "path")?;
@@ -2928,38 +3639,64 @@ async fn github_get_file_at_commit(state: &AppState, payload: &GithubReadRequest
     github_get_json(
         state,
         payload,
-        format!("{}/contents/{path}?ref={reference}&t={}", github_repo_url(&owner, &repo), now_ms()),
+        format!(
+            "{}/contents/{path}?ref={reference}&t={}",
+            github_repo_url(&owner, &repo),
+            now_ms()
+        ),
     )
     .await
 }
 
-async fn github_get_repo_tree(state: &AppState, payload: &GithubReadRequest) -> Result<GithubReadResponse> {
+async fn github_get_repo_tree(
+    state: &AppState,
+    payload: &GithubReadRequest,
+) -> Result<GithubReadResponse> {
     let owner = required(&payload.owner, "owner")?;
     let repo = required(&payload.repo, "repo")?;
-    let tree_sha = payload.r#ref.as_deref().or(payload.branch.as_deref()).unwrap_or("main");
+    let tree_sha = payload
+        .r#ref
+        .as_deref()
+        .or(payload.branch.as_deref())
+        .unwrap_or("main");
     let recursive = payload.recursive.unwrap_or(true);
     let suffix = if recursive { "?recursive=1" } else { "?" };
     github_get_json(
         state,
         payload,
-        format!("{}/git/trees/{tree_sha}{suffix}&t={}", github_repo_url(&owner, &repo), now_ms()),
+        format!(
+            "{}/git/trees/{tree_sha}{suffix}&t={}",
+            github_repo_url(&owner, &repo),
+            now_ms()
+        ),
     )
     .await
 }
 
-async fn github_get_ref(state: &AppState, payload: &GithubReadRequest) -> Result<GithubReadResponse> {
+async fn github_get_ref(
+    state: &AppState,
+    payload: &GithubReadRequest,
+) -> Result<GithubReadResponse> {
     let owner = required(&payload.owner, "owner")?;
     let repo = required(&payload.repo, "repo")?;
     let reference = payload.r#ref.as_deref().unwrap_or("heads/main");
     github_get_json(
         state,
         payload,
-        format!("{}/git/refs/{reference}?t={}", github_repo_url(&owner, &repo), now_ms()),
+        format!(
+            "{}/git/refs/{reference}?t={}",
+            github_repo_url(&owner, &repo),
+            now_ms()
+        ),
     )
     .await
 }
 
-async fn github_get_json(state: &AppState, payload: &GithubReadRequest, url: String) -> Result<GithubReadResponse> {
+async fn github_get_json(
+    state: &AppState,
+    payload: &GithubReadRequest,
+    url: String,
+) -> Result<GithubReadResponse> {
     let response = github_api_get(state, payload, url).await?;
     github_response_from_response(response, None).await
 }
@@ -2989,7 +3726,9 @@ async fn github_api_get(
     let mut request = state
         .http
         .get(url)
-        .timeout(Duration::from_millis(payload.timeout_ms.unwrap_or(10_000).max(1000)))
+        .timeout(Duration::from_millis(
+            payload.timeout_ms.unwrap_or(10_000).max(1000),
+        ))
         .header("accept", "application/vnd.github.v3+json")
         .header("user-agent", "obsidian-i18n-companion");
     if let Some(token) = payload.token.as_deref().filter(|token| !token.is_empty()) {
@@ -3010,7 +3749,9 @@ async fn github_get_url(
     Ok(state
         .http
         .get(target)
-        .timeout(Duration::from_millis(payload.timeout_ms.unwrap_or(10_000).max(1000)))
+        .timeout(Duration::from_millis(
+            payload.timeout_ms.unwrap_or(10_000).max(1000),
+        ))
         .header("user-agent", "obsidian-i18n-companion")
         .send()
         .await?)
@@ -3103,13 +3844,20 @@ fn select_best_translation(payload: AutomationMatchRequest) -> Result<Automation
 
     for candidate in payload.matches {
         if has_language_match {
-            let language = candidate.entry.get("language").and_then(Value::as_str).unwrap_or_default();
+            let language = candidate
+                .entry
+                .get("language")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             if language != payload.target_language {
                 continue;
             }
         }
 
-        let repo_stats = payload.stats.pointer(&format!("/repos/{}", escape_json_pointer(&candidate.repo_address)));
+        let repo_stats = payload.stats.pointer(&format!(
+            "/repos/{}",
+            escape_json_pointer(&candidate.repo_address)
+        ));
         let stars = repo_stats
             .and_then(|stats| stats.get("stars"))
             .and_then(Value::as_f64)
@@ -3154,9 +3902,15 @@ fn select_best_translation(payload: AutomationMatchRequest) -> Result<Automation
         };
 
         let total_raw = match payload.strategy.as_str() {
-            "version_first" => (version_score * 1.5) + (popularity_score * 0.5) + (freshness_score * 0.5),
-            "popularity" => (version_score * 0.5) + (popularity_score * 1.5) + (freshness_score * 0.5),
-            "latest_update" => (version_score * 0.5) + (popularity_score * 0.5) + (freshness_score * 1.5),
+            "version_first" => {
+                (version_score * 1.5) + (popularity_score * 0.5) + (freshness_score * 0.5)
+            }
+            "popularity" => {
+                (version_score * 0.5) + (popularity_score * 1.5) + (freshness_score * 0.5)
+            }
+            "latest_update" => {
+                (version_score * 0.5) + (popularity_score * 0.5) + (freshness_score * 1.5)
+            }
             _ => version_score + popularity_score + freshness_score,
         };
         let total = (total_raw.round() as i64).min(100);
@@ -3182,8 +3936,14 @@ fn version_compatibility(cloud_version: &str, local_version: &str) -> f64 {
     if cloud_version == local_version {
         return 100.0;
     }
-    let cloud_major = cloud_version.split('.').next().and_then(|value| value.parse::<i64>().ok());
-    let local_major = local_version.split('.').next().and_then(|value| value.parse::<i64>().ok());
+    let cloud_major = cloud_version
+        .split('.')
+        .next()
+        .and_then(|value| value.parse::<i64>().ok());
+    let local_major = local_version
+        .split('.')
+        .next()
+        .and_then(|value| value.parse::<i64>().ok());
     if cloud_major.is_some() && cloud_major == local_major {
         50.0
     } else {
@@ -3207,7 +3967,10 @@ async fn handle_cloud_publish_source(state: &AppState, payload: Value) -> Result
         return Ok(json!({ "state": false, "error": "GitHub Token 缺失" }));
     }
     let paths = paths(&payload.persistence.base_path);
-    let source_id = payload.source_id.as_deref().ok_or_else(|| anyhow!("缺少 sourceId"))?;
+    let source_id = payload
+        .source_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("缺少 sourceId"))?;
     let source = load_meta(&paths)
         .pointer(&format!("/sources/{}", escape_pointer(source_id)))
         .cloned()
@@ -3215,49 +3978,68 @@ async fn handle_cloud_publish_source(state: &AppState, payload: Value) -> Result
     let content = read_translation(&paths, source_id).ok_or_else(|| anyhow!("翻译文件不存在"))?;
     let content_text = serde_json::to_string_pretty(&content)?;
     let hash = simple_hash(&content_text);
-    let source_type = source.get("type").and_then(Value::as_str).unwrap_or("plugin");
-    let plugin = source.get("plugin").and_then(Value::as_str).unwrap_or_default();
+    let source_type = source
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("plugin");
+    let plugin = source
+        .get("plugin")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let remote_path = cloud_file_path(source_id, source_type);
-    let message_title = payload.title.as_deref().or_else(|| source.get("title").and_then(Value::as_str)).unwrap_or(source_id);
-    let upload = github_upload_file(state, &GithubWriteRequest {
-        operation: "uploadFile".to_string(),
-        token: payload.token.clone(),
-        owner: Some(payload.owner.clone()),
-        repo: Some(payload.repo.clone()),
-        path: Some(remote_path),
-        content: Some(BASE64_STANDARD.encode(content_text.as_bytes())),
-        message: Some(format!("Update translation: {message_title}")),
-        branch: Some(payload.branch.clone()),
-        sha: None,
-        name: None,
-        title: None,
-        body: None,
-        label: None,
-        target_owner: None,
-        target_repo: None,
-        base_tree: None,
-        tree_data: None,
-        tree: None,
-        parents: None,
-        r#ref: None,
-        files: None,
-        timeout_ms: None,
-    }).await?;
+    let message_title = payload
+        .title
+        .as_deref()
+        .or_else(|| source.get("title").and_then(Value::as_str))
+        .unwrap_or(source_id);
+    let upload = github_upload_file(
+        state,
+        &GithubWriteRequest {
+            operation: "uploadFile".to_string(),
+            token: payload.token.clone(),
+            owner: Some(payload.owner.clone()),
+            repo: Some(payload.repo.clone()),
+            path: Some(remote_path),
+            content: Some(BASE64_STANDARD.encode(content_text.as_bytes())),
+            message: Some(format!("Update translation: {message_title}")),
+            branch: Some(payload.branch.clone()),
+            sha: None,
+            name: None,
+            title: None,
+            body: None,
+            label: None,
+            target_owner: None,
+            target_repo: None,
+            base_tree: None,
+            tree_data: None,
+            tree: None,
+            parents: None,
+            r#ref: None,
+            files: None,
+            timeout_ms: None,
+        },
+    )
+    .await?;
     if !upload.state {
         return Ok(json!({ "state": false, "error": upload.data }));
     }
 
     let (mut manifest, manifest_sha) = fetch_manifest_with_sha(state, &payload).await?;
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let existing_index = manifest.iter().position(|entry| entry.get("id").and_then(Value::as_str) == Some(source_id));
+    let existing_index = manifest
+        .iter()
+        .position(|entry| entry.get("id").and_then(Value::as_str) == Some(source_id));
     let created_at = existing_index
         .and_then(|index| manifest[index].get("created_at").cloned())
         .unwrap_or_else(|| Value::String(now.clone()));
     let version = payload.version.clone().unwrap_or_default();
-    let title = payload
-        .title
-        .clone()
-        .unwrap_or_else(|| source.get("title").and_then(Value::as_str).unwrap_or(source_id).to_string());
+    let title = payload.title.clone().unwrap_or_else(|| {
+        source
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or(source_id)
+            .to_string()
+    });
     let description = payload.description.clone().unwrap_or_default();
     let mut entry = json!({
         "id": source_id,
@@ -3274,12 +4056,18 @@ async fn handle_cloud_publish_source(state: &AppState, payload: Value) -> Result
     });
     if let Some(index) = existing_index {
         let existing = manifest[index].clone();
-        merge_object(&mut entry, &existing, &["id", "plugin", "language", "type", "created_at"]);
+        merge_object(
+            &mut entry,
+            &existing,
+            &["id", "plugin", "language", "type", "created_at"],
+        );
         manifest[index] = entry;
         manifest = manifest
             .into_iter()
             .enumerate()
-            .filter(|(item_index, item)| *item_index == index || item.get("id").and_then(Value::as_str) != Some(source_id))
+            .filter(|(item_index, item)| {
+                *item_index == index || item.get("id").and_then(Value::as_str) != Some(source_id)
+            })
             .map(|(_, item)| item)
             .collect();
     } else {
@@ -3300,13 +4088,43 @@ async fn handle_cloud_download_source(state: &AppState, payload: Value) -> Resul
     let payload: CloudTaskPayload = serde_json::from_value(payload)?;
     let paths = paths(&payload.persistence.base_path);
     let entry = payload.entry.clone();
-    let source_id = entry.get("id").and_then(Value::as_str).ok_or_else(|| anyhow!("缺少 entry.id"))?;
-    let source_type = entry.get("type").and_then(Value::as_str).unwrap_or("plugin");
+    let source_id = entry
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("缺少 entry.id"))?;
+    let source_type = entry
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("plugin");
     let content = fetch_cloud_translation(state, &payload, source_id, source_type).await?;
-    let existing = load_meta(&paths).pointer(&format!("/sources/{}", escape_pointer(source_id))).cloned();
-    let should_activate = existing.is_none() && !has_any_sources_for_plugin(&paths, entry.get("plugin").and_then(Value::as_str).unwrap_or_default());
-    let source = source_from_entry(&entry, &content, &payload.owner, &payload.repo, existing.as_ref(), should_activate)?;
-    save_translation_and_source(state, &paths, source_id, &content, source.clone(), should_activate).await?;
+    let existing = load_meta(&paths)
+        .pointer(&format!("/sources/{}", escape_pointer(source_id)))
+        .cloned();
+    let should_activate = existing.is_none()
+        && !has_any_sources_for_plugin(
+            &paths,
+            entry
+                .get("plugin")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+    let source = source_from_entry(
+        &entry,
+        &content,
+        &payload.owner,
+        &payload.repo,
+        existing.as_ref(),
+        should_activate,
+    )?;
+    save_translation_and_source(
+        state,
+        &paths,
+        source_id,
+        &content,
+        source.clone(),
+        should_activate,
+    )
+    .await?;
     Ok(json!({ "state": true, "source": source }))
 }
 
@@ -3319,14 +4137,27 @@ async fn handle_cloud_update_sources(state: &AppState, payload: Value) -> Result
         if source_id.is_empty() {
             continue;
         }
-        let source_type = entry.get("type").and_then(Value::as_str).unwrap_or("plugin");
-        let existing = load_meta(&paths).pointer(&format!("/sources/{}", escape_pointer(source_id))).cloned();
+        let source_type = entry
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("plugin");
+        let existing = load_meta(&paths)
+            .pointer(&format!("/sources/{}", escape_pointer(source_id)))
+            .cloned();
         if existing.is_none() {
             continue;
         }
         let content = fetch_cloud_translation(state, &payload, source_id, source_type).await?;
-        let source = source_from_entry(entry, &content, &payload.owner, &payload.repo, existing.as_ref(), false)?;
-        save_translation_and_source(state, &paths, source_id, &content, source.clone(), false).await?;
+        let source = source_from_entry(
+            entry,
+            &content,
+            &payload.owner,
+            &payload.repo,
+            existing.as_ref(),
+            false,
+        )?;
+        save_translation_and_source(state, &paths, source_id, &content, source.clone(), false)
+            .await?;
         updated.push(source);
     }
     Ok(json!({ "state": true, "sources": updated, "total": updated.len() }))
@@ -3346,12 +4177,20 @@ async fn handle_cloud_prepare_backup(_state: &AppState, payload: Value) -> Resul
             };
             let content_text = serde_json::to_string_pretty(&content)?;
             let hash = simple_hash(&content_text);
-            if manifest.iter().any(|entry| entry.get("id").and_then(Value::as_str) == Some(source_id) && entry.get("hash").and_then(Value::as_str) == Some(hash.as_str())) {
+            if manifest.iter().any(|entry| {
+                entry.get("id").and_then(Value::as_str) == Some(source_id)
+                    && entry.get("hash").and_then(Value::as_str) == Some(hash.as_str())
+            }) {
                 continue;
             }
-            let source_type = source.get("type").and_then(Value::as_str).unwrap_or("plugin");
+            let source_type = source
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("plugin");
             let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-            let existing_index = manifest.iter().position(|entry| entry.get("id").and_then(Value::as_str) == Some(source_id));
+            let existing_index = manifest
+                .iter()
+                .position(|entry| entry.get("id").and_then(Value::as_str) == Some(source_id));
             let mut entry = json!({
                 "id": source_id,
                 "plugin": source.get("plugin").and_then(Value::as_str).unwrap_or_default(),
@@ -3372,16 +4211,21 @@ async fn handle_cloud_prepare_backup(_state: &AppState, payload: Value) -> Resul
             } else {
                 manifest.push(entry);
             }
-            files.push(json!({ "path": cloud_file_path(source_id, source_type), "content": content_text }));
+            files.push(
+                json!({ "path": cloud_file_path(source_id, source_type), "content": content_text }),
+            );
             let mut updated_source = source.clone();
             updated_source["origin"] = json!("cloud");
-            updated_source["cloud"] = json!({ "owner": payload.owner, "repo": payload.repo, "hash": hash });
+            updated_source["cloud"] =
+                json!({ "owner": payload.owner, "repo": payload.repo, "hash": hash });
             updated_source["updatedAt"] = json!(now_ms());
             merge_metadata_index(&mut updated_source, &content, true);
             sources.push(updated_source);
         }
     }
-    Ok(json!({ "state": true, "data": { "filesToUpload": files, "sourcesToSave": sources, "manifest": manifest }, "total": files.len() }))
+    Ok(
+        json!({ "state": true, "data": { "filesToUpload": files, "sourcesToSave": sources, "manifest": manifest }, "total": files.len() }),
+    )
 }
 
 async fn handle_cloud_restore_all(state: &AppState, payload: Value) -> Result<Value> {
@@ -3406,15 +4250,37 @@ async fn handle_cloud_restore_all(state: &AppState, payload: Value) -> Result<Va
                 continue;
             }
         }
-        let source_type = entry.get("type").and_then(Value::as_str).unwrap_or("plugin");
+        let source_type = entry
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("plugin");
         let content = fetch_cloud_translation(state, &payload, source_id, source_type).await?;
-        let existing = load_meta(&paths).pointer(&format!("/sources/{}", escape_pointer(source_id))).cloned();
-        let should_activate = existing.is_none() && !has_any_sources_for_plugin(&paths, entry.get("plugin").and_then(Value::as_str).unwrap_or_default());
-        let source = source_from_entry(entry, &content, &payload.owner, &payload.repo, existing.as_ref(), should_activate)?;
-        save_translation_and_source(state, &paths, source_id, &content, source, should_activate).await?;
+        let existing = load_meta(&paths)
+            .pointer(&format!("/sources/{}", escape_pointer(source_id)))
+            .cloned();
+        let should_activate = existing.is_none()
+            && !has_any_sources_for_plugin(
+                &paths,
+                entry
+                    .get("plugin")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            );
+        let source = source_from_entry(
+            entry,
+            &content,
+            &payload.owner,
+            &payload.repo,
+            existing.as_ref(),
+            should_activate,
+        )?;
+        save_translation_and_source(state, &paths, source_id, &content, source, should_activate)
+            .await?;
         restored += 1;
     }
-    Ok(json!({ "state": true, "manifest": manifest, "restored": restored, "skipped": skipped, "total": manifest.len() }))
+    Ok(
+        json!({ "state": true, "manifest": manifest, "restored": restored, "skipped": skipped, "total": manifest.len() }),
+    )
 }
 
 async fn handle_cloud_backup_all(
@@ -3458,8 +4324,18 @@ async fn handle_cloud_backup_all(
         payload.manifest = manifest.clone();
         touch_progress(&task, json!({ "currentLabel": "准备备份数据" })).await;
         let prepared = handle_cloud_prepare_backup(state, serde_json::to_value(&payload)?).await?;
-        if !prepared.get("state").and_then(Value::as_bool).unwrap_or(false) {
-            bail!("{}", prepared.get("error").or_else(|| prepared.get("data")).unwrap_or(&Value::Null));
+        if !prepared
+            .get("state")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            bail!(
+                "{}",
+                prepared
+                    .get("error")
+                    .or_else(|| prepared.get("data"))
+                    .unwrap_or(&Value::Null)
+            );
         }
         let data = prepared.get("data").cloned().unwrap_or_else(|| json!({}));
         files_to_upload = checkpoint_files(&data);
@@ -3476,13 +4352,17 @@ async fn handle_cloud_backup_all(
     }
 
     let total = files_to_upload.len();
-    touch_progress(&task, json!({
-        "totalResources": total,
-        "totalItems": total,
-        "processedResources": current_idx.min(total),
-        "processedItems": current_idx.min(total),
-        "successCount": current_idx.min(total),
-    })).await;
+    touch_progress(
+        &task,
+        json!({
+            "totalResources": total,
+            "totalItems": total,
+            "processedResources": current_idx.min(total),
+            "processedItems": current_idx.min(total),
+            "successCount": current_idx.min(total),
+        }),
+    )
+    .await;
 
     if total == 0 {
         clear_backup_checkpoint(&paths)?;
@@ -3497,49 +4377,77 @@ async fn handle_cloud_backup_all(
         let chunk = files_to_upload[current_idx..end].to_vec();
         let batch_index = current_idx / CLOUD_BACKUP_CHUNK_SIZE + 1;
         let batch_total = total.div_ceil(CLOUD_BACKUP_CHUNK_SIZE);
-        touch_progress(&task, json!({
-            "currentLabel": format!("上传批次 {batch_index}/{batch_total}"),
-            "processedResources": current_idx,
-            "processedItems": current_idx,
-        })).await;
+        touch_progress(
+            &task,
+            json!({
+                "currentLabel": format!("上传批次 {batch_index}/{batch_total}"),
+                "processedResources": current_idx,
+                "processedItems": current_idx,
+            }),
+        )
+        .await;
 
-        let upload = github_batch_upload_files(state, &GithubWriteRequest {
-            operation: "batchUploadFiles".to_string(),
-            token: payload.token.clone(),
-            owner: Some(payload.owner.clone()),
-            repo: Some(payload.repo.clone()),
-            name: None,
-            path: None,
-            content: None,
-            message: Some(format!("Bulk backup translations ({batch_index}/{batch_total})")),
-            branch: Some(payload.branch.clone()),
-            sha: None,
-            title: None,
-            body: None,
-            label: None,
-            target_owner: None,
-            target_repo: None,
-            base_tree: None,
-            tree_data: None,
-            tree: None,
-            parents: None,
-            r#ref: None,
-            files: Some(chunk),
-            timeout_ms: None,
-        }).await?;
+        let upload = github_batch_upload_files(
+            state,
+            &GithubWriteRequest {
+                operation: "batchUploadFiles".to_string(),
+                token: payload.token.clone(),
+                owner: Some(payload.owner.clone()),
+                repo: Some(payload.repo.clone()),
+                name: None,
+                path: None,
+                content: None,
+                message: Some(format!(
+                    "Bulk backup translations ({batch_index}/{batch_total})"
+                )),
+                branch: Some(payload.branch.clone()),
+                sha: None,
+                title: None,
+                body: None,
+                label: None,
+                target_owner: None,
+                target_repo: None,
+                base_tree: None,
+                tree_data: None,
+                tree: None,
+                parents: None,
+                r#ref: None,
+                files: Some(chunk),
+                timeout_ms: None,
+            },
+        )
+        .await?;
         if !upload.state {
-            save_backup_checkpoint(&paths, &files_to_upload, &sources_to_save, &manifest, total, current_idx)?;
+            save_backup_checkpoint(
+                &paths,
+                &files_to_upload,
+                &sources_to_save,
+                &manifest,
+                total,
+                current_idx,
+            )?;
             bump_record_revision(&task).await;
             bail!("{}", upload.data);
         }
 
         current_idx = end;
-        touch_progress(&task, json!({
-            "processedResources": current_idx,
-            "processedItems": current_idx,
-            "successCount": current_idx,
-        })).await;
-        save_backup_checkpoint(&paths, &files_to_upload, &sources_to_save, &manifest, total, current_idx)?;
+        touch_progress(
+            &task,
+            json!({
+                "processedResources": current_idx,
+                "processedItems": current_idx,
+                "successCount": current_idx,
+            }),
+        )
+        .await;
+        save_backup_checkpoint(
+            &paths,
+            &files_to_upload,
+            &sources_to_save,
+            &manifest,
+            total,
+            current_idx,
+        )?;
         bump_record_revision(&task).await;
     }
 
@@ -3570,14 +4478,17 @@ fn save_backup_checkpoint(
     total: usize,
     current_idx: usize,
 ) -> Result<()> {
-    write_json_pretty(&paths.checkpoint_path, &json!({
-        "filesToUpload": files_to_upload,
-        "sourcesToSave": sources_to_save,
-        "manifest": manifest,
-        "total": total,
-        "currentIdx": current_idx,
-        "timestamp": now_ms(),
-    }))
+    write_json_pretty(
+        &paths.checkpoint_path,
+        &json!({
+            "filesToUpload": files_to_upload,
+            "sourcesToSave": sources_to_save,
+            "manifest": manifest,
+            "total": total,
+            "currentIdx": current_idx,
+            "timestamp": now_ms(),
+        }),
+    )
 }
 
 fn clear_backup_checkpoint(paths: &PersistencePaths) -> Result<()> {
@@ -3594,10 +4505,12 @@ fn checkpoint_files(value: &Value) -> Vec<GithubBatchUploadFile> {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|file| Some(GithubBatchUploadFile {
-            path: file.get("path")?.as_str()?.to_string(),
-            content: file.get("content")?.as_str()?.to_string(),
-        }))
+        .filter_map(|file| {
+            Some(GithubBatchUploadFile {
+                path: file.get("path")?.as_str()?.to_string(),
+                content: file.get("content")?.as_str()?.to_string(),
+            })
+        })
         .collect()
 }
 
@@ -3618,28 +4531,37 @@ async fn save_backup_sources(
     write_json_pretty(&paths.meta_path, &meta)
 }
 
-async fn fetch_cloud_translation(state: &AppState, payload: &CloudTaskPayload, source_id: &str, source_type: &str) -> Result<Value> {
-    let read = github_get_file_content_with_fallback(state, &GithubReadRequest {
-        operation: "getFileContentWithFallback".to_string(),
-        token: payload.token.clone(),
-        github_proxy_url: None,
-        owner: Some(payload.owner.clone()),
-        repo: Some(payload.repo.clone()),
-        path: Some(cloud_file_path(source_id, source_type)),
-        branch: Some(payload.branch.clone()),
-        r#ref: None,
-        username: None,
-        repo_name: None,
-        url: None,
-        target_owner: None,
-        target_repo: None,
-        repo_address: None,
-        creator: None,
-        page: None,
-        per_page: None,
-        recursive: None,
-        timeout_ms: None,
-    }).await?;
+async fn fetch_cloud_translation(
+    state: &AppState,
+    payload: &CloudTaskPayload,
+    source_id: &str,
+    source_type: &str,
+) -> Result<Value> {
+    let read = github_get_file_content_with_fallback(
+        state,
+        &GithubReadRequest {
+            operation: "getFileContentWithFallback".to_string(),
+            token: payload.token.clone(),
+            github_proxy_url: None,
+            owner: Some(payload.owner.clone()),
+            repo: Some(payload.repo.clone()),
+            path: Some(cloud_file_path(source_id, source_type)),
+            branch: Some(payload.branch.clone()),
+            r#ref: None,
+            username: None,
+            repo_name: None,
+            url: None,
+            target_owner: None,
+            target_repo: None,
+            repo_address: None,
+            creator: None,
+            page: None,
+            per_page: None,
+            recursive: None,
+            timeout_ms: None,
+        },
+    )
+    .await?;
     if !read.state {
         bail!("下载翻译失败: {}", read.data);
     }
@@ -3654,35 +4576,46 @@ async fn fetch_manifest(state: &AppState, payload: &CloudTaskPayload) -> Result<
     Ok(manifest)
 }
 
-async fn fetch_manifest_with_sha(state: &AppState, payload: &CloudTaskPayload) -> Result<(Vec<Value>, Option<String>)> {
-    let read = github_get_file_content(state, &GithubReadRequest {
-        operation: "getFileContent".to_string(),
-        token: payload.token.clone(),
-        github_proxy_url: None,
-        owner: Some(payload.owner.clone()),
-        repo: Some(payload.repo.clone()),
-        path: Some("metadata.json".to_string()),
-        branch: Some(payload.branch.clone()),
-        r#ref: Some(payload.branch.clone()),
-        username: None,
-        repo_name: None,
-        url: None,
-        target_owner: None,
-        target_repo: None,
-        repo_address: None,
-        creator: None,
-        page: None,
-        per_page: None,
-        recursive: None,
-        timeout_ms: None,
-    }).await?;
+async fn fetch_manifest_with_sha(
+    state: &AppState,
+    payload: &CloudTaskPayload,
+) -> Result<(Vec<Value>, Option<String>)> {
+    let read = github_get_file_content(
+        state,
+        &GithubReadRequest {
+            operation: "getFileContent".to_string(),
+            token: payload.token.clone(),
+            github_proxy_url: None,
+            owner: Some(payload.owner.clone()),
+            repo: Some(payload.repo.clone()),
+            path: Some("metadata.json".to_string()),
+            branch: Some(payload.branch.clone()),
+            r#ref: Some(payload.branch.clone()),
+            username: None,
+            repo_name: None,
+            url: None,
+            target_owner: None,
+            target_repo: None,
+            repo_address: None,
+            creator: None,
+            page: None,
+            per_page: None,
+            recursive: None,
+            timeout_ms: None,
+        },
+    )
+    .await?;
     if !read.state {
         if read.status == Some(404) {
             return Ok((Vec::new(), None));
         }
         bail!("读取 metadata.json 失败: {}", read.data);
     }
-    let sha = read.data.get("sha").and_then(Value::as_str).map(str::to_string);
+    let sha = read
+        .data
+        .get("sha")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let manifest = if let Some(content) = read.data.get("content").and_then(Value::as_str) {
         let text = decode_github_content(content)?;
         serde_json::from_str::<Vec<Value>>(&text).unwrap_or_default()
@@ -3692,54 +4625,85 @@ async fn fetch_manifest_with_sha(state: &AppState, payload: &CloudTaskPayload) -
     Ok((manifest, sha))
 }
 
-async fn upload_manifest(state: &AppState, payload: &CloudTaskPayload, manifest: &[Value], sha: Option<String>) -> Result<()> {
+async fn upload_manifest(
+    state: &AppState,
+    payload: &CloudTaskPayload,
+    manifest: &[Value],
+    sha: Option<String>,
+) -> Result<()> {
     let content = BASE64_STANDARD.encode(serde_json::to_string_pretty(manifest)?.as_bytes());
-    let response = github_upload_file(state, &GithubWriteRequest {
-        operation: "uploadFile".to_string(),
-        token: payload.token.clone(),
-        owner: Some(payload.owner.clone()),
-        repo: Some(payload.repo.clone()),
-        path: Some("metadata.json".to_string()),
-        content: Some(content),
-        message: Some("Update metadata.json".to_string()),
-        branch: Some(payload.branch.clone()),
-        sha,
-        name: None,
-        title: None,
-        body: None,
-        label: None,
-        target_owner: None,
-        target_repo: None,
-        base_tree: None,
-        tree_data: None,
-        tree: None,
-        parents: None,
-        r#ref: None,
-        files: None,
-        timeout_ms: None,
-    }).await?;
+    let response = github_upload_file(
+        state,
+        &GithubWriteRequest {
+            operation: "uploadFile".to_string(),
+            token: payload.token.clone(),
+            owner: Some(payload.owner.clone()),
+            repo: Some(payload.repo.clone()),
+            path: Some("metadata.json".to_string()),
+            content: Some(content),
+            message: Some("Update metadata.json".to_string()),
+            branch: Some(payload.branch.clone()),
+            sha,
+            name: None,
+            title: None,
+            body: None,
+            label: None,
+            target_owner: None,
+            target_repo: None,
+            base_tree: None,
+            tree_data: None,
+            tree: None,
+            parents: None,
+            r#ref: None,
+            files: None,
+            timeout_ms: None,
+        },
+    )
+    .await?;
     if !response.state {
         bail!("上传 metadata.json 失败: {}", response.data);
     }
     Ok(())
 }
 
-async fn save_translation_and_source(state: &AppState, paths: &PersistencePaths, source_id: &str, content: &Value, source: Value, activate: bool) -> Result<()> {
+async fn save_translation_and_source(
+    state: &AppState,
+    paths: &PersistencePaths,
+    source_id: &str,
+    content: &Value,
+    source: Value,
+    activate: bool,
+) -> Result<()> {
     let _guard = state.persistence_lock.lock().await;
     save_translation(paths, source_id, content)?;
     save_source_entry_locked(paths, source_id, source, activate)
 }
 
-async fn save_source_entry(state: &AppState, paths: &PersistencePaths, source_id: &str, source: Value, activate: bool) -> Result<()> {
+async fn save_source_entry(
+    state: &AppState,
+    paths: &PersistencePaths,
+    source_id: &str,
+    source: Value,
+    activate: bool,
+) -> Result<()> {
     let _guard = state.persistence_lock.lock().await;
     save_source_entry_locked(paths, source_id, source, activate)
 }
 
-fn save_source_entry_locked(paths: &PersistencePaths, source_id: &str, source: Value, activate: bool) -> Result<()> {
+fn save_source_entry_locked(
+    paths: &PersistencePaths,
+    source_id: &str,
+    source: Value,
+    activate: bool,
+) -> Result<()> {
     let mut meta = load_meta(paths);
     if let Some(sources) = meta.get_mut("sources").and_then(Value::as_object_mut) {
         if activate {
-            let plugin = source.get("plugin").and_then(Value::as_str).unwrap_or_default().to_string();
+            let plugin = source
+                .get("plugin")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             for existing in sources.values_mut() {
                 if existing.get("plugin").and_then(Value::as_str) == Some(plugin.as_str()) {
                     existing["isActive"] = json!(false);
@@ -3751,7 +4715,14 @@ fn save_source_entry_locked(paths: &PersistencePaths, source_id: &str, source: V
     write_json_pretty(&paths.meta_path, &meta)
 }
 
-fn source_from_entry(entry: &Value, content: &Value, owner: &str, repo: &str, existing: Option<&Value>, activate: bool) -> Result<Value> {
+fn source_from_entry(
+    entry: &Value,
+    content: &Value,
+    owner: &str,
+    repo: &str,
+    existing: Option<&Value>,
+    activate: bool,
+) -> Result<Value> {
     let source_id = entry.get("id").and_then(Value::as_str).unwrap_or_default();
     let now = now_ms();
     let mut source = json!({
@@ -3770,7 +4741,12 @@ fn source_from_entry(entry: &Value, content: &Value, owner: &str, repo: &str, ex
     Ok(source)
 }
 
-fn has_existing_extracted_source(paths: &PersistencePaths, plugin_id: &str, source_type: &str, translation_version: &str) -> bool {
+fn has_existing_extracted_source(
+    paths: &PersistencePaths,
+    plugin_id: &str,
+    source_type: &str,
+    translation_version: &str,
+) -> bool {
     load_meta(paths)
         .get("sources")
         .and_then(Value::as_object)
@@ -3778,11 +4754,14 @@ fn has_existing_extracted_source(paths: &PersistencePaths, plugin_id: &str, sour
             sources.values().any(|source| {
                 source.get("plugin").and_then(Value::as_str) == Some(plugin_id)
                     && source.get("type").and_then(Value::as_str) == Some(source_type)
-                    && source.get("translationVersion").and_then(Value::as_str) == Some(translation_version)
+                    && source.get("translationVersion").and_then(Value::as_str)
+                        == Some(translation_version)
                     && source
                         .get("id")
                         .and_then(Value::as_str)
-                        .is_some_and(|source_id| paths.sources_dir.join(format!("{source_id}.json")).exists())
+                        .is_some_and(|source_id| {
+                            paths.sources_dir.join(format!("{source_id}.json")).exists()
+                        })
             })
         })
 }
@@ -3791,11 +4770,19 @@ fn has_any_sources_for_plugin(paths: &PersistencePaths, plugin_id: &str) -> bool
     load_meta(paths)
         .get("sources")
         .and_then(Value::as_object)
-        .is_some_and(|sources| sources.values().any(|source| source.get("plugin").and_then(Value::as_str) == Some(plugin_id)))
+        .is_some_and(|sources| {
+            sources
+                .values()
+                .any(|source| source.get("plugin").and_then(Value::as_str) == Some(plugin_id))
+        })
 }
 
 fn cloud_file_path(source_id: &str, source_type: &str) -> String {
-    let dir = if source_type == "theme" { "themes" } else { "plugins" };
+    let dir = if source_type == "theme" {
+        "themes"
+    } else {
+        "plugins"
+    };
     format!("{dir}/{source_id}.json")
 }
 
@@ -3810,7 +4797,10 @@ fn merge_object(target: &mut Value, existing: &Value, keys: &[&str]) {
 fn simple_hash(text: &str) -> String {
     let mut hash: i32 = 0;
     for unit in text.encode_utf16() {
-        hash = hash.wrapping_shl(5).wrapping_sub(hash).wrapping_add(unit as i32);
+        hash = hash
+            .wrapping_shl(5)
+            .wrapping_sub(hash)
+            .wrapping_add(unit as i32);
     }
     let hex = format!("{:x}", hash.unsigned_abs());
     let padded = format!("{hex:0>8}");
@@ -3822,12 +4812,26 @@ async fn handle_sync_task(state: &AppState, task_type: &str, payload: Value) -> 
         "ast-replace" => handle_ast_replace(payload).await,
         "code-extract" => handle_code_extract(payload).await,
         "plugin-apply-translation" => handle_plugin_apply_translation(payload).await,
-        "plugin-diagnose-cleanup-start" => handle_plugin_diagnose_cleanup_start(state, payload).await,
+        "plugin-diagnose-cleanup-start" => {
+            handle_plugin_diagnose_cleanup_start(state, payload).await
+        }
         "plugin-diagnose-cleanup-step" => handle_plugin_diagnose_cleanup_step(state, payload).await,
-        "plugin-diagnose-cleanup-cancel" => handle_plugin_diagnose_cleanup_cancel(state, payload).await,
-        "plugin-diagnose-cleanup-apply" => handle_plugin_diagnose_cleanup_apply(state, payload).await,
+        "plugin-diagnose-cleanup-cancel" => {
+            handle_plugin_diagnose_cleanup_cancel(state, payload).await
+        }
+        "plugin-diagnose-cleanup-apply" => {
+            handle_plugin_diagnose_cleanup_apply(state, payload).await
+        }
         "theme-apply-translation" => handle_theme_apply_translation(payload).await,
-        "source-export" | "source-read" | "source-import" | "source-remove" | "source-set-active" | "source-index" | "source-clear-batch-records" => handle_source_manager_task(state, task_type, payload).await,
+        "source-export"
+        | "source-read"
+        | "source-import"
+        | "source-remove"
+        | "source-set-active"
+        | "source-index"
+        | "source-clear-batch-records" => {
+            handle_source_manager_task(state, task_type, payload).await
+        }
         "plugin-extract" => Ok(serde_json::to_value(handle_plugin_extract(payload).await?)?),
         "theme-extract" => Ok(serde_json::to_value(handle_theme_extract(payload).await?)?),
         "plugin-translate" => {
@@ -3896,7 +4900,11 @@ async fn handle_theme_apply_translation(payload: Value) -> Result<Value> {
     .await?
 }
 
-async fn handle_source_manager_task(state: &AppState, operation: &str, payload: Value) -> Result<Value> {
+async fn handle_source_manager_task(
+    state: &AppState,
+    operation: &str,
+    payload: Value,
+) -> Result<Value> {
     let operation = operation.to_string();
     let state = state.clone();
     let persistence_lock = state.persistence_lock.clone();
@@ -3932,14 +4940,26 @@ fn resolve_apply_translation_json(
     read_translation(&paths, &source_id).ok_or_else(|| anyhow!("翻译文件不存在"))
 }
 
-fn apply_plugin_translation_blocking(payload: PluginApplyTranslationPayload) -> Result<ApplyTranslationResponse> {
-    let translation_json = resolve_apply_translation_json(payload.translation_json, payload.persistence, payload.translation_source_id)?;
+fn apply_plugin_translation_blocking(
+    payload: PluginApplyTranslationPayload,
+) -> Result<ApplyTranslationResponse> {
+    let translation_json = resolve_apply_translation_json(
+        payload.translation_json,
+        payload.persistence,
+        payload.translation_source_id,
+    )?;
     let dict = translation_json
         .get("dict")
         .and_then(Value::as_object)
         .ok_or_else(|| anyhow!("translationJson.dict missing"))?;
     let files = dict.keys().cloned().collect::<Vec<_>>();
-    create_plugin_backup(&payload.backup_base_path, &payload.plugin_id, &payload.plugin_dir, &files, false)?;
+    create_plugin_backup(
+        &payload.backup_base_path,
+        &payload.plugin_id,
+        &payload.plugin_dir,
+        &files,
+        false,
+    )?;
     let apply_ast = payload.apply_ast.unwrap_or(true);
     let apply_regex = payload.apply_regex.unwrap_or(true);
 
@@ -3949,8 +4969,9 @@ fn apply_plugin_translation_blocking(payload: PluginApplyTranslationPayload) -> 
         if !target_file_path.exists() {
             continue;
         }
-        let mut file_string = read_backup_content(&payload.backup_base_path, &payload.plugin_id, file)?
-            .unwrap_or_else(|| fs::read_to_string(&target_file_path).unwrap_or_default());
+        let mut file_string =
+            read_backup_content(&payload.backup_base_path, &payload.plugin_id, file)?
+                .unwrap_or_else(|| fs::read_to_string(&target_file_path).unwrap_or_default());
 
         if apply_ast {
             if let Some(ast) = file_dict.get("ast").and_then(Value::as_array) {
@@ -3982,14 +5003,29 @@ fn apply_plugin_translation_blocking(payload: PluginApplyTranslationPayload) -> 
     })
 }
 
-fn apply_theme_translation_blocking(payload: ThemeApplyTranslationPayload) -> Result<ApplyTranslationResponse> {
-    let translation_json = resolve_apply_translation_json(payload.translation_json, payload.persistence, payload.translation_source_id)?;
+fn apply_theme_translation_blocking(
+    payload: ThemeApplyTranslationPayload,
+) -> Result<ApplyTranslationResponse> {
+    let translation_json = resolve_apply_translation_json(
+        payload.translation_json,
+        payload.persistence,
+        payload.translation_source_id,
+    )?;
     let dict = translation_json
         .get("dict")
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("translationJson.dict missing"))?;
-    let css_relative_path = payload.theme_css_relative_path.as_deref().unwrap_or("theme.css");
-    create_plugin_backup(&payload.backup_base_path, &payload.theme_id, &payload.theme_dir, &[css_relative_path.to_string()], false)?;
+    let css_relative_path = payload
+        .theme_css_relative_path
+        .as_deref()
+        .unwrap_or("theme.css");
+    create_plugin_backup(
+        &payload.backup_base_path,
+        &payload.theme_id,
+        &payload.theme_dir,
+        &[css_relative_path.to_string()],
+        false,
+    )?;
     let theme_css_path = PathBuf::from(&payload.theme_css_path);
     let mut css = fs::read_to_string(&theme_css_path)
         .with_context(|| format!("failed to read {}", theme_css_path.display()))?;
@@ -4009,7 +5045,11 @@ fn apply_theme_translation_blocking(payload: ThemeApplyTranslationPayload) -> Re
 
 fn safe_join(base: &str, relative: &str) -> Result<PathBuf> {
     let relative_path = Path::new(relative);
-    if relative_path.is_absolute() || relative_path.components().any(|component| matches!(component, std::path::Component::ParentDir)) {
+    if relative_path.is_absolute()
+        || relative_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
         bail!("invalid relative path: {relative}");
     }
     Ok(PathBuf::from(base).join(relative_path))
@@ -4069,7 +5109,11 @@ fn remove_legacy_backups(backup_base_path: &str, plugin_id: &str) -> Result<()> 
     Ok(())
 }
 
-fn read_backup_content(backup_base_path: &str, plugin_id: &str, file: &str) -> Result<Option<String>> {
+fn read_backup_content(
+    backup_base_path: &str,
+    plugin_id: &str,
+    file: &str,
+) -> Result<Option<String>> {
     let backup_path = plugin_backup_dir(backup_base_path, plugin_id).join(format!("{file}.gz"));
     if backup_path.exists() {
         let compressed = fs::read(&backup_path)?;
@@ -4094,8 +5138,14 @@ fn read_backup_content(backup_base_path: &str, plugin_id: &str, file: &str) -> R
 fn apply_regex_translations(code: &str, translations: &[Value]) -> String {
     let mut translated = code.to_string();
     for item in translations {
-        let source = item.get("source").and_then(Value::as_str).unwrap_or_default();
-        let target = item.get("target").and_then(Value::as_str).unwrap_or_default();
+        let source = item
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let target = item
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         if !source.is_empty() && !target.is_empty() && source != target {
             translated = translated.replace(source, target);
         }
@@ -4103,7 +5153,8 @@ fn apply_regex_translations(code: &str, translations: &[Value]) -> String {
     translated
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct TranslationCandidate {
     file: String,
     kind: String,
@@ -4135,8 +5186,14 @@ impl TranslationCandidate {
 }
 
 fn is_active_translation_item(item: &Value) -> bool {
-    let source = item.get("source").and_then(Value::as_str).unwrap_or_default();
-    let target = item.get("target").and_then(Value::as_str).unwrap_or_default();
+    let source = item
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let target = item
+        .get("target")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     !source.is_empty() && !target.is_empty() && source != target
 }
 
@@ -4235,7 +5292,10 @@ fn translation_candidates_fail(
         .map(|error| error.to_string())
 }
 
-fn partition_candidates(candidates: &[TranslationCandidate], parts: usize) -> Vec<Vec<TranslationCandidate>> {
+fn partition_candidates(
+    candidates: &[TranslationCandidate],
+    parts: usize,
+) -> Vec<Vec<TranslationCandidate>> {
     if parts == 0 || candidates.is_empty() {
         return Vec::new();
     }
@@ -4312,7 +5372,10 @@ fn minimize_failing_translation_set(
     current
 }
 
-fn remove_translation_candidates(translation_json: &mut Value, candidates: &[TranslationCandidate]) -> usize {
+fn remove_translation_candidates(
+    translation_json: &mut Value,
+    candidates: &[TranslationCandidate],
+) -> usize {
     let mut grouped: HashMap<(String, String), Vec<usize>> = HashMap::new();
     for candidate in candidates {
         grouped
@@ -4321,7 +5384,10 @@ fn remove_translation_candidates(translation_json: &mut Value, candidates: &[Tra
             .push(candidate.index);
     }
 
-    let Some(dict) = translation_json.get_mut("dict").and_then(Value::as_object_mut) else {
+    let Some(dict) = translation_json
+        .get_mut("dict")
+        .and_then(Value::as_object_mut)
+    else {
         return 0;
     };
     let mut removed = 0usize;
@@ -4345,7 +5411,10 @@ fn remove_translation_candidates(translation_json: &mut Value, candidates: &[Tra
     removed
 }
 
-fn remove_translation_issues(translation_json: &mut Value, issues: &[TranslationIssueItem]) -> usize {
+fn remove_translation_issues(
+    translation_json: &mut Value,
+    issues: &[TranslationIssueItem],
+) -> usize {
     let mut grouped: HashMap<(String, String), Vec<&TranslationIssueItem>> = HashMap::new();
     for issue in issues {
         grouped
@@ -4354,7 +5423,10 @@ fn remove_translation_issues(translation_json: &mut Value, issues: &[Translation
             .push(issue);
     }
 
-    let Some(dict) = translation_json.get_mut("dict").and_then(Value::as_object_mut) else {
+    let Some(dict) = translation_json
+        .get_mut("dict")
+        .and_then(Value::as_object_mut)
+    else {
         return 0;
     };
     let mut removed = 0usize;
@@ -4374,8 +5446,14 @@ fn remove_translation_issues(translation_json: &mut Value, issues: &[Translation
                 continue;
             }
             let item = &items[issue.index];
-            let source = item.get("source").and_then(Value::as_str).unwrap_or_default();
-            let target = item.get("target").and_then(Value::as_str).unwrap_or_default();
+            let source = item
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let target = item
+                .get("target")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             if source == issue.source && target == issue.target {
                 items.remove(issue.index);
                 removed += 1;
@@ -4407,7 +5485,8 @@ fn diagnose_translation_json(
     let cleared_items = Vec::new();
 
     loop {
-        let candidates = collect_translation_candidates(&working_translation_json, apply_ast, apply_regex);
+        let candidates =
+            collect_translation_candidates(&working_translation_json, apply_ast, apply_regex);
         if candidates.is_empty() {
             break;
         }
@@ -4417,7 +5496,9 @@ fn diagnose_translation_json(
 
         let mut failing = Vec::new();
         for candidate in &candidates {
-            if let Some(reason) = translation_candidates_fail(source_by_file, std::slice::from_ref(candidate)) {
+            if let Some(reason) =
+                translation_candidates_fail(source_by_file, std::slice::from_ref(candidate))
+            {
                 issue_items.push(candidate.issue(&reason));
                 failing.push(candidate.clone());
             }
@@ -4503,7 +5584,9 @@ fn save_cleaned_translation_source(
     Ok(())
 }
 
-fn apply_diagnose_cleanup_blocking(payload: PluginDiagnoseCleanupApplyPayload) -> Result<PluginDiagnoseCleanupApplyResponse> {
+fn apply_diagnose_cleanup_blocking(
+    payload: PluginDiagnoseCleanupApplyPayload,
+) -> Result<PluginDiagnoseCleanupApplyResponse> {
     let paths = paths(&payload.persistence.base_path);
     let mut translation_json = read_translation(&paths, &payload.translation_source_id)
         .ok_or_else(|| anyhow!("翻译文件不存在"))?;
@@ -4519,7 +5602,10 @@ fn apply_diagnose_cleanup_blocking(payload: PluginDiagnoseCleanupApplyPayload) -
     Ok(PluginDiagnoseCleanupApplyResponse {
         state: true,
         removed_count,
-        issue_record_path: paths.diagnose_issue_record_path.to_string_lossy().to_string(),
+        issue_record_path: paths
+            .diagnose_issue_record_path
+            .to_string_lossy()
+            .to_string(),
         translation_version: translation_json
             .pointer("/metadata/version")
             .and_then(Value::as_str)
@@ -4558,9 +5644,294 @@ fn render_probe_files(
                 code = apply_regex_translations(&code, regex_items);
             }
         }
-        files.push(RuntimeProbeFile { file, code });
+        files.push(RuntimeProbeFile {
+            file,
+            code: Some(code),
+        });
     }
     Ok(files)
+}
+
+fn source_probe_files(source_by_file: &HashMap<String, String>) -> Vec<RuntimeProbeFile> {
+    let mut file_names = source_by_file.keys().cloned().collect::<Vec<_>>();
+    file_names.sort();
+    file_names
+        .into_iter()
+        .filter(|file| is_javascript_file(file))
+        .map(|file| RuntimeProbeFile {
+            code: source_by_file.get(&file).cloned(),
+            file,
+        })
+        .collect()
+}
+
+async fn render_probe_files_for_session(
+    state: &AppState,
+    session: &DiagnoseCleanupSession,
+    candidates: &[TranslationCandidate],
+) -> Result<Vec<RuntimeProbeFile>> {
+    let files = source_probe_files(&session.source_by_file);
+    let Some(endpoint) = session
+        .cjs_endpoint
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return render_probe_files(&session.source_by_file, candidates);
+    };
+
+    let endpoint = endpoint.trim_end_matches('/');
+    let response = state
+        .http
+        .post(format!("{endpoint}/task"))
+        .json(&json!({
+            "type": "plugin-diagnose-render-probe",
+            "payload": {
+                "files": files,
+                "candidates": candidates,
+            }
+        }))
+        .send()
+        .await
+        .context("CJS probe 渲染请求失败")?;
+    let payload: Value = response
+        .json()
+        .await
+        .context("CJS probe 渲染响应解析失败")?;
+    if !payload.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let error = payload
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("CJS probe 渲染失败");
+        bail!("{error}");
+    }
+    let result = payload
+        .get("result")
+        .cloned()
+        .ok_or_else(|| anyhow!("CJS probe 渲染缺少 result"))?;
+    if !result
+        .get("state")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let error = result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("CJS probe 渲染失败");
+        bail!("{error}");
+    }
+    serde_json::from_value::<Vec<RuntimeProbeFile>>(
+        result
+            .get("files")
+            .cloned()
+            .ok_or_else(|| anyhow!("CJS probe 渲染缺少 files"))?,
+    )
+    .context("CJS probe 渲染 files 类型错误")
+}
+
+fn response_probe_files(files: &[RuntimeProbeFile]) -> Vec<RuntimeProbeFile> {
+    files
+        .iter()
+        .map(|file| RuntimeProbeFile {
+            file: file.file.clone(),
+            code: None,
+        })
+        .collect()
+}
+
+fn write_probe_files(plugin_dir: &str, files: &[RuntimeProbeFile]) -> Result<Vec<String>> {
+    let mut written = Vec::new();
+    for file in files {
+        let target_path = safe_join(plugin_dir, &file.file)?;
+        let Some(code) = file.code.as_deref() else {
+            bail!("probe 文件缺少代码: {}", file.file);
+        };
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&target_path, code)
+            .with_context(|| format!("failed to write {}", target_path.display()))?;
+        written.push(file.file.clone());
+    }
+    Ok(written)
+}
+
+fn capture_plugin_files(
+    plugin_dir: &str,
+    files: impl IntoIterator<Item = String>,
+) -> Result<HashMap<String, Option<String>>> {
+    let mut originals = HashMap::new();
+    for file in files {
+        let target_path = safe_join(plugin_dir, &file)?;
+        let content = if target_path.exists() {
+            Some(
+                fs::read_to_string(&target_path)
+                    .with_context(|| format!("failed to read {}", target_path.display()))?,
+            )
+        } else {
+            None
+        };
+        originals.insert(file, content);
+    }
+    Ok(originals)
+}
+
+fn restore_original_plugin_files(session: &DiagnoseCleanupSession) -> Result<()> {
+    for (file, content) in &session.original_files {
+        let target_path = safe_join(&session.plugin_dir, file)?;
+        match content {
+            Some(code) => {
+                if let Some(parent) = target_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&target_path, code)
+                    .with_context(|| format!("failed to restore {}", target_path.display()))?;
+            }
+            None => match fs::remove_file(&target_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to remove {}", target_path.display()))
+                }
+            },
+        }
+    }
+    mark_diagnose_checkpoint_originals_restored(
+        &session.paths,
+        &session.plugin_id,
+        &session.translation_source_id,
+    )?;
+    Ok(())
+}
+
+fn diagnose_original_backup_ref(
+    plugin_id: &str,
+    translation_source_id: &str,
+    file: &str,
+) -> String {
+    format!(
+        "v3/{}/{}/{}.txt",
+        sha256_hex(plugin_id),
+        sha256_hex(translation_source_id),
+        sha256_hex(file)
+    )
+}
+
+fn diagnose_original_backup_path(paths: &PersistencePaths, backup_ref: &str) -> Result<PathBuf> {
+    let relative = Path::new(backup_ref);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!("invalid diagnose original backup ref: {backup_ref}");
+    }
+    Ok(paths.diagnose_originals_dir.join(relative))
+}
+
+fn mark_diagnose_checkpoint_originals_restored(
+    paths: &PersistencePaths,
+    plugin_id: &str,
+    translation_source_id: &str,
+) -> Result<()> {
+    let mut checkpoint = load_json_or(&paths.diagnose_checkpoint_path, Value::Null);
+    if checkpoint.get("schemaVersion").and_then(Value::as_u64) != Some(3)
+        || checkpoint.get("pluginId").and_then(Value::as_str) != Some(plugin_id)
+        || checkpoint
+            .get("translationSourceId")
+            .and_then(Value::as_str)
+            != Some(translation_source_id)
+    {
+        return Ok(());
+    }
+    checkpoint["originalFilesRestored"] = json!(true);
+    checkpoint["updatedAt"] = json!(now_ms());
+    write_json_pretty(&paths.diagnose_checkpoint_path, &checkpoint)
+}
+
+fn save_original_plugin_file_snapshots(session: &DiagnoseCleanupSession) -> Result<()> {
+    for (file, content) in &session.original_files {
+        let Some(content) = content else {
+            continue;
+        };
+        let backup_ref =
+            diagnose_original_backup_ref(&session.plugin_id, &session.translation_source_id, file);
+        let backup_path = diagnose_original_backup_path(&session.paths, &backup_ref)?;
+        if let Some(parent) = backup_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&backup_path, content)
+            .with_context(|| format!("failed to write {}", backup_path.display()))?;
+    }
+    Ok(())
+}
+
+fn restore_originals_from_checkpoint(
+    paths: &PersistencePaths,
+    plugin_id: &str,
+    translation_source_id: &str,
+    plugin_dir: &str,
+) -> Result<()> {
+    let checkpoint = load_json_or(&paths.diagnose_checkpoint_path, Value::Null);
+    if checkpoint.get("schemaVersion").and_then(Value::as_u64) != Some(3)
+        || checkpoint.get("pluginId").and_then(Value::as_str) != Some(plugin_id)
+        || checkpoint
+            .get("translationSourceId")
+            .and_then(Value::as_str)
+            != Some(translation_source_id)
+    {
+        return Ok(());
+    }
+    let Some(original_files) = checkpoint.get("originalFiles").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    if checkpoint
+        .get("originalFilesRestored")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return Ok(());
+    }
+    let mut restored_any = false;
+    for (file, meta) in original_files {
+        let target_path = safe_join(plugin_dir, file)?;
+        let exists = meta.get("exists").and_then(Value::as_bool).unwrap_or(true);
+        if !exists {
+            match fs::remove_file(&target_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to remove {}", target_path.display()))
+                }
+            }
+            restored_any = true;
+            continue;
+        }
+        let backup_ref = meta
+            .get("backupRef")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("diagnose original backup ref missing for {file}"))?;
+        let backup_path = diagnose_original_backup_path(paths, backup_ref)?;
+        let content = fs::read_to_string(&backup_path)
+            .with_context(|| format!("failed to read {}", backup_path.display()))?;
+        if let Some(expected) = meta.get("sha256").and_then(Value::as_str) {
+            let actual = sha256_hex(&content);
+            if actual != expected {
+                bail!("diagnose original backup checksum mismatch for {file}");
+            }
+        }
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&target_path, content)
+            .with_context(|| format!("failed to restore {}", target_path.display()))?;
+        restored_any = true;
+    }
+    if restored_any {
+        mark_diagnose_checkpoint_originals_restored(paths, plugin_id, translation_source_id)?;
+    }
+    Ok(())
 }
 
 fn candidate_identity(candidate: &TranslationCandidate) -> (String, String, usize, String, String) {
@@ -4583,6 +5954,30 @@ fn candidate_identity(candidate: &TranslationCandidate) -> (String, String, usiz
     )
 }
 
+fn sha256_hex(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn candidate_key(candidate: &TranslationCandidate) -> String {
+    let source = candidate
+        .item
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let target = candidate
+        .item
+        .get("target")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let digest = sha256_hex(&format!("{source}\u{1f}{target}"));
+    format!(
+        "{}\t{}\t{}\t{}",
+        candidate.kind, candidate.file, candidate.index, digest
+    )
+}
+
 fn issue_identity(issue: &TranslationIssueItem) -> String {
     format!(
         "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
@@ -4593,27 +5988,6 @@ fn issue_identity(issue: &TranslationIssueItem) -> String {
 fn candidate_issue_identity(candidate: &TranslationCandidate) -> String {
     let (file, kind, index, source, target) = candidate_identity(candidate);
     format!("{file}\u{1f}{kind}\u{1f}{index}\u{1f}{source}\u{1f}{target}")
-}
-
-fn same_candidate_set(left: &[TranslationCandidate], right: &[TranslationCandidate]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let left_set = left.iter().map(candidate_identity).collect::<HashSet<_>>();
-    let right_set = right.iter().map(candidate_identity).collect::<HashSet<_>>();
-    left_set == right_set
-}
-
-fn issue_as_candidate(issue: &TranslationIssueItem) -> TranslationCandidate {
-    TranslationCandidate {
-        file: issue.file.clone(),
-        kind: issue.kind.clone(),
-        index: issue.index,
-        item: json!({
-            "source": issue.source,
-            "target": issue.target,
-        }),
-    }
 }
 
 fn candidate_group_signature(candidates: &[TranslationCandidate]) -> String {
@@ -4646,11 +6020,17 @@ fn remove_candidates_from_list(
     if candidates.is_empty() {
         return;
     }
-    let remove_set = candidates.iter().map(candidate_identity).collect::<HashSet<_>>();
+    let remove_set = candidates
+        .iter()
+        .map(candidate_identity)
+        .collect::<HashSet<_>>();
     source.retain(|candidate| !remove_set.contains(&candidate_identity(candidate)));
 }
 
-fn push_unique_issues(target: &mut Vec<TranslationIssueItem>, issues: impl IntoIterator<Item = TranslationIssueItem>) {
+fn push_unique_issues(
+    target: &mut Vec<TranslationIssueItem>,
+    issues: impl IntoIterator<Item = TranslationIssueItem>,
+) {
     let mut seen = target.iter().map(issue_identity).collect::<HashSet<_>>();
     for issue in issues {
         if seen.insert(issue_identity(&issue)) {
@@ -4659,23 +6039,254 @@ fn push_unique_issues(target: &mut Vec<TranslationIssueItem>, issues: impl IntoI
     }
 }
 
-fn diagnose_checkpoint_items(candidates: &[TranslationCandidate], reason: &str) -> Vec<TranslationIssueItem> {
-    candidates.iter().map(|candidate| candidate.issue(reason)).collect()
+fn candidate_phase(candidate: &TranslationCandidate) -> &str {
+    candidate.kind.as_str()
+}
+
+fn phase_display_name(phase: &str) -> &str {
+    match phase {
+        "ast" => "AST",
+        "regex" => "Regex",
+        _ => phase,
+    }
+}
+
+fn diagnose_progress(
+    session: &DiagnoseCleanupSession,
+    phase: &str,
+    current_group_items: usize,
+) -> DiagnoseProgress {
+    let queued = session
+        .phase_queues
+        .get(phase)
+        .map(VecDeque::len)
+        .unwrap_or_default();
+    DiagnoseProgress {
+        phase: phase.to_string(),
+        queue_groups: queued + usize::from(current_group_items > 0),
+        current_group_items,
+    }
+}
+
+fn completed_diagnose_progress(session: &DiagnoseCleanupSession) -> DiagnoseProgress {
+    let phase = session
+        .phase_order
+        .get(session.active_phase_index)
+        .cloned()
+        .unwrap_or_else(|| "completed".to_string());
+    DiagnoseProgress {
+        phase,
+        queue_groups: 0,
+        current_group_items: 0,
+    }
+}
+
+fn filtered_unresolved_candidates(
+    pending_identities: &HashSet<(String, String, usize, String, String)>,
+    candidates: &[TranslationCandidate],
+    phase: Option<&str>,
+) -> Vec<TranslationCandidate> {
+    candidates
+        .iter()
+        .filter(|candidate| {
+            phase.map_or(true, |value| candidate_phase(candidate) == value)
+                && pending_identities.contains(&candidate_identity(candidate))
+        })
+        .cloned()
+        .collect()
+}
+
+fn checkpoint_phase_groups(
+    session: &DiagnoseCleanupSession,
+    phase: &str,
+) -> Vec<Vec<TranslationCandidate>> {
+    let pending_identities = session
+        .pending_candidates
+        .iter()
+        .map(candidate_identity)
+        .collect::<HashSet<_>>();
+    let mut current_groups = session
+        .probe_map
+        .values()
+        .filter_map(|group| {
+            let unresolved =
+                filtered_unresolved_candidates(&pending_identities, group, Some(phase));
+            if unresolved.is_empty() {
+                None
+            } else {
+                Some(unresolved)
+            }
+        })
+        .collect::<Vec<_>>();
+    current_groups.sort_by_key(|group| candidate_group_signature(group));
+
+    let mut groups = current_groups;
+    if let Some(queue) = session.phase_queues.get(phase) {
+        for group in queue {
+            let unresolved =
+                filtered_unresolved_candidates(&pending_identities, group, Some(phase));
+            if !unresolved.is_empty() {
+                groups.push(unresolved);
+            }
+        }
+    }
+    groups
+}
+
+fn checkpoint_phase_queues(session: &DiagnoseCleanupSession) -> Value {
+    let mut queues = serde_json::Map::new();
+    for phase in &session.phase_order {
+        let groups = checkpoint_phase_groups(session, phase);
+        queues.insert(
+            phase.clone(),
+            json!(groups
+                .into_iter()
+                .map(|group| group
+                    .into_iter()
+                    .map(|candidate| candidate_key(&candidate))
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>()),
+        );
+    }
+    Value::Object(queues)
+}
+
+fn issue_candidate_key(issue: &TranslationIssueItem) -> String {
+    let digest = sha256_hex(&format!("{}\u{1f}{}", issue.source, issue.target));
+    format!(
+        "{}\t{}\t{}\t{}",
+        issue.kind, issue.file, issue.index, digest
+    )
+}
+
+fn diagnose_issue_keys(issues: &[TranslationIssueItem]) -> Vec<String> {
+    let mut keys = issues.iter().map(issue_candidate_key).collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn compact_index_ranges(mut indexes: Vec<usize>) -> Vec<[usize; 2]> {
+    if indexes.is_empty() {
+        return Vec::new();
+    }
+    indexes.sort_unstable();
+    indexes.dedup();
+    let mut ranges = Vec::new();
+    let mut start = indexes[0];
+    let mut end = indexes[0];
+    for index in indexes.into_iter().skip(1) {
+        if index == end + 1 {
+            end = index;
+        } else {
+            ranges.push([start, end]);
+            start = index;
+            end = index;
+        }
+    }
+    ranges.push([start, end]);
+    ranges
+}
+
+fn cleared_ranges(session: &DiagnoseCleanupSession) -> Value {
+    let mut phases = serde_json::Map::new();
+    for phase in &session.phase_order {
+        let mut by_file: HashMap<String, Vec<usize>> = HashMap::new();
+        for candidate in session
+            .cleared_runtime_candidates
+            .iter()
+            .filter(|candidate| candidate_phase(candidate) == phase)
+        {
+            by_file
+                .entry(candidate.file.clone())
+                .or_default()
+                .push(candidate.index);
+        }
+        let mut files = serde_json::Map::new();
+        let mut file_names = by_file.keys().cloned().collect::<Vec<_>>();
+        file_names.sort();
+        for file in file_names {
+            if let Some(indexes) = by_file.remove(&file) {
+                files.insert(file, json!(compact_index_ranges(indexes)));
+            }
+        }
+        phases.insert(phase.clone(), Value::Object(files));
+    }
+    Value::Object(phases)
+}
+
+fn original_files_checkpoint(session: &DiagnoseCleanupSession) -> Value {
+    let mut files = serde_json::Map::new();
+    let mut file_names = session.original_files.keys().cloned().collect::<Vec<_>>();
+    file_names.sort();
+    for file in file_names {
+        let content = session
+            .original_files
+            .get(&file)
+            .and_then(|value| value.as_ref());
+        let mut meta = serde_json::Map::new();
+        meta.insert("exists".to_string(), json!(content.is_some()));
+        if let Some(content) = content {
+            meta.insert(
+                "backupRef".to_string(),
+                json!(diagnose_original_backup_ref(
+                    &session.plugin_id,
+                    &session.translation_source_id,
+                    &file
+                )),
+            );
+            meta.insert("sha256".to_string(), json!(sha256_hex(content)));
+            meta.insert("size".to_string(), json!(content.as_bytes().len()));
+        }
+        files.insert(file, Value::Object(meta));
+    }
+    Value::Object(files)
+}
+
+fn current_probe_checkpoint(session: &DiagnoseCleanupSession) -> Option<Value> {
+    let mut probes = session.probe_map.iter().collect::<Vec<_>>();
+    probes.sort_by_key(|(probe_id, _)| *probe_id);
+    let (probe_id, candidates) = probes.into_iter().next()?;
+    let phase = candidates
+        .first()
+        .map(|candidate| candidate_phase(candidate).to_string())
+        .unwrap_or_else(|| "baseline".to_string());
+    Some(json!({
+        "probeId": probe_id,
+        "phase": phase,
+        "keys": candidates.iter().map(candidate_key).collect::<Vec<_>>(),
+        "files": session.probe_files.get(probe_id).cloned().unwrap_or_default(),
+    }))
 }
 
 fn save_diagnose_checkpoint(session: &DiagnoseCleanupSession, status: &str) -> Result<()> {
+    save_original_plugin_file_snapshots(session)?;
+    let phase = session
+        .phase_order
+        .get(session.active_phase_index)
+        .cloned()
+        .unwrap_or_else(|| "completed".to_string());
+    let progress = completed_diagnose_progress(session);
     write_json_pretty(
         &session.paths.diagnose_checkpoint_path,
         &json!({
-            "schemaVersion": 1,
+            "schemaVersion": 3,
             "updatedAt": now_ms(),
             "pluginId": session.plugin_id.clone(),
             "translationSourceId": session.translation_source_id.clone(),
+            "translationChecksum": calculate_checksum(&session.translation_json)?,
             "status": status,
-            "pendingItems": diagnose_checkpoint_items(&session.pending_candidates, "待运行验证"),
-            "clearedItems": diagnose_checkpoint_items(&session.cleared_runtime_candidates, "运行验证通过"),
-            "issueItems": session.issue_items.clone(),
+            "activePhase": phase,
+            "activePhaseIndex": session.active_phase_index,
+            "originalFilesRestored": false,
+            "phaseOrder": session.phase_order.clone(),
+            "phaseQueues": checkpoint_phase_queues(session),
+            "issueKeys": diagnose_issue_keys(&session.issue_items),
+            "clearedRanges": cleared_ranges(session),
+            "currentProbe": current_probe_checkpoint(session),
+            "originalFiles": original_files_checkpoint(session),
             "processedFiles": session.processed_files,
+            "progress": progress,
         }),
     )
 }
@@ -4698,33 +6309,204 @@ fn load_diagnose_checkpoint(
     }
 }
 
-fn restore_diagnose_checkpoint(session: &mut DiagnoseCleanupSession) -> Result<()> {
+fn push_unique_cleared_candidates(
+    target: &mut Vec<TranslationCandidate>,
+    candidates: impl IntoIterator<Item = TranslationCandidate>,
+) {
+    let mut seen = target.iter().map(candidate_key).collect::<HashSet<_>>();
+    for candidate in candidates {
+        if seen.insert(candidate_key(&candidate)) {
+            target.push(candidate);
+        }
+    }
+}
+
+fn set_active_phase(session: &mut DiagnoseCleanupSession, phase: &str) {
+    if let Some(index) = session.phase_order.iter().position(|item| item == phase) {
+        session.active_phase_index = index;
+    }
+}
+
+fn remove_candidates_by_key_set(source: &mut Vec<TranslationCandidate>, keys: &HashSet<String>) {
+    if keys.is_empty() {
+        return;
+    }
+    source.retain(|candidate| !keys.contains(&candidate_key(candidate)));
+}
+
+fn load_open_diagnose_issues(
+    paths: &PersistencePaths,
+    translation_source_id: &str,
+    plugin_id: &str,
+) -> Vec<TranslationIssueItem> {
+    let record = load_json_or(&paths.diagnose_issue_record_path, Value::Null);
+    let Some(items) = record
+        .pointer(&format!("/sources/{translation_source_id}/issues"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter(|item| {
+            item.get("status").and_then(Value::as_str) == Some("open")
+                && record
+                    .pointer(&format!("/sources/{translation_source_id}/pluginId"))
+                    .and_then(Value::as_str)
+                    == Some(plugin_id)
+        })
+        .filter_map(|item| {
+            Some(TranslationIssueItem {
+                file: item.get("file")?.as_str()?.to_string(),
+                kind: item.get("kind")?.as_str()?.to_string(),
+                index: item.get("index")?.as_u64()? as usize,
+                source: item.get("source")?.as_str()?.to_string(),
+                target: item.get("target")?.as_str()?.to_string(),
+                reason: item
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("插件运行验证失败")
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+fn index_in_ranges(index: usize, ranges: &[Value]) -> bool {
+    ranges.iter().any(|range| {
+        let Some(pair) = range.as_array() else {
+            return false;
+        };
+        let start = pair
+            .first()
+            .and_then(Value::as_u64)
+            .unwrap_or(usize::MAX as u64) as usize;
+        let end = pair
+            .get(1)
+            .and_then(Value::as_u64)
+            .unwrap_or(usize::MAX as u64) as usize;
+        index >= start && index <= end
+    })
+}
+
+fn candidates_from_cleared_ranges(
+    candidates: &[TranslationCandidate],
+    cleared_ranges: Option<&Value>,
+) -> Vec<TranslationCandidate> {
+    let Some(phases) = cleared_ranges.and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    candidates
+        .iter()
+        .filter(|candidate| {
+            phases
+                .get(candidate_phase(candidate))
+                .and_then(Value::as_object)
+                .and_then(|files| files.get(&candidate.file))
+                .and_then(Value::as_array)
+                .is_some_and(|ranges| index_in_ranges(candidate.index, ranges))
+        })
+        .cloned()
+        .collect()
+}
+
+fn restore_diagnose_checkpoint(session: &mut DiagnoseCleanupSession) -> Result<bool> {
     let Some(checkpoint) = load_diagnose_checkpoint(
         &session.paths,
         &session.plugin_id,
         &session.translation_source_id,
     ) else {
-        return Ok(());
+        return Ok(false);
     };
-
-    let issue_items = checkpoint
-        .get("issueItems")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<Vec<TranslationIssueItem>>(value).ok())
-        .unwrap_or_default();
-    let cleared_items = checkpoint
-        .get("clearedItems")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<Vec<TranslationIssueItem>>(value).ok())
-        .unwrap_or_default();
-
-    push_unique_issues(&mut session.issue_items, issue_items.clone());
-    remove_issue_items_from_candidates(&mut session.pending_candidates, &issue_items);
-    remove_issue_items_from_candidates(&mut session.pending_candidates, &cleared_items);
-    for issue in cleared_items {
-        session.cleared_runtime_candidates.push(issue_as_candidate(&issue));
+    if checkpoint.get("schemaVersion").and_then(Value::as_u64) != Some(3) {
+        return Ok(false);
     }
-    Ok(())
+    if checkpoint
+        .get("translationChecksum")
+        .and_then(Value::as_str)
+        != Some(calculate_checksum(&session.translation_json)?.as_str())
+    {
+        return Ok(false);
+    }
+
+    let issue_key_set = checkpoint
+        .get("issueKeys")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let recorded_issues = load_open_diagnose_issues(
+        &session.paths,
+        &session.translation_source_id,
+        &session.plugin_id,
+    );
+    let recorded_issue_keys = recorded_issues
+        .iter()
+        .map(issue_candidate_key)
+        .collect::<HashSet<_>>();
+    push_unique_issues(&mut session.issue_items, recorded_issues);
+    remove_candidates_by_key_set(&mut session.pending_candidates, &issue_key_set);
+    remove_candidates_by_key_set(&mut session.pending_candidates, &recorded_issue_keys);
+
+    let cleared = candidates_from_cleared_ranges(
+        &session.pending_candidates,
+        checkpoint.get("clearedRanges"),
+    );
+    push_unique_cleared_candidates(&mut session.cleared_runtime_candidates, cleared.clone());
+    remove_candidates_from_list(&mut session.pending_candidates, &cleared);
+
+    if let Some(active_phase) = checkpoint.get("activePhase").and_then(Value::as_str) {
+        set_active_phase(session, active_phase);
+    } else if let Some(active_phase_index) =
+        checkpoint.get("activePhaseIndex").and_then(Value::as_u64)
+    {
+        session.active_phase_index = (active_phase_index as usize).min(session.phase_order.len());
+    }
+
+    let Some(phase_queues) = checkpoint.get("phaseQueues").and_then(Value::as_object) else {
+        return Ok(false);
+    };
+    let candidates_by_key = session
+        .pending_candidates
+        .iter()
+        .cloned()
+        .map(|candidate| (candidate_key(&candidate), candidate))
+        .collect::<HashMap<_, _>>();
+    let mut restored_any = false;
+    session.phase_queues.clear();
+    for phase in session.phase_order.clone() {
+        let mut queue = VecDeque::new();
+        let groups = phase_queues
+            .get(&phase)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for group in groups {
+            let keys = group
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|value| value.as_str().map(ToString::to_string))
+                .collect::<Vec<_>>();
+            let unresolved = keys
+                .into_iter()
+                .filter_map(|key| candidates_by_key.get(&key).cloned())
+                .filter(|candidate| candidate_phase(candidate) == phase)
+                .collect::<Vec<_>>();
+            if !unresolved.is_empty() {
+                restored_any = true;
+                queue.push_back(unresolved);
+            }
+        }
+        session.phase_queues.insert(phase, queue);
+    }
+    Ok(restored_any)
 }
 
 fn update_diagnose_issue_record(
@@ -4769,7 +6551,11 @@ fn update_diagnose_issue_record(
     source_entry["translationSourceId"] = json!(translation_source_id);
     source_entry["pluginId"] = json!(plugin_id);
     source_entry["updatedAt"] = json!(now);
-    if source_entry.get("issues").and_then(Value::as_array).is_none() {
+    if source_entry
+        .get("issues")
+        .and_then(Value::as_array)
+        .is_none()
+    {
         source_entry["issues"] = json!([]);
     }
 
@@ -4778,7 +6564,10 @@ fn update_diagnose_issue_record(
     };
     for issue in issues {
         let key = issue_identity(issue);
-        if let Some(existing) = items.iter_mut().find(|item| item.get("key").and_then(Value::as_str) == Some(key.as_str())) {
+        if let Some(existing) = items
+            .iter_mut()
+            .find(|item| item.get("key").and_then(Value::as_str) == Some(key.as_str()))
+        {
             existing["lastSeenAt"] = json!(now);
             existing["status"] = json!(status);
             existing["reason"] = json!(issue.reason.clone());
@@ -4801,43 +6590,34 @@ fn update_diagnose_issue_record(
     write_json_pretty(&paths.diagnose_issue_record_path, &record)
 }
 
-fn pairwise_candidate_groups(candidates: &[TranslationCandidate]) -> Vec<Vec<TranslationCandidate>> {
-    let mut groups = Vec::new();
-    if candidates.len() <= 2 || candidates.len() > 64 {
-        return groups;
-    }
-    for left in 0..candidates.len() {
-        for right in (left + 1)..candidates.len() {
-            groups.push(vec![candidates[left].clone(), candidates[right].clone()]);
-        }
-    }
-    groups
-}
-
-fn probe_response(
+async fn probe_response(
+    state: &AppState,
     session_id: &str,
     session: &mut DiagnoseCleanupSession,
     candidates: Vec<TranslationCandidate>,
     label: &str,
+    phase: &str,
 ) -> Result<PluginDiagnoseCleanupResponse> {
     let probe_id = nanoid!(16);
-    let files = render_probe_files(&session.source_by_file, &candidates)?;
+    let files = render_probe_files_for_session(state, session, &candidates).await?;
+    let written_files = write_probe_files(&session.plugin_dir, &files)?;
+    let progress = diagnose_progress(session, phase, candidates.len());
     session.probe_map.insert(probe_id.clone(), candidates);
+    session
+        .probe_files
+        .insert(probe_id.clone(), written_files.clone());
+    save_diagnose_checkpoint(session, "running")?;
     Ok(PluginDiagnoseCleanupResponse {
         state: true,
         status: "probe".to_string(),
         session_id: Some(session_id.to_string()),
         probe: Some(RuntimeProbeRequest {
             probe_id,
-            files,
+            files: response_probe_files(&files),
             label: label.to_string(),
         }),
         issue_items: session.issue_items.clone(),
-        cleared_items: session
-            .cleared_runtime_candidates
-            .iter()
-            .map(|candidate| candidate.issue("运行验证通过，已从嫌疑池排除"))
-            .collect(),
+        cleared_items: Vec::new(),
         processed_files: session.processed_files,
         translation_version: session
             .translation_json
@@ -4845,21 +6625,21 @@ fn probe_response(
             .and_then(Value::as_str)
             .unwrap_or("0.0.0")
             .to_string(),
+        progress,
     })
 }
 
-fn completed_response(session: &DiagnoseCleanupSession, status: &str) -> PluginDiagnoseCleanupResponse {
+fn completed_response(
+    session: &DiagnoseCleanupSession,
+    status: &str,
+) -> PluginDiagnoseCleanupResponse {
     PluginDiagnoseCleanupResponse {
         state: true,
         status: status.to_string(),
         session_id: None,
         probe: None,
         issue_items: session.issue_items.clone(),
-        cleared_items: session
-            .cleared_runtime_candidates
-            .iter()
-            .map(|candidate| candidate.issue("运行验证通过，已从嫌疑池排除"))
-            .collect(),
+        cleared_items: Vec::new(),
         processed_files: session.processed_files,
         translation_version: session
             .translation_json
@@ -4867,6 +6647,7 @@ fn completed_response(session: &DiagnoseCleanupSession, status: &str) -> PluginD
             .and_then(Value::as_str)
             .unwrap_or("0.0.0")
             .to_string(),
+        progress: completed_diagnose_progress(session),
     }
 }
 
@@ -4884,7 +6665,11 @@ fn mark_runtime_candidates_cleared(
     if candidates.is_empty() {
         return Ok(());
     }
-    let pending_set = session.pending_candidates.iter().map(candidate_identity).collect::<HashSet<_>>();
+    let pending_set = session
+        .pending_candidates
+        .iter()
+        .map(candidate_identity)
+        .collect::<HashSet<_>>();
     let cleared = candidates
         .iter()
         .filter(|candidate| pending_set.contains(&candidate_identity(candidate)))
@@ -4896,7 +6681,15 @@ fn mark_runtime_candidates_cleared(
     let issue_set = session
         .issue_items
         .iter()
-        .map(|issue| (issue.file.clone(), issue.kind.clone(), issue.index, issue.source.clone(), issue.target.clone()))
+        .map(|issue| {
+            (
+                issue.file.clone(),
+                issue.kind.clone(),
+                issue.index,
+                issue.source.clone(),
+                issue.target.clone(),
+            )
+        })
         .collect::<HashSet<_>>();
     for candidate in &cleared {
         let (file, kind, index, source, target) = candidate_identity(candidate);
@@ -4916,7 +6709,10 @@ fn mark_runtime_candidates_issues(
     if candidates.is_empty() {
         return Ok(());
     }
-    let issues = candidates.iter().map(|candidate| candidate.issue(reason)).collect::<Vec<_>>();
+    let issues = candidates
+        .iter()
+        .map(|candidate| candidate.issue(reason))
+        .collect::<Vec<_>>();
     push_unique_issues(&mut session.issue_items, issues.clone());
     remove_candidates_from_list(&mut session.pending_candidates, candidates);
     remove_candidates_from_list(&mut session.cleared_runtime_candidates, candidates);
@@ -4934,7 +6730,11 @@ fn filter_unresolved_candidates(
     session: &DiagnoseCleanupSession,
     candidates: &[TranslationCandidate],
 ) -> Vec<TranslationCandidate> {
-    let pending_set = session.pending_candidates.iter().map(candidate_identity).collect::<HashSet<_>>();
+    let pending_set = session
+        .pending_candidates
+        .iter()
+        .map(candidate_identity)
+        .collect::<HashSet<_>>();
     candidates
         .iter()
         .filter(|candidate| pending_set.contains(&candidate_identity(candidate)))
@@ -4942,92 +6742,150 @@ fn filter_unresolved_candidates(
         .collect()
 }
 
-fn mark_combo_group_if_exhausted(
+fn queue_runtime_chunks(
     session: &mut DiagnoseCleanupSession,
-    group: Vec<TranslationCandidate>,
-) -> Result<bool> {
-    let unresolved = filter_unresolved_candidates(session, &group);
-    if !unresolved.is_empty() {
-        mark_runtime_candidates_issues(
-            session,
-            &unresolved,
-            "组合导致插件运行验证失败，已记录该组合中的条目",
-        )?;
+    phase: &str,
+    candidates: Vec<TranslationCandidate>,
+) -> Result<()> {
+    let unresolved = filter_unresolved_candidates(session, &candidates)
+        .into_iter()
+        .filter(|candidate| candidate_phase(candidate) == phase)
+        .collect::<Vec<_>>();
+    if unresolved.is_empty() {
+        return Ok(());
     }
-    Ok(true)
+    let queue = session.phase_queues.entry(phase.to_string()).or_default();
+    for chunk in runtime_probe_chunks(&unresolved) {
+        if !chunk.is_empty() {
+            queue.push_back(chunk);
+        }
+    }
+    save_diagnose_checkpoint(session, "running")
 }
 
-fn queue_runtime_chunks(session: &mut DiagnoseCleanupSession, candidates: Vec<TranslationCandidate>) {
-    for chunk in runtime_probe_chunks(&candidates).into_iter().rev() {
-        session.runtime_probe_queue.push(chunk);
+fn initialize_phase_queues(session: &mut DiagnoseCleanupSession) {
+    session.phase_queues.clear();
+    for phase in session.phase_order.clone() {
+        let candidates = session
+            .pending_candidates
+            .iter()
+            .filter(|candidate| candidate_phase(candidate) == phase)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut queue = VecDeque::new();
+        if !candidates.is_empty() {
+            queue.push_back(candidates);
+        }
+        session.phase_queues.insert(phase, queue);
     }
 }
 
-fn next_runtime_queued_probe(
-    session_id: &str,
+fn advance_to_next_phase_with_work(session: &mut DiagnoseCleanupSession) {
+    while session.active_phase_index < session.phase_order.len() {
+        let phase = &session.phase_order[session.active_phase_index];
+        let has_work = session
+            .phase_queues
+            .get(phase)
+            .map(|queue| !queue.is_empty())
+            .unwrap_or(false)
+            || session
+                .pending_candidates
+                .iter()
+                .any(|candidate| candidate_phase(candidate) == phase);
+        if has_work {
+            break;
+        }
+        session.active_phase_index += 1;
+    }
+}
+
+fn current_phase(session: &DiagnoseCleanupSession) -> Option<String> {
+    session.phase_order.get(session.active_phase_index).cloned()
+}
+
+fn phase_pending_count(session: &DiagnoseCleanupSession, phase: &str) -> usize {
+    session
+        .pending_candidates
+        .iter()
+        .filter(|candidate| candidate_phase(candidate) == phase)
+        .count()
+}
+
+fn pop_next_phase_group(
     session: &mut DiagnoseCleanupSession,
-) -> Result<Option<PluginDiagnoseCleanupResponse>> {
-    while let Some(candidates) = session.runtime_probe_queue.pop() {
-        let unresolved = filter_unresolved_candidates(session, &candidates);
+    phase: &str,
+) -> Option<Vec<TranslationCandidate>> {
+    loop {
+        let group = session
+            .phase_queues
+            .get_mut(phase)
+            .and_then(VecDeque::pop_front)?;
+        let unresolved = filter_unresolved_candidates(session, &group);
         if !unresolved.is_empty() {
-            return probe_response(session_id, session, unresolved, "分组运行验证").map(Some);
+            return Some(unresolved);
         }
     }
-    Ok(None)
 }
 
-fn next_runtime_probe_response(
+async fn next_runtime_probe_response(
+    state: &AppState,
     session_id: &str,
     session: &mut DiagnoseCleanupSession,
 ) -> Result<Option<PluginDiagnoseCleanupResponse>> {
-    if let Some(response) = next_runtime_queued_probe(session_id, session)? {
-        return Ok(Some(response));
-    }
-
-    if let Some(group) = session.combo_fallback_groups.pop() {
-        let signature = candidate_group_signature(&group.candidates);
-        if !session.pairwise_tested_group_signatures.contains(&signature) {
-            let pairwise = pairwise_candidate_groups(&group.candidates);
-            if !pairwise.is_empty() {
-                session.pairwise_tested_group_signatures.insert(signature);
-                session.combo_fallback_groups.push(group.clone());
-                for pair in pairwise.into_iter().rev() {
-                    session.runtime_probe_queue.push(pair);
-                }
-                if let Some(response) = next_runtime_queued_probe(session_id, session)? {
-                    return Ok(Some(response));
-                }
-            }
+    loop {
+        advance_to_next_phase_with_work(session);
+        let Some(phase) = current_phase(session) else {
+            save_diagnose_checkpoint(session, "completed")?;
+            return Ok(None);
+        };
+        if session
+            .phase_queues
+            .get(&phase)
+            .map(|queue| queue.is_empty())
+            .unwrap_or(true)
+            && phase_pending_count(session, &phase) > 0
+        {
+            let candidates = session
+                .pending_candidates
+                .iter()
+                .filter(|candidate| candidate_phase(candidate) == phase)
+                .cloned()
+                .collect::<Vec<_>>();
+            session
+                .phase_queues
+                .entry(phase.clone())
+                .or_default()
+                .push_back(candidates);
         }
-        if session.issue_items.len() == group.issue_count_at_start {
-            mark_combo_group_if_exhausted(session, group.candidates.clone())?;
-        }
-        return next_runtime_probe_response(session_id, session);
-    }
 
-    if session.pending_candidates.is_empty() {
-        save_diagnose_checkpoint(session, "completed")?;
-        return Ok(None);
+        let Some(candidates) = pop_next_phase_group(session, &phase) else {
+            session.active_phase_index += 1;
+            save_diagnose_checkpoint(session, "running")?;
+            continue;
+        };
+        let label = if candidates.len() == phase_pending_count(session, &phase) {
+            format!("{} 全量运行验证", phase_display_name(&phase))
+        } else {
+            format!("{} 分组运行验证", phase_display_name(&phase))
+        };
+        return probe_response(state, session_id, session, candidates, &label, &phase)
+            .await
+            .map(Some);
     }
-
-    probe_response(
-        session_id,
-        session,
-        session.pending_candidates.clone(),
-        "全量运行验证",
-    )
-    .map(Some)
 }
 
-async fn handle_plugin_diagnose_cleanup_start(
-    state: &AppState,
-    payload: Value,
-) -> Result<Value> {
+async fn handle_plugin_diagnose_cleanup_start(state: &AppState, payload: Value) -> Result<Value> {
     let _guard = state.persistence_lock.lock().await;
     let payload: PluginDiagnoseCleanupStartPayload = serde_json::from_value(payload)?;
     let paths = paths(&payload.persistence.base_path);
-    let translation_json = read_translation(&paths, &payload.translation_source_id)
-        .ok_or_else(|| anyhow!("翻译文件不存在"))?;
+    restore_originals_from_checkpoint(
+        &paths,
+        &payload.plugin_id,
+        &payload.translation_source_id,
+        &payload.plugin_dir,
+    )?;
+    let translation_json =
+        prepare_diagnose_translation(&paths, &payload.translation_source_id, payload.draft)?;
     let apply_ast = payload.apply_ast.unwrap_or(true);
     let apply_regex = payload.apply_regex.unwrap_or(true);
     let source_by_file = source_by_file_for_plugin(
@@ -5037,12 +6895,8 @@ async fn handle_plugin_diagnose_cleanup_start(
         &translation_json,
         payload.is_applied.unwrap_or(false),
     )?;
-    let static_report = diagnose_translation_json(
-        &translation_json,
-        &source_by_file,
-        apply_ast,
-        apply_regex,
-    )?;
+    let static_report =
+        diagnose_translation_json(&translation_json, &source_by_file, apply_ast, apply_regex)?;
     update_diagnose_issue_record(
         &paths,
         &payload.translation_source_id,
@@ -5051,38 +6905,68 @@ async fn handle_plugin_diagnose_cleanup_start(
         "open",
     )?;
 
-    let mut pending_candidates = collect_translation_candidates(&translation_json, apply_ast, apply_regex);
+    let mut pending_candidates =
+        collect_translation_candidates(&translation_json, apply_ast, apply_regex);
     remove_issue_items_from_candidates(&mut pending_candidates, &static_report.issue_items);
+    let original_files = capture_plugin_files(&payload.plugin_dir, source_by_file.keys().cloned())?;
     let mut session = DiagnoseCleanupSession {
         paths,
         plugin_id: payload.plugin_id,
+        plugin_dir: payload.plugin_dir,
+        cjs_endpoint: payload.cjs_endpoint,
         translation_source_id: payload.translation_source_id,
         translation_json,
         source_by_file,
+        original_files,
         issue_items: static_report.issue_items,
         cleared_runtime_candidates: Vec::new(),
         pending_candidates,
         probe_map: HashMap::new(),
-        runtime_probe_queue: Vec::new(),
-        combo_fallback_groups: Vec::new(),
-        pairwise_tested_group_signatures: HashSet::new(),
+        probe_files: HashMap::new(),
+        phase_order: {
+            let mut phases = Vec::new();
+            if apply_ast {
+                phases.push("ast".to_string());
+            }
+            if apply_regex {
+                phases.push("regex".to_string());
+            }
+            phases
+        },
+        active_phase_index: 0,
+        phase_queues: HashMap::new(),
         processed_files: static_report.processed_files,
     };
-    restore_diagnose_checkpoint(&mut session)?;
+    initialize_phase_queues(&mut session);
+    let restored_queues = restore_diagnose_checkpoint(&mut session)?;
+    if !restored_queues {
+        initialize_phase_queues(&mut session);
+    }
     save_diagnose_checkpoint(&session, "running")?;
 
     if !payload.runtime_probe.unwrap_or(false) || session.pending_candidates.is_empty() {
         save_diagnose_checkpoint(&session, "completed")?;
-        return Ok(serde_json::to_value(completed_response(&session, "completed"))?);
+        mark_diagnose_checkpoint_originals_restored(
+            &session.paths,
+            &session.plugin_id,
+            &session.translation_source_id,
+        )?;
+        return Ok(serde_json::to_value(completed_response(
+            &session,
+            "completed",
+        ))?);
     }
 
     let session_id = nanoid!(16);
     let response = probe_response(
+        state,
         &session_id,
         &mut session,
         Vec::new(),
         "原始运行验证",
-    )?;
+        "baseline",
+    )
+    .await?;
     state
         .diagnose_sessions
         .lock()
@@ -5091,10 +6975,7 @@ async fn handle_plugin_diagnose_cleanup_start(
     Ok(serde_json::to_value(response)?)
 }
 
-async fn handle_plugin_diagnose_cleanup_step(
-    state: &AppState,
-    payload: Value,
-) -> Result<Value> {
+async fn handle_plugin_diagnose_cleanup_step(state: &AppState, payload: Value) -> Result<Value> {
     let _guard = state.persistence_lock.lock().await;
     let payload: PluginDiagnoseCleanupStepPayload = serde_json::from_value(payload)?;
     let mut sessions = state.diagnose_sessions.lock().await;
@@ -5105,25 +6986,34 @@ async fn handle_plugin_diagnose_cleanup_step(
         .probe_map
         .remove(&payload.probe_id)
         .ok_or_else(|| anyhow!("诊断探针不存在或已处理"))?;
+    session.probe_files.remove(&payload.probe_id);
 
     if candidates.is_empty() {
         if !payload.success {
             let response = completed_response(session, "baselineFailed");
+            save_diagnose_checkpoint(session, "baselineFailed")?;
+            restore_original_plugin_files(session)?;
             sessions.remove(&payload.session_id);
             return Ok(serde_json::to_value(response)?);
         }
-        if let Some(response) = next_runtime_probe_response(&payload.session_id, session)? {
+        if let Some(response) =
+            next_runtime_probe_response(state, &payload.session_id, session).await?
+        {
             return Ok(serde_json::to_value(response)?);
         }
         let response = completed_response(session, "completed");
+        save_diagnose_checkpoint(session, "completed")?;
+        restore_original_plugin_files(session)?;
         sessions.remove(&payload.session_id);
         return Ok(serde_json::to_value(response)?);
     }
 
+    let phase = candidates
+        .first()
+        .map(|candidate| candidate_phase(candidate).to_string())
+        .unwrap_or_else(|| "regex".to_string());
     if payload.success {
-        if same_candidate_set(&candidates, &session.pending_candidates) {
-            mark_runtime_candidates_cleared(session, &candidates)?;
-        }
+        mark_runtime_candidates_cleared(session, &candidates)?;
     } else if candidates.len() <= 1 {
         let reason = payload
             .error
@@ -5132,40 +7022,33 @@ async fn handle_plugin_diagnose_cleanup_step(
             .unwrap_or("插件运行验证失败");
         mark_runtime_candidates_issues(session, &candidates, reason)?;
     } else {
-        session.combo_fallback_groups.push(ComboFallbackGroup {
-            candidates: candidates.clone(),
-            issue_count_at_start: session.issue_items.len(),
-        });
-        queue_runtime_chunks(session, candidates);
+        queue_runtime_chunks(session, &phase, candidates)?;
     }
 
-    if let Some(response) = next_runtime_probe_response(&payload.session_id, session)? {
+    if let Some(response) = next_runtime_probe_response(state, &payload.session_id, session).await?
+    {
         Ok(serde_json::to_value(response)?)
     } else {
         save_diagnose_checkpoint(session, "completed")?;
         let response = completed_response(session, "completed");
+        restore_original_plugin_files(session)?;
         sessions.remove(&payload.session_id);
         Ok(serde_json::to_value(response)?)
     }
 }
 
-async fn handle_plugin_diagnose_cleanup_cancel(
-    state: &AppState,
-    payload: Value,
-) -> Result<Value> {
+async fn handle_plugin_diagnose_cleanup_cancel(state: &AppState, payload: Value) -> Result<Value> {
     let _guard = state.persistence_lock.lock().await;
     let payload: PluginDiagnoseCleanupCancelPayload = serde_json::from_value(payload)?;
     let mut sessions = state.diagnose_sessions.lock().await;
     if let Some(session) = sessions.remove(&payload.session_id) {
         save_diagnose_checkpoint(&session, "stopped")?;
+        restore_original_plugin_files(&session)?;
     }
     Ok(json!({ "state": true }))
 }
 
-async fn handle_plugin_diagnose_cleanup_apply(
-    state: &AppState,
-    payload: Value,
-) -> Result<Value> {
+async fn handle_plugin_diagnose_cleanup_apply(state: &AppState, payload: Value) -> Result<Value> {
     let _guard = state.persistence_lock.lock().await;
     let payload: PluginDiagnoseCleanupApplyPayload = serde_json::from_value(payload)?;
     let response = apply_diagnose_cleanup_blocking(payload)?;
@@ -5182,12 +7065,23 @@ fn apply_theme_settings_translations(css: &str, translations: &[Value]) -> Strin
             let mut new_block_content = block_content.to_string();
             for item in translations {
                 let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-                let source = item.get("source").and_then(Value::as_str).unwrap_or_default();
-                let target = item.get("target").and_then(Value::as_str).unwrap_or_default();
-                if item_type.is_empty() || source.is_empty() || target.is_empty() || source == target {
+                let source = item
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let target = item
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if item_type.is_empty()
+                    || source.is_empty()
+                    || target.is_empty()
+                    || source == target
+                {
                     continue;
                 }
-                new_block_content = replace_theme_setting_value(&new_block_content, item_type, source, target);
+                new_block_content =
+                    replace_theme_setting_value(&new_block_content, item_type, source, target);
             }
             format!("/* @settings{new_block_content}*/")
         })
@@ -5214,7 +7108,12 @@ fn replace_theme_setting_value(block: &str, item_type: &str, source: &str, targe
     output
 }
 
-fn replace_theme_setting_line(line: &str, item_type: &str, source: &str, target: &str) -> Option<String> {
+fn replace_theme_setting_line(
+    line: &str,
+    item_type: &str,
+    source: &str,
+    target: &str,
+) -> Option<String> {
     let indent_len = line.len() - line.trim_start_matches([' ', '\t']).len();
     let indent = &line[..indent_len];
     let rest = &line[indent_len..];
@@ -5224,14 +7123,24 @@ fn replace_theme_setting_line(line: &str, item_type: &str, source: &str, target:
         return None;
     }
     let mut value = rest[key_end + 1..].trim();
-    let quote = value.chars().next().filter(|ch| *ch == '\'' || *ch == '"').unwrap_or('\0');
+    let quote = value
+        .chars()
+        .next()
+        .filter(|ch| *ch == '\'' || *ch == '"')
+        .unwrap_or('\0');
     if quote != '\0' {
         value = value.strip_prefix(quote)?.strip_suffix(quote)?;
     }
     if value != source {
         return None;
     }
-    let quote_text = if quote == '\0' { "" } else if quote == '\'' { "'" } else { "\"" };
+    let quote_text = if quote == '\0' {
+        ""
+    } else if quote == '\'' {
+        "'"
+    } else {
+        "\""
+    };
     Some(format!("{indent}{key}: {quote_text}{target}{quote_text}"))
 }
 
@@ -5279,7 +7188,11 @@ fn handle_plugin_extract_blocking(payload: Value) -> Result<CompanionExtractResu
         let sources = ast
             .iter()
             .chain(regex.iter())
-            .filter_map(|item| item.get("source").and_then(Value::as_str).map(str::to_string))
+            .filter_map(|item| {
+                item.get("source")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
             .collect::<Vec<_>>();
         if is_chinese_skip_mode(&payload.settings, "extracted")
             && should_skip_chinese_by_extracted_items(&metadata_text, &sources)
@@ -5295,7 +7208,8 @@ fn handle_plugin_extract_blocking(payload: Value) -> Result<CompanionExtractResu
                 error: None,
             });
         }
-        let extraction_enabled = payload.settings.ast_extraction_enabled || payload.settings.re_extraction_enabled;
+        let extraction_enabled =
+            payload.settings.ast_extraction_enabled || payload.settings.re_extraction_enabled;
         if extraction_enabled && !has_extracted_translation_content(&sources) {
             return Ok(CompanionExtractResult {
                 status: "skipped".to_string(),
@@ -5369,13 +7283,15 @@ fn handle_theme_extract_blocking(payload: Value) -> Result<CompanionExtractResul
         let css_str = fs::read_to_string(&theme_css_path)
             .with_context(|| format!("failed to read {}", theme_css_path.display()))?;
         let manifest_path = PathBuf::from(&payload.theme_dir).join("manifest.json");
-        let manifest = read_json_file(&manifest_path).unwrap_or_else(|| json!({
-            "name": payload.theme_name.clone(),
-            "version": "0.0.0",
-            "minAppVersion": "",
-            "author": "",
-            "authorUrl": "",
-        }));
+        let manifest = read_json_file(&manifest_path).unwrap_or_else(|| {
+            json!({
+                "name": payload.theme_name.clone(),
+                "version": "0.0.0",
+                "minAppVersion": "",
+                "author": "",
+                "authorUrl": "",
+            })
+        });
         let theme_name = manifest
             .get("name")
             .and_then(Value::as_str)
@@ -5397,7 +7313,11 @@ fn handle_theme_extract_blocking(payload: Value) -> Result<CompanionExtractResul
         let dict = extract_theme_items(&css_str);
         let sources = dict
             .iter()
-            .filter_map(|item| item.get("source").and_then(Value::as_str).map(str::to_string))
+            .filter_map(|item| {
+                item.get("source")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
             .collect::<Vec<_>>();
         if is_chinese_skip_mode(&payload.settings, "extracted")
             && should_skip_chinese_by_extracted_items(theme_name, &sources)
@@ -5478,6 +7398,7 @@ fn paths(base_path: &str) -> PersistencePaths {
         batch_task_record_path: base_path.join("batch-task-records.json"),
         diagnose_checkpoint_path: base_path.join("diagnose-checkpoint.json"),
         diagnose_issue_record_path: base_path.join("diagnose-issues.json"),
+        diagnose_originals_dir: base_path.join("diagnose-originals"),
     }
 }
 
@@ -5513,7 +7434,10 @@ fn source_export_blocking(payload: SourceManagerPayload) -> Result<SourceImportE
     let meta = load_meta(&paths);
     let mut export_data = serde_json::Map::new();
     for source_id in payload.source_ids {
-        if let Some(source) = meta.pointer(&format!("/sources/{}", escape_pointer(&source_id))).cloned() {
+        if let Some(source) = meta
+            .pointer(&format!("/sources/{}", escape_pointer(&source_id)))
+            .cloned()
+        {
             if let Some(content) = read_translation(&paths, &source_id) {
                 export_data.insert(source_id, json!({ "meta": source, "content": content }));
             }
@@ -5536,7 +7460,9 @@ fn source_export_blocking(payload: SourceManagerPayload) -> Result<SourceImportE
 
 fn source_read_blocking(payload: SourceManagerPayload) -> Result<SourceImportExportResponse> {
     let paths = paths(&payload.persistence.base_path);
-    let source_id = payload.source_id.ok_or_else(|| anyhow!("sourceId missing"))?;
+    let source_id = payload
+        .source_id
+        .ok_or_else(|| anyhow!("sourceId missing"))?;
     let source = read_translation(&paths, &source_id).ok_or_else(|| anyhow!("翻译文件不存在"))?;
     Ok(SourceImportExportResponse {
         state: true,
@@ -5551,9 +7477,15 @@ fn source_read_blocking(payload: SourceManagerPayload) -> Result<SourceImportExp
 
 fn source_import_blocking(payload: SourceManagerPayload) -> Result<SourceImportExportResponse> {
     let paths = paths(&payload.persistence.base_path);
-    let encoded = payload.content_base64.ok_or_else(|| anyhow!("contentBase64 missing"))?;
+    let encoded = payload
+        .content_base64
+        .ok_or_else(|| anyhow!("contentBase64 missing"))?;
     let bytes = BASE64_STANDARD.decode(encoded)?;
-    let text = if payload.file_name.as_deref().is_some_and(|name| name.ends_with(".gz")) {
+    let text = if payload
+        .file_name
+        .as_deref()
+        .is_some_and(|name| name.ends_with(".gz"))
+    {
         let mut decoder = GzDecoder::new(bytes.as_slice());
         let mut output = String::new();
         decoder.read_to_string(&mut output)?;
@@ -5581,12 +7513,28 @@ fn source_import_blocking(payload: SourceManagerPayload) -> Result<SourceImportE
 
     if let Some(entries) = data.as_object() {
         for item in entries.values() {
-            let Some(mut source) = item.get("meta").cloned() else { continue; };
-            let Some(content) = item.get("content").cloned() else { continue; };
-            let Some(source_id) = source.get("id").and_then(Value::as_str).map(str::to_string) else { continue; };
-            let checksum = source.get("checksum").and_then(Value::as_str).unwrap_or_default().to_string();
+            let Some(mut source) = item.get("meta").cloned() else {
+                continue;
+            };
+            let Some(content) = item.get("content").cloned() else {
+                continue;
+            };
+            let Some(source_id) = source.get("id").and_then(Value::as_str).map(str::to_string)
+            else {
+                continue;
+            };
+            let checksum = source
+                .get("checksum")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             if let Some(existing) = sources.get(&source_id) {
-                if existing.get("checksum").and_then(Value::as_str).unwrap_or_default() == checksum {
+                if existing
+                    .get("checksum")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    == checksum
+                {
                     skipped_count += 1;
                     continue;
                 }
@@ -5625,13 +7573,19 @@ fn source_remove_blocking(payload: SourceManagerPayload) -> Result<SourceImportE
         for source_id in payload.source_ids {
             if let Some(source) = sources.remove(&source_id) {
                 deleted_count += 1;
-                let was_active = source.get("isActive").and_then(Value::as_bool).unwrap_or(false);
-                let plugin_id = source.get("plugin").and_then(Value::as_str).unwrap_or_default().to_string();
+                let was_active = source
+                    .get("isActive")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let plugin_id = source
+                    .get("plugin")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
                 if was_active {
-                    if let Some((_, replacement)) = sources
-                        .iter_mut()
-                        .find(|(_, item)| item.get("plugin").and_then(Value::as_str) == Some(plugin_id.as_str()))
-                    {
+                    if let Some((_, replacement)) = sources.iter_mut().find(|(_, item)| {
+                        item.get("plugin").and_then(Value::as_str) == Some(plugin_id.as_str())
+                    }) {
                         replacement["isActive"] = json!(true);
                     }
                 }
@@ -5657,7 +7611,9 @@ fn source_remove_blocking(payload: SourceManagerPayload) -> Result<SourceImportE
 
 fn source_set_active_blocking(payload: SourceManagerPayload) -> Result<SourceImportExportResponse> {
     let paths = paths(&payload.persistence.base_path);
-    let source_id = payload.source_id.ok_or_else(|| anyhow!("sourceId missing"))?;
+    let source_id = payload
+        .source_id
+        .ok_or_else(|| anyhow!("sourceId missing"))?;
     let active = payload.active.unwrap_or(true);
     let mut meta = load_meta(&paths);
     if let Some(sources) = meta.get_mut("sources").and_then(Value::as_object_mut) {
@@ -5671,7 +7627,9 @@ fn source_set_active_blocking(payload: SourceManagerPayload) -> Result<SourceImp
             if active {
                 for source in sources.values_mut() {
                     if source.get("plugin").and_then(Value::as_str) == Some(plugin_id.as_str()) {
-                        source["isActive"] = json!(source.get("id").and_then(Value::as_str) == Some(source_id.as_str()));
+                        source["isActive"] = json!(
+                            source.get("id").and_then(Value::as_str) == Some(source_id.as_str())
+                        );
                     }
                 }
             } else if let Some(source) = sources.get_mut(&source_id) {
@@ -5691,7 +7649,9 @@ fn source_set_active_blocking(payload: SourceManagerPayload) -> Result<SourceImp
     })
 }
 
-fn source_clear_batch_records_blocking(payload: SourceManagerPayload) -> Result<SourceImportExportResponse> {
+fn source_clear_batch_records_blocking(
+    payload: SourceManagerPayload,
+) -> Result<SourceImportExportResponse> {
     let paths = paths(&payload.persistence.base_path);
     let scope = payload.scope.as_deref();
     let mut record = load_record(&paths);
@@ -5759,7 +7719,10 @@ where
         .cloned()
         .unwrap_or_default();
     let original_len = existing.len();
-    let retained = existing.into_iter().filter(|item| keep(item)).collect::<Vec<_>>();
+    let retained = existing
+        .into_iter()
+        .filter(|item| keep(item))
+        .collect::<Vec<_>>();
     let removed = original_len.saturating_sub(retained.len());
     record[key] = Value::Array(retained);
     removed
@@ -5781,24 +7744,139 @@ fn save_translation(paths: &PersistencePaths, source_id: &str, content: &Value) 
     Ok(())
 }
 
+fn count_translation_items(dict: Option<&Value>) -> usize {
+    let Some(dict) = dict else {
+        return 0;
+    };
+    if let Some(plugin_dict) = dict.as_object() {
+        plugin_dict
+            .values()
+            .map(|file_dict| {
+                file_dict
+                    .get("ast")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0)
+                    + file_dict
+                        .get("regex")
+                        .and_then(Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or(0)
+            })
+            .sum()
+    } else {
+        dict.as_array().map(Vec::len).unwrap_or(0)
+    }
+}
+
+fn backup_translation_source(paths: &PersistencePaths, source_id: &str) -> Result<()> {
+    let source_path = paths.sources_dir.join(format!("{source_id}.json"));
+    if !source_path.exists() {
+        return Ok(());
+    }
+    let backup_path = paths
+        .sources_dir
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("backups")
+        .join("translations")
+        .join(format!("{source_id}.json.gz"));
+    if let Some(parent) = backup_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let content = fs::read(&source_path)?;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&content)?;
+    fs::write(&backup_path, encoder.finish()?)?;
+    Ok(())
+}
+
+fn save_translation_source_with_meta(
+    paths: &PersistencePaths,
+    source_id: &str,
+    translation_json: &Value,
+) -> Result<()> {
+    save_translation(paths, source_id, translation_json)?;
+    let mut meta = load_meta(paths);
+    if let Some(source) = meta
+        .get_mut("sources")
+        .and_then(Value::as_object_mut)
+        .and_then(|sources| sources.get_mut(source_id))
+    {
+        source["checksum"] = json!(calculate_checksum(translation_json)?);
+        source["updatedAt"] = json!(now_ms());
+        merge_metadata_index(source, translation_json, true);
+        merge_source_file_mtime(source, paths, source_id);
+        write_json_pretty(&paths.meta_path, &meta)?;
+    }
+    Ok(())
+}
+
+fn prepare_diagnose_translation(
+    paths: &PersistencePaths,
+    source_id: &str,
+    draft: Option<PluginDiagnoseDraftPayload>,
+) -> Result<Value> {
+    let mut translation_json =
+        read_translation(paths, source_id).ok_or_else(|| anyhow!("翻译文件不存在"))?;
+    let Some(draft) = draft else {
+        return Ok(translation_json);
+    };
+
+    let disk_count = count_translation_items(translation_json.get("dict"));
+    if let Some(dict) = draft.dict {
+        let draft_count = count_translation_items(Some(&dict));
+        if disk_count > 0 && draft_count == 0 {
+            bail!("运行前检查拒绝保存空草稿：磁盘翻译文件包含 {disk_count} 条翻译");
+        }
+        translation_json["dict"] = dict;
+    }
+    if let Some(metadata) = draft.metadata {
+        translation_json["metadata"] = metadata;
+    }
+
+    backup_translation_source(paths, source_id)?;
+    save_translation_source_with_meta(paths, source_id, &translation_json)?;
+    Ok(translation_json)
+}
+
 fn metadata_index(content: &Value) -> Value {
     let is_pending_translation = |item: &Value| {
-        let source = item.get("source").and_then(Value::as_str).unwrap_or_default().trim();
-        let target = item.get("target").and_then(Value::as_str).unwrap_or_default().trim();
+        let source = item
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        let target = item
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
         target.is_empty() || target == source
     };
     let is_translated_entry = |item: &Value| {
-        let source = item.get("source").and_then(Value::as_str).unwrap_or_default().trim();
-        let target = item.get("target").and_then(Value::as_str).unwrap_or_default().trim();
+        let source = item
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        let target = item
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
         !target.is_empty() && target != source
     };
 
-    let (format_valid, total_count, pending_count, translated_count) = if let Some(dict) = content.get("dict") {
+    let (format_valid, total_count, pending_count, translated_count) = if let Some(dict) =
+        content.get("dict")
+    {
         if let Some(plugin_dict) = dict.as_object() {
             let mut total = 0u64;
             let mut pending = 0u64;
             let mut translated = 0u64;
-            let mut valid = content.get("schemaVersion").is_some() && content.get("metadata").is_some();
+            let mut valid =
+                content.get("schemaVersion").is_some() && content.get("metadata").is_some();
             for group in plugin_dict.values() {
                 let ast = group.get("ast").and_then(Value::as_array);
                 let regex = group.get("regex").and_then(Value::as_array);
@@ -5818,8 +7896,14 @@ fn metadata_index(content: &Value) -> Value {
             (valid, total, pending, translated)
         } else if let Some(theme_items) = dict.as_array() {
             let total = theme_items.len() as u64;
-            let pending = theme_items.iter().filter(|item| is_pending_translation(item)).count() as u64;
-            let translated = theme_items.iter().filter(|item| is_translated_entry(item)).count() as u64;
+            let pending = theme_items
+                .iter()
+                .filter(|item| is_pending_translation(item))
+                .count() as u64;
+            let translated = theme_items
+                .iter()
+                .filter(|item| is_translated_entry(item))
+                .count() as u64;
             let valid = content.get("schemaVersion").is_some() && content.get("metadata").is_some();
             (valid, total, pending, translated)
         } else {
@@ -5851,9 +7935,12 @@ fn merge_metadata_index(source: &mut Value, content: &Value, preserve_processing
         for (key, value) in obj {
             if preserve_processing_state
                 && matches!(
-                key.as_str(),
-                "processedTranslationCount" | "unprocessedTranslationCount" | "translationProcessingComplete"
-            ) && source.get(key).is_some()
+                    key.as_str(),
+                    "processedTranslationCount"
+                        | "unprocessedTranslationCount"
+                        | "translationProcessingComplete"
+                )
+                && source.get(key).is_some()
             {
                 continue;
             }
@@ -5893,7 +7980,12 @@ fn installed_resource_sets(state: &AppState) -> (HashSet<String>, HashSet<String
         for entry in entries.flatten() {
             if entry.file_type().map(|item| item.is_dir()).unwrap_or(false) {
                 let plugin_id = read_json_file(&entry.path().join("manifest.json"))
-                    .and_then(|manifest| manifest.get("id").and_then(Value::as_str).map(str::to_string))
+                    .and_then(|manifest| {
+                        manifest
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
                     .unwrap_or_else(|| entry.file_name().to_string_lossy().to_string());
                 plugins.insert(plugin_id);
             }
@@ -5907,8 +7999,15 @@ fn installed_resource_sets(state: &AppState) -> (HashSet<String>, HashSet<String
             let name = entry.file_name().to_string_lossy().to_string();
             if entry.file_type().map(|item| item.is_dir()).unwrap_or(false) {
                 themes.insert(name);
-            } else if entry.file_type().map(|item| item.is_file()).unwrap_or(false)
-                && entry.path().extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("css"))
+            } else if entry
+                .file_type()
+                .map(|item| item.is_file())
+                .unwrap_or(false)
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("css"))
             {
                 if let Some(stem) = entry.path().file_stem().and_then(|stem| stem.to_str()) {
                     themes.insert(stem.to_string());
@@ -5920,9 +8019,19 @@ fn installed_resource_sets(state: &AppState) -> (HashSet<String>, HashSet<String
     (plugins, themes)
 }
 
-fn merge_source_install_state(source: &mut Value, installed_plugins: &HashSet<String>, installed_themes: &HashSet<String>) {
-    let plugin_id = source.get("plugin").and_then(Value::as_str).unwrap_or_default();
-    let source_type = source.get("type").and_then(Value::as_str).unwrap_or("plugin");
+fn merge_source_install_state(
+    source: &mut Value,
+    installed_plugins: &HashSet<String>,
+    installed_themes: &HashSet<String>,
+) {
+    let plugin_id = source
+        .get("plugin")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let source_type = source
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("plugin");
     let is_installed = if source_type == "theme" {
         installed_themes.contains(plugin_id)
     } else {
@@ -5931,7 +8040,10 @@ fn merge_source_install_state(source: &mut Value, installed_plugins: &HashSet<St
     source["isInstalled"] = json!(is_installed);
 }
 
-fn source_index_blocking(state: &AppState, payload: SourceManagerPayload) -> Result<SourceImportExportResponse> {
+fn source_index_blocking(
+    state: &AppState,
+    payload: SourceManagerPayload,
+) -> Result<SourceImportExportResponse> {
     let paths = paths(&payload.persistence.base_path);
     let mut meta = load_meta(&paths);
     let mut updated_count = 0usize;
@@ -6015,7 +8127,8 @@ async fn save_translated_source(
     source_id: &str,
     content: &Value,
 ) -> Result<SavedTranslationIndex> {
-    save_translated_source_with_processing_preservation(state, paths, source_id, content, false).await
+    save_translated_source_with_processing_preservation(state, paths, source_id, content, false)
+        .await
 }
 
 async fn save_translated_source_partial(
@@ -6024,7 +8137,8 @@ async fn save_translated_source_partial(
     source_id: &str,
     content: &Value,
 ) -> Result<SavedTranslationIndex> {
-    save_translated_source_with_processing_preservation(state, paths, source_id, content, true).await
+    save_translated_source_with_processing_preservation(state, paths, source_id, content, true)
+        .await
 }
 
 async fn save_translated_source_with_processing_preservation(
@@ -6045,8 +8159,16 @@ async fn save_translated_source_with_processing_preservation(
         let Some(source) = meta.pointer_mut(&format!("/sources/{source_id}")) else {
             return Ok(saved_index);
         };
-        let plugin = source.get("plugin").and_then(Value::as_str).unwrap_or_default().to_string();
-        let source_type = source.get("type").and_then(Value::as_str).unwrap_or("plugin").to_string();
+        let plugin = source
+            .get("plugin")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let source_type = source
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("plugin")
+            .to_string();
         source["title"] = content
             .pointer("/metadata/title")
             .cloned()
@@ -6055,12 +8177,18 @@ async fn save_translated_source_with_processing_preservation(
                     .get("title")
                     .cloned()
                     .unwrap_or(Value::String(String::new()))
-        });
+            });
         source["origin"] = json!("local");
         merge_metadata_index(source, content, preserve_processing_state);
         saved_index = SavedTranslationIndex {
-            total_count: source.get("totalTranslationCount").and_then(Value::as_u64).unwrap_or(0),
-            format_valid: source.get("translationFormatValid").and_then(Value::as_bool).unwrap_or(false),
+            total_count: source
+                .get("totalTranslationCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            format_valid: source
+                .get("translationFormatValid")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         };
         merge_source_file_mtime(source, paths, source_id);
         if let Some(obj) = source.as_object_mut() {
@@ -6077,9 +8205,14 @@ async fn save_translated_source_with_processing_preservation(
     if let Some(sources) = meta.get_mut("sources").and_then(Value::as_object_mut) {
         for existing in sources.values_mut() {
             if existing.get("plugin").and_then(Value::as_str) == Some(plugin.as_str())
-                && existing.get("type").and_then(Value::as_str).unwrap_or("plugin") == source_type
+                && existing
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("plugin")
+                    == source_type
             {
-                existing["isActive"] = json!(existing.get("id").and_then(Value::as_str) == Some(source_id));
+                existing["isActive"] =
+                    json!(existing.get("id").and_then(Value::as_str) == Some(source_id));
             }
         }
     }
@@ -6098,16 +8231,25 @@ async fn save_extracted_source(
     let _guard = state.persistence_lock.lock().await;
     let mut meta = load_meta(paths);
     let source_id = nanoid!(32);
-    let translation_version = content.pointer("/metadata/version").and_then(Value::as_str).unwrap_or_default();
+    let translation_version = content
+        .pointer("/metadata/version")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if let Some(sources) = meta.get_mut("sources").and_then(Value::as_object_mut) {
         if sources.values().any(|source| {
             source.get("plugin").and_then(Value::as_str) == Some(plugin_id)
                 && source.get("type").and_then(Value::as_str) == Some(source_type)
-                && source.get("translationVersion").and_then(Value::as_str) == Some(translation_version)
+                && source.get("translationVersion").and_then(Value::as_str)
+                    == Some(translation_version)
                 && source
                     .get("id")
                     .and_then(Value::as_str)
-                    .is_some_and(|existing_source_id| paths.sources_dir.join(format!("{existing_source_id}.json")).exists())
+                    .is_some_and(|existing_source_id| {
+                        paths
+                            .sources_dir
+                            .join(format!("{existing_source_id}.json"))
+                            .exists()
+                    })
         }) {
             return Ok(false);
         }
@@ -6277,7 +8419,8 @@ fn remove_completed_retry_items_from_record(
             .filter(|item| {
                 let key = RetryCompletedItemKey {
                     failure_id: failure_id.clone(),
-                    dict_index: item.get("dictIndex").and_then(Value::as_i64).unwrap_or(-1) as isize,
+                    dict_index: item.get("dictIndex").and_then(Value::as_i64).unwrap_or(-1)
+                        as isize,
                     file: non_empty_string(item.get("file")),
                     batch_type: batch_type.clone(),
                 };
@@ -6296,7 +8439,10 @@ fn remove_completed_retry_items_from_record(
     removed_failure_ids
 }
 
-fn load_retry_failures_for_scope(paths: &PersistencePaths, scope: &str) -> Vec<BatchTaskFailureRecord> {
+fn load_retry_failures_for_scope(
+    paths: &PersistencePaths,
+    scope: &str,
+) -> Vec<BatchTaskFailureRecord> {
     load_record(paths)
         .get("failures")
         .and_then(Value::as_array)
@@ -6468,7 +8614,8 @@ async fn replace_or_clear_completed_failures_for_source(
             for failure in failures.into_iter().rev() {
                 existing_failures.insert(
                     0,
-                    serde_json::to_value(build_failure_record(scope, failure)).unwrap_or(Value::Null),
+                    serde_json::to_value(build_failure_record(scope, failure))
+                        .unwrap_or(Value::Null),
                 );
             }
         }
@@ -6485,12 +8632,15 @@ async fn replace_or_clear_completed_failures_for_source(
                 && item.get("sourceId").and_then(Value::as_str) == Some(source_id))
         });
         if !resource_completed && !combined_success.is_empty() {
-            success_batches.insert(0, json!({
-                "scope": scope,
-                "sourceId": source_id,
-                "itemKeys": combined_success,
-                "updatedAt": now_ms(),
-            }));
+            success_batches.insert(
+                0,
+                json!({
+                    "scope": scope,
+                    "sourceId": source_id,
+                    "itemKeys": combined_success,
+                    "updatedAt": now_ms(),
+                }),
+            );
             success_batches.truncate(500);
         }
         record["successBatches"] = Value::Array(success_batches);
@@ -6665,8 +8815,14 @@ async fn handle_extract_batch(
                 if !object.contains_key("settings") {
                     object.insert("settings".to_string(), batch_settings.clone());
                 }
-                if scope == "plugin" && !object.contains_key("language") && !batch_language.is_empty() {
-                    object.insert("language".to_string(), Value::String(batch_language.clone()));
+                if scope == "plugin"
+                    && !object.contains_key("language")
+                    && !batch_language.is_empty()
+                {
+                    object.insert(
+                        "language".to_string(),
+                        Value::String(batch_language.clone()),
+                    );
                 }
             }
             let label = resource
@@ -6696,7 +8852,16 @@ async fn handle_extract_batch(
                         .and_then(Value::as_str)
                         .unwrap_or("plugin");
                     let content = result.content.unwrap_or(Value::Null);
-                    if save_extracted_source(&state, &paths, plugin_id, &content, title, source_type).await? {
+                    if save_extracted_source(
+                        &state,
+                        &paths,
+                        plugin_id,
+                        &content,
+                        title,
+                        source_type,
+                    )
+                    .await?
+                    {
                         bump_source_revision(&task).await;
                         increment_progress(&task, "successCount", 1).await;
                     } else {
@@ -6938,9 +9103,15 @@ async fn handle_batch_translate(
                 continue;
             };
             let pending = if is_plugin {
-                count_pending_plugin_items(&translation_json, batch.config.overwrite_existing_translations)
+                count_pending_plugin_items(
+                    &translation_json,
+                    batch.config.overwrite_existing_translations,
+                )
             } else {
-                count_pending_theme_items(&translation_json, batch.config.overwrite_existing_translations)
+                count_pending_theme_items(
+                    &translation_json,
+                    batch.config.overwrite_existing_translations,
+                )
             };
             if pending == 0 {
                 mark_batch_translate_resource_completed(
@@ -6994,7 +9165,9 @@ async fn handle_batch_translate(
                 );
             }
             let added_items = ast_items.len() + regex_items.len() + theme_items.len()
-                - before_ast_items - before_regex_items - before_theme_items;
+                - before_ast_items
+                - before_regex_items
+                - before_theme_items;
             if added_items == 0 {
                 mark_batch_translate_resource_completed(
                     state,
@@ -7010,14 +9183,23 @@ async fn handle_batch_translate(
                 .await?;
                 continue;
             }
-            resource_state.all_items = collect_all_item_keys(&resource_state.translation_json, is_plugin);
+            resource_state.all_items =
+                collect_all_item_keys(&resource_state.translation_json, is_plugin);
             resource_state.pending_items = if is_plugin {
-                ast_items[before_ast_items..].iter()
+                ast_items[before_ast_items..]
+                    .iter()
                     .map(|item| compact_success_item_key(item, "ast", true))
-                    .chain(regex_items[before_regex_items..].iter().map(|item| compact_success_item_key(item, "regex", true)))
+                    .chain(
+                        regex_items[before_regex_items..]
+                            .iter()
+                            .map(|item| compact_success_item_key(item, "regex", true)),
+                    )
                     .collect()
             } else {
-                theme_items[before_theme_items..].iter().map(|item| compact_success_item_key(item, "theme", false)).collect()
+                theme_items[before_theme_items..]
+                    .iter()
+                    .map(|item| compact_success_item_key(item, "theme", false))
+                    .collect()
             };
             pending_items_in_window += added_items;
             resource_states.push(resource_state);
@@ -7189,7 +9371,11 @@ async fn process_batch_translate_window(
 
     for resource_state in resource_states {
         ensure_not_cancelled(task).await?;
-        touch_progress(task, json!({ "currentLabel": resource_state.resource.label })).await;
+        touch_progress(
+            task,
+            json!({ "currentLabel": resource_state.resource.label }),
+        )
+        .await;
         let saved_index = save_translated_source(
             state,
             paths,
@@ -7238,7 +9424,11 @@ async fn process_batch_translate_window(
     Ok(())
 }
 
-fn translate_window_item_limit(batch_size: usize, concurrency: usize, window_multiplier: usize) -> usize {
+fn translate_window_item_limit(
+    batch_size: usize,
+    concurrency: usize,
+    window_multiplier: usize,
+) -> usize {
     batch_size.max(1) * concurrency.max(1) * window_multiplier.max(1)
 }
 
@@ -7302,7 +9492,11 @@ fn stop_if_batch_translate_failures_exceed_limit(
     config: &CompanionTranslationConfig,
     phase: &str,
 ) -> Result<()> {
-    if !should_stop_batch_translate_for_failures(failed_items, config.batch_size, config.concurrency) {
+    if !should_stop_batch_translate_for_failures(
+        failed_items,
+        config.batch_size,
+        config.concurrency,
+    ) {
         return Ok(());
     }
     bail!(
@@ -7360,7 +9554,8 @@ fn collect_plugin_packed_items(
         for (file, file_dict) in dict {
             if let Some(ast) = file_dict.get("ast").and_then(Value::as_array) {
                 for (index, item) in ast.iter().enumerate() {
-                    if should_translate(item.get("target"), item.get("source"), overwrite_existing) {
+                    if should_translate(item.get("target"), item.get("source"), overwrite_existing)
+                    {
                         ast_items.push(json!({
                             "id": *ast_id,
                             "resourceStateIndex": resource_state_index,
@@ -7377,7 +9572,8 @@ fn collect_plugin_packed_items(
             }
             if let Some(regex) = file_dict.get("regex").and_then(Value::as_array) {
                 for (index, item) in regex.iter().enumerate() {
-                    if should_translate(item.get("target"), item.get("source"), overwrite_existing) {
+                    if should_translate(item.get("target"), item.get("source"), overwrite_existing)
+                    {
                         regex_items.push(json!({
                             "id": *regex_id,
                             "resourceStateIndex": resource_state_index,
@@ -7513,12 +9709,19 @@ where
                     runtime.batch_type,
                     runtime.is_plugin,
                 );
-                report.translated_items.extend(batch_report.translated_items);
+                report
+                    .translated_items
+                    .extend(batch_report.translated_items);
                 report.failures.extend(batch_report.failures);
                 if failed_count > 0 {
-                    flush_changed_resource_states(runtime.state, runtime.paths, resource_states).await?;
+                    flush_changed_resource_states(runtime.state, runtime.paths, resource_states)
+                        .await?;
                 }
-                if should_stop_batch_translate_for_failures(failed_items, config.batch_size, config.concurrency) {
+                if should_stop_batch_translate_for_failures(
+                    failed_items,
+                    config.batch_size,
+                    config.concurrency,
+                ) {
                     stop_scheduling = true;
                 }
             }
@@ -7555,7 +9758,11 @@ where
                 );
                 report.failures.extend(batch_report.failures);
                 failed_items += batch_failed_count;
-                if should_stop_batch_translate_for_failures(failed_items, config.batch_size, config.concurrency) {
+                if should_stop_batch_translate_for_failures(
+                    failed_items,
+                    config.batch_size,
+                    config.concurrency,
+                ) {
                     stop_scheduling = true;
                 }
             }
@@ -7601,10 +9808,7 @@ where
     Ok(report)
 }
 
-fn packed_batch_report(
-    batch: Vec<Value>,
-    translated: Vec<TranslationPair>,
-) -> PackedBatchReport {
+fn packed_batch_report(batch: Vec<Value>, translated: Vec<TranslationPair>) -> PackedBatchReport {
     let mut report = PackedBatchReport {
         translated_items: Vec::new(),
         failures: Vec::new(),
@@ -7652,7 +9856,9 @@ fn merge_successful_packed_response(
     translated: Vec<TranslationPair>,
 ) {
     let batch_report = packed_batch_report(batch, translated);
-    report.translated_items.extend(batch_report.translated_items);
+    report
+        .translated_items
+        .extend(batch_report.translated_items);
     report.failures.extend(batch_report.failures);
 }
 
@@ -7692,7 +9898,9 @@ fn apply_packed_translation_report(
             *target_slot = Value::String(target.to_string());
             resource_state.processed_items += 1;
             resource_state.dirty = true;
-            resource_state.success_items.push(compact_success_item_key(&item, batch_type, is_plugin));
+            resource_state
+                .success_items
+                .push(compact_success_item_key(&item, batch_type, is_plugin));
         }
     }
 
@@ -7733,7 +9941,10 @@ async fn flush_changed_resource_states(
 }
 
 fn compact_success_item_key(item: &Value, batch_type: &str, is_plugin: bool) -> String {
-    let index = item.get("dictIndex").and_then(Value::as_u64).unwrap_or(usize::MAX as u64);
+    let index = item
+        .get("dictIndex")
+        .and_then(Value::as_u64)
+        .unwrap_or(usize::MAX as u64);
     if is_plugin {
         let file = item.get("file").and_then(Value::as_str).unwrap_or_default();
         format!("{file}\t{batch_type}\t{index}")
@@ -7822,7 +10033,8 @@ async fn handle_plugin_translate(
         for (file, file_dict) in dict {
             if let Some(ast) = file_dict.get("ast").and_then(Value::as_array) {
                 for (index, item) in ast.iter().enumerate() {
-                    if should_translate(item.get("target"), item.get("source"), overwrite_existing) {
+                    if should_translate(item.get("target"), item.get("source"), overwrite_existing)
+                    {
                         ast_items.push(json!({ "id": next_id, "file": file, "dictIndex": index, "type": item.get("type").and_then(Value::as_str).unwrap_or(""), "name": item.get("name").and_then(Value::as_str).unwrap_or(""), "source": item.get("source").and_then(Value::as_str).unwrap_or(""), "target": item.get("target").and_then(Value::as_str).unwrap_or("") }));
                         next_id += 1;
                     }
@@ -7830,7 +10042,8 @@ async fn handle_plugin_translate(
             }
             if let Some(regex) = file_dict.get("regex").and_then(Value::as_array) {
                 for (index, item) in regex.iter().enumerate() {
-                    if should_translate(item.get("target"), item.get("source"), overwrite_existing) {
+                    if should_translate(item.get("target"), item.get("source"), overwrite_existing)
+                    {
                         regex_items.push(json!({ "id": next_id, "file": file, "dictIndex": index, "source": item.get("source").and_then(Value::as_str).unwrap_or(""), "target": item.get("target").and_then(Value::as_str).unwrap_or("") }));
                         next_id += 1;
                     }
@@ -8123,10 +10336,8 @@ where
                     report.translated_items.push(mapped);
                 }
                 if !failed_items.is_empty() {
-                    report.push_failure(
-                        "翻译返回缺少部分条目或包含空译文".to_string(),
-                        failed_items,
-                    );
+                    report
+                        .push_failure("翻译返回缺少部分条目或包含空译文".to_string(), failed_items);
                 }
             }
             Err(error) if error.to_string().contains(MANUAL_STOP) => return Err(error),
@@ -8167,7 +10378,11 @@ where
     Ok(report)
 }
 
-fn split_translation_batches(items: &[Value], batch_size: usize, batch_char_limit: usize) -> Vec<Vec<Value>> {
+fn split_translation_batches(
+    items: &[Value],
+    batch_size: usize,
+    batch_char_limit: usize,
+) -> Vec<Vec<Value>> {
     let batch_size = batch_size.max(1);
     let mut batches = Vec::new();
     for batch in items.chunks(batch_size) {
@@ -8297,7 +10512,8 @@ async fn call_chat_completion(
         .map_err(|error| normalize_ai_error(error, started, timeout_ms))?;
     let status = response.status();
     let status_text = status.canonical_reason().unwrap_or_default().to_string();
-    let text = read_response_text_with_first_chunk_timeout(&mut response, started, timeout_ms).await?;
+    let text =
+        read_response_text_with_first_chunk_timeout(&mut response, started, timeout_ms).await?;
     let body = normalize_streaming_response_text(&text);
     if !status.is_success() {
         let mut message = format!(
@@ -8434,8 +10650,13 @@ async fn read_response_text_with_first_chunk_timeout(
         bytes.extend_from_slice(&chunk);
     }
 
-    String::from_utf8(bytes)
-        .map_err(|error| anyhow!("AI 返回非 UTF-8 响应（耗时 {}）：{}", format_duration(now_ms() - started), error))
+    String::from_utf8(bytes).map_err(|error| {
+        anyhow!(
+            "AI 返回非 UTF-8 响应（耗时 {}）：{}",
+            format_duration(now_ms() - started),
+            error
+        )
+    })
 }
 
 fn response_text_has_activity_delta(bytes: &[u8]) -> bool {
@@ -8596,11 +10817,7 @@ fn raw_t_field_until_object_end(text: &str, start: usize) -> Option<String> {
             continue;
         }
         let quote_end = start + offset + ch.len_utf8();
-        if text
-            .get(quote_end..)?
-            .trim_start()
-            .starts_with('}')
-        {
+        if text.get(quote_end..)?.trim_start().starts_with('}') {
             return text.get(start..start + offset).map(str::to_string);
         }
     }
@@ -8639,7 +10856,11 @@ fn extract_translation_array(value: &Value) -> Result<Vec<TranslationPair>> {
         .collect())
 }
 
-fn should_translate(target: Option<&Value>, source: Option<&Value>, overwrite_existing: bool) -> bool {
+fn should_translate(
+    target: Option<&Value>,
+    source: Option<&Value>,
+    overwrite_existing: bool,
+) -> bool {
     let target = target.and_then(Value::as_str).unwrap_or_default();
     let source = source.and_then(Value::as_str).unwrap_or_default();
     overwrite_existing || target.trim().is_empty() || target == source
@@ -8658,7 +10879,11 @@ fn count_pending_plugin_items(json: &Value, overwrite_existing: bool) -> usize {
                             items
                                 .iter()
                                 .filter(|item| {
-                                    should_translate(item.get("target"), item.get("source"), overwrite_existing)
+                                    should_translate(
+                                        item.get("target"),
+                                        item.get("source"),
+                                        overwrite_existing,
+                                    )
                                 })
                                 .count()
                         })
@@ -8670,7 +10895,11 @@ fn count_pending_plugin_items(json: &Value, overwrite_existing: bool) -> usize {
                             items
                                 .iter()
                                 .filter(|item| {
-                                    should_translate(item.get("target"), item.get("source"), overwrite_existing)
+                                    should_translate(
+                                        item.get("target"),
+                                        item.get("source"),
+                                        overwrite_existing,
+                                    )
                                 })
                                 .count()
                         })
@@ -8688,7 +10917,9 @@ fn count_pending_theme_items(json: &Value, overwrite_existing: bool) -> usize {
         .map(|items| {
             items
                 .iter()
-                .filter(|item| should_translate(item.get("target"), item.get("source"), overwrite_existing))
+                .filter(|item| {
+                    should_translate(item.get("target"), item.get("source"), overwrite_existing)
+                })
                 .count()
         })
         .unwrap_or(0)
@@ -9047,11 +11278,20 @@ async fn handle_failure_retry(
             let first = failures.first().cloned().context("empty failure group")?;
             touch_progress(&task, json!({ "currentLabel": first.resource_label })).await;
             let Some(mut translation_json) = read_translation(&paths, &first.source_id) else {
-                let skipped_ids = failures.iter().map(|failure| failure.id.clone()).collect::<Vec<_>>();
+                let skipped_ids = failures
+                    .iter()
+                    .map(|failure| failure.id.clone())
+                    .collect::<Vec<_>>();
                 remove_failures(state, &paths, &skipped_ids).await?;
-                increment_progress(&task, "processedItems", retry_failure_item_count(&failures)).await;
+                increment_progress(&task, "processedItems", retry_failure_item_count(&failures))
+                    .await;
                 increment_progress(&task, "skippedCount", failures.len()).await;
-                increment_progress(&task, "processedResources", count_new_retry_failures(&mut processed_retry_ids, &failures)).await;
+                increment_progress(
+                    &task,
+                    "processedResources",
+                    count_new_retry_failures(&mut processed_retry_ids, &failures),
+                )
+                .await;
                 bump_record_revision(&task).await;
                 continue;
             };
@@ -9086,7 +11326,10 @@ async fn handle_failure_retry(
             }
             if let Some(failed_ids) = result.get("failedFailureIds").and_then(Value::as_array) {
                 for failure_id in failed_ids.iter().filter_map(Value::as_str) {
-                    if !completed_failure_ids.iter().any(|completed| completed == failure_id) {
+                    if !completed_failure_ids
+                        .iter()
+                        .any(|completed| completed == failure_id)
+                    {
                         failed_retry_ids.insert(failure_id.to_string());
                     }
                 }
@@ -9102,12 +11345,7 @@ async fn handle_failure_retry(
                     .saturating_sub(processed_items_after.saturating_sub(processed_items_before)),
             )
             .await;
-            increment_progress(
-                &task,
-                "successCount",
-                completed_failure_ids.len(),
-            )
-            .await;
+            increment_progress(&task, "successCount", completed_failure_ids.len()).await;
             increment_progress(
                 &task,
                 "skippedCount",
@@ -9118,7 +11356,12 @@ async fn handle_failure_retry(
                     .unwrap_or(0),
             )
             .await;
-            increment_progress(&task, "processedResources", count_new_retry_failures(&mut processed_retry_ids, &failures)).await;
+            increment_progress(
+                &task,
+                "processedResources",
+                count_new_retry_failures(&mut processed_retry_ids, &failures),
+            )
+            .await;
             bump_source_revision(&task).await;
             bump_record_revision(&task).await;
         }
@@ -9131,8 +11374,14 @@ fn retry_failure_item_count(failures: &[BatchTaskFailureRecord]) -> usize {
     failures.iter().map(|failure| failure.items.len()).sum()
 }
 
-fn count_new_retry_failures(seen: &mut HashSet<String>, failures: &[BatchTaskFailureRecord]) -> usize {
-    failures.iter().filter(|failure| seen.insert(failure.id.clone())).count()
+fn count_new_retry_failures(
+    seen: &mut HashSet<String>,
+    failures: &[BatchTaskFailureRecord],
+) -> usize {
+    failures
+        .iter()
+        .filter(|failure| seen.insert(failure.id.clone()))
+        .count()
 }
 
 fn calculate_checksum(value: &Value) -> Result<String> {
@@ -9292,7 +11541,11 @@ mod tests {
         let flattened = batches
             .iter()
             .flatten()
-            .map(|item| item.get("source").and_then(Value::as_str).unwrap_or_default())
+            .map(|item| {
+                item.get("source")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            })
             .collect::<Vec<_>>();
         assert_eq!(flattened, vec!["abcd", "efgh", "ijk", "lmn", "op"]);
     }
@@ -9318,8 +11571,7 @@ mod tests {
     #[test]
     fn parse_translation_response_reads_malformed_t_field_raw() {
         let items =
-            parse_translation_response(r#"{"items":[{"i":350,"t":""text:sdjifsjk"}]}"#)
-                .unwrap();
+            parse_translation_response(r#"{"items":[{"i":350,"t":""text:sdjifsjk"}]}"#).unwrap();
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].i, 350);
@@ -9328,10 +11580,8 @@ mod tests {
 
     #[test]
     fn parse_translation_response_raw_fallback_does_not_unescape() {
-        let items = parse_translation_response(
-            r#"{"items":[{"i":350,"t":"line\nraw"broken"}]}"#,
-        )
-        .unwrap();
+        let items =
+            parse_translation_response(r#"{"items":[{"i":350,"t":"line\nraw"broken"}]}"#).unwrap();
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].t, r#"line\nraw"broken"#);
@@ -9380,7 +11630,10 @@ mod tests {
                 .and_then(Value::as_array)
                 .unwrap()
                 .iter()
-                .map(|item| item.get("source").and_then(Value::as_str).unwrap_or_default())
+                .map(|item| item
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default())
                 .collect::<Vec<_>>(),
             vec!["Hello", "Tip", "Okay"]
         );
@@ -9460,7 +11713,10 @@ mod tests {
                 .and_then(Value::as_array)
                 .unwrap()
                 .iter()
-                .map(|item| item.get("source").and_then(Value::as_str).unwrap_or_default())
+                .map(|item| item
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default())
                 .collect::<Vec<_>>(),
             vec!["Hello", "Tip", "Okay"]
         );
@@ -9560,7 +11816,11 @@ mod tests {
         let baseline_probe = start.probe.unwrap();
         assert_eq!(baseline_probe.label, "原始运行验证");
         assert_eq!(baseline_probe.files.len(), 1);
-        assert_eq!(baseline_probe.files[0].code, original_code);
+        assert!(baseline_probe.files[0].code.is_none());
+        assert_eq!(
+            fs::read_to_string(plugin_dir.join("main.js")).unwrap(),
+            original_code
+        );
 
         let after_baseline_value = handle_plugin_diagnose_cleanup_step(
             &state,
@@ -9576,9 +11836,11 @@ mod tests {
             serde_json::from_value(after_baseline_value).unwrap();
         assert_eq!(after_baseline.status, "probe");
         let full_probe = after_baseline.probe.unwrap();
-        assert_eq!(full_probe.label, "全量运行验证");
-        assert!(full_probe.files[0].code.contains("甲"));
-        assert!(full_probe.files[0].code.contains("乙"));
+        assert_eq!(full_probe.label, "Regex 全量运行验证");
+        assert!(full_probe.files[0].code.is_none());
+        let full_code = fs::read_to_string(plugin_dir.join("main.js")).unwrap();
+        assert!(full_code.contains("甲"));
+        assert!(full_code.contains("乙"));
 
         let after_failed_full_value = handle_plugin_diagnose_cleanup_step(
             &state,
@@ -9595,8 +11857,9 @@ mod tests {
             serde_json::from_value(after_failed_full_value).unwrap();
         assert_eq!(after_failed_full.status, "probe");
         let split_probe = after_failed_full.probe.unwrap();
-        assert_eq!(split_probe.label, "分组运行验证");
-        let split_code = &split_probe.files[0].code;
+        assert_eq!(split_probe.label, "Regex 分组运行验证");
+        assert!(split_probe.files[0].code.is_none());
+        let split_code = fs::read_to_string(plugin_dir.join("main.js")).unwrap();
         assert_ne!(split_code.contains("甲"), split_code.contains("乙"));
 
         let after_failed_single_value = handle_plugin_diagnose_cleanup_step(
@@ -9628,6 +11891,635 @@ mod tests {
         let _ = fs::remove_dir_all(&base_path);
     }
 
+    #[tokio::test]
+    async fn runtime_diagnose_runs_ast_before_regex_and_reports_progress() {
+        let base_path = env::temp_dir().join(format!("i18n-runtime-phase-diagnose-{}", nanoid!()));
+        let _ = fs::remove_dir_all(&base_path);
+        let plugin_dir = base_path.join("demo-plugin");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        let original_code =
+            r#"const title = "A1"; const subtitle = "A2"; console.log("R1"); console.log("R2");"#;
+        fs::write(plugin_dir.join("main.js"), original_code).unwrap();
+
+        let paths = paths(base_path.to_str().unwrap());
+        let source_id = "source-phase";
+        let translation_json = json!({
+            "schemaVersion": 1,
+            "metadata": {
+                "plugin": "demo-plugin",
+                "language": "zh-CN",
+                "version": "1.0.0",
+                "supportedVersions": "*",
+                "title": "Demo",
+                "description": "",
+                "author": ""
+            },
+            "dict": {
+                "main.js": {
+                    "ast": [
+                        { "type": "VariableDeclarator", "name": "title", "source": "A1", "target": "AX1" },
+                        { "type": "VariableDeclarator", "name": "subtitle", "source": "A2", "target": "AX2" }
+                    ],
+                    "regex": [
+                        { "source": "R1", "target": "RX1" },
+                        { "source": "R2", "target": "RX2" }
+                    ]
+                }
+            }
+        });
+        save_translation(&paths, source_id, &translation_json).unwrap();
+
+        let state = AppState {
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            diagnose_sessions: Arc::new(Mutex::new(HashMap::new())),
+            persistence_lock: Arc::new(Mutex::new(())),
+            plugin_dir: base_path.clone(),
+            http: reqwest::Client::new(),
+            shutdown: Arc::new(Mutex::new(None)),
+        };
+
+        let start_value = handle_plugin_diagnose_cleanup_start(
+            &state,
+            json!({
+                "pluginId": "demo-plugin",
+                "pluginDir": plugin_dir.to_string_lossy(),
+                "backupBasePath": base_path.to_string_lossy(),
+                "persistence": { "basePath": base_path.to_string_lossy() },
+                "translationSourceId": source_id,
+                "applyAst": true,
+                "applyRegex": true,
+                "runtimeProbe": true,
+                "isApplied": false
+            }),
+        )
+        .await
+        .unwrap();
+        let start: PluginDiagnoseCleanupResponse = serde_json::from_value(start_value).unwrap();
+        let baseline_probe = start.probe.unwrap();
+        let after_baseline_value = handle_plugin_diagnose_cleanup_step(
+            &state,
+            json!({
+                "sessionId": start.session_id.unwrap(),
+                "probeId": baseline_probe.probe_id,
+                "success": true
+            }),
+        )
+        .await
+        .unwrap();
+        let after_baseline: PluginDiagnoseCleanupResponse =
+            serde_json::from_value(after_baseline_value).unwrap();
+        assert_eq!(after_baseline.progress.phase, "ast");
+        assert_eq!(after_baseline.progress.queue_groups, 1);
+        assert_eq!(after_baseline.progress.current_group_items, 2);
+        let ast_probe = after_baseline.probe.unwrap();
+        assert_eq!(ast_probe.label, "AST 全量运行验证");
+        assert!(ast_probe.files[0].code.is_none());
+        let ast_code = fs::read_to_string(plugin_dir.join("main.js")).unwrap();
+        assert!(ast_code.contains("AX1"));
+        assert!(ast_code.contains("AX2"));
+        assert!(!ast_code.contains("RX1"));
+        assert!(!ast_code.contains("RX2"));
+
+        let after_ast_value = handle_plugin_diagnose_cleanup_step(
+            &state,
+            json!({
+                "sessionId": after_baseline.session_id.unwrap(),
+                "probeId": ast_probe.probe_id,
+                "success": true
+            }),
+        )
+        .await
+        .unwrap();
+        let after_ast: PluginDiagnoseCleanupResponse =
+            serde_json::from_value(after_ast_value).unwrap();
+        assert_eq!(after_ast.progress.phase, "regex");
+        assert_eq!(after_ast.progress.queue_groups, 1);
+        assert_eq!(after_ast.progress.current_group_items, 2);
+        assert!(after_ast.cleared_items.is_empty());
+        let regex_probe = after_ast.probe.unwrap();
+        assert_eq!(regex_probe.label, "Regex 全量运行验证");
+        assert!(regex_probe.files[0].code.is_none());
+        let regex_code = fs::read_to_string(plugin_dir.join("main.js")).unwrap();
+        assert!(regex_code.contains("RX1"));
+        assert!(regex_code.contains("RX2"));
+        assert!(!regex_code.contains("AX1"));
+        assert!(!regex_code.contains("AX2"));
+
+        let _ = fs::remove_dir_all(&base_path);
+    }
+
+    #[tokio::test]
+    async fn runtime_diagnose_uses_breadth_first_queue_and_resumes_checkpoint() {
+        let base_path = env::temp_dir().join(format!("i18n-runtime-bfs-diagnose-{}", nanoid!()));
+        let _ = fs::remove_dir_all(&base_path);
+        let plugin_dir = base_path.join("demo-plugin");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        let original_code =
+            r#"console.log("R1"); console.log("R2"); console.log("R3"); console.log("R4");"#;
+        fs::write(plugin_dir.join("main.js"), original_code).unwrap();
+
+        let paths = paths(base_path.to_str().unwrap());
+        let source_id = "source-bfs";
+        let translation_json = json!({
+            "schemaVersion": 1,
+            "metadata": {
+                "plugin": "demo-plugin",
+                "language": "zh-CN",
+                "version": "1.0.0",
+                "supportedVersions": "*",
+                "title": "Demo",
+                "description": "",
+                "author": ""
+            },
+            "dict": {
+                "main.js": {
+                    "ast": [],
+                    "regex": [
+                        { "source": "R1", "target": "RX1" },
+                        { "source": "R2", "target": "RX2" },
+                        { "source": "R3", "target": "RX3" },
+                        { "source": "R4", "target": "RX4" }
+                    ]
+                }
+            }
+        });
+        save_translation(&paths, source_id, &translation_json).unwrap();
+
+        let state = AppState {
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            diagnose_sessions: Arc::new(Mutex::new(HashMap::new())),
+            persistence_lock: Arc::new(Mutex::new(())),
+            plugin_dir: base_path.clone(),
+            http: reqwest::Client::new(),
+            shutdown: Arc::new(Mutex::new(None)),
+        };
+
+        let start_value = handle_plugin_diagnose_cleanup_start(
+            &state,
+            json!({
+                "pluginId": "demo-plugin",
+                "pluginDir": plugin_dir.to_string_lossy(),
+                "backupBasePath": base_path.to_string_lossy(),
+                "persistence": { "basePath": base_path.to_string_lossy() },
+                "translationSourceId": source_id,
+                "applyAst": true,
+                "applyRegex": true,
+                "runtimeProbe": true,
+                "isApplied": false
+            }),
+        )
+        .await
+        .unwrap();
+        let start: PluginDiagnoseCleanupResponse = serde_json::from_value(start_value).unwrap();
+        let baseline_probe = start.probe.unwrap();
+        let full_value = handle_plugin_diagnose_cleanup_step(
+            &state,
+            json!({
+                "sessionId": start.session_id.unwrap(),
+                "probeId": baseline_probe.probe_id,
+                "success": true
+            }),
+        )
+        .await
+        .unwrap();
+        let full: PluginDiagnoseCleanupResponse = serde_json::from_value(full_value).unwrap();
+        let full_probe = full.probe.unwrap();
+        assert_eq!(full.progress.phase, "regex");
+        assert_eq!(full.progress.current_group_items, 4);
+
+        let first_half_value = handle_plugin_diagnose_cleanup_step(
+            &state,
+            json!({
+                "sessionId": full.session_id.unwrap(),
+                "probeId": full_probe.probe_id,
+                "success": false,
+                "error": "full failed"
+            }),
+        )
+        .await
+        .unwrap();
+        let first_half: PluginDiagnoseCleanupResponse =
+            serde_json::from_value(first_half_value).unwrap();
+        let first_half_probe = first_half.probe.unwrap();
+        assert_eq!(first_half.progress.queue_groups, 2);
+        assert_eq!(first_half.progress.current_group_items, 2);
+        assert!(first_half_probe.files[0].code.is_none());
+        let first_half_code = fs::read_to_string(plugin_dir.join("main.js")).unwrap();
+        assert!(first_half_code.contains("RX1"));
+        assert!(first_half_code.contains("RX2"));
+        assert!(!first_half_code.contains("RX3"));
+        assert!(!first_half_code.contains("RX4"));
+
+        let second_half_value = handle_plugin_diagnose_cleanup_step(
+            &state,
+            json!({
+                "sessionId": first_half.session_id.unwrap(),
+                "probeId": first_half_probe.probe_id,
+                "success": false,
+                "error": "first half failed"
+            }),
+        )
+        .await
+        .unwrap();
+        let second_half: PluginDiagnoseCleanupResponse =
+            serde_json::from_value(second_half_value).unwrap();
+        let second_half_probe = second_half.probe.unwrap();
+        assert_eq!(second_half.progress.queue_groups, 3);
+        assert_eq!(second_half.progress.current_group_items, 2);
+        assert!(second_half_probe.files[0].code.is_none());
+        let second_half_code = fs::read_to_string(plugin_dir.join("main.js")).unwrap();
+        assert!(!second_half_code.contains("RX1"));
+        assert!(!second_half_code.contains("RX2"));
+        assert!(second_half_code.contains("RX3"));
+        assert!(second_half_code.contains("RX4"));
+
+        let first_single_value = handle_plugin_diagnose_cleanup_step(
+            &state,
+            json!({
+                "sessionId": second_half.session_id.unwrap(),
+                "probeId": second_half_probe.probe_id,
+                "success": true
+            }),
+        )
+        .await
+        .unwrap();
+        let first_single: PluginDiagnoseCleanupResponse =
+            serde_json::from_value(first_single_value).unwrap();
+        assert!(first_single.cleared_items.is_empty());
+        assert_eq!(first_single.progress.current_group_items, 1);
+        let checkpoint = load_json_or(&paths.diagnose_checkpoint_path, Value::Null);
+        assert_eq!(
+            checkpoint.get("schemaVersion").and_then(Value::as_u64),
+            Some(3)
+        );
+        assert!(checkpoint.get("clearedItems").is_none());
+        assert_eq!(
+            checkpoint
+                .pointer("/clearedRanges/regex/main.js/0")
+                .cloned(),
+            Some(json!([2, 3]))
+        );
+
+        handle_plugin_diagnose_cleanup_cancel(
+            &state,
+            json!({ "sessionId": first_single.session_id.clone().unwrap() }),
+        )
+        .await
+        .unwrap();
+
+        let resumed_start_value = handle_plugin_diagnose_cleanup_start(
+            &state,
+            json!({
+                "pluginId": "demo-plugin",
+                "pluginDir": plugin_dir.to_string_lossy(),
+                "backupBasePath": base_path.to_string_lossy(),
+                "persistence": { "basePath": base_path.to_string_lossy() },
+                "translationSourceId": source_id,
+                "applyAst": true,
+                "applyRegex": true,
+                "runtimeProbe": true,
+                "isApplied": false
+            }),
+        )
+        .await
+        .unwrap();
+        let resumed_start: PluginDiagnoseCleanupResponse =
+            serde_json::from_value(resumed_start_value).unwrap();
+        let resumed_baseline_probe = resumed_start.probe.unwrap();
+        let resumed_next_value = handle_plugin_diagnose_cleanup_step(
+            &state,
+            json!({
+                "sessionId": resumed_start.session_id.unwrap(),
+                "probeId": resumed_baseline_probe.probe_id,
+                "success": true
+            }),
+        )
+        .await
+        .unwrap();
+        let resumed_next: PluginDiagnoseCleanupResponse =
+            serde_json::from_value(resumed_next_value).unwrap();
+        assert_eq!(resumed_next.progress.phase, "regex");
+        assert_eq!(resumed_next.progress.current_group_items, 1);
+        let resumed_probe = resumed_next.probe.unwrap();
+        assert!(resumed_probe.files[0].code.is_none());
+        let resumed_code = fs::read_to_string(plugin_dir.join("main.js")).unwrap();
+        assert!(
+            resumed_code.contains("RX1") || resumed_code.contains("RX2"),
+            "resume should continue the narrowed failing half"
+        );
+        assert!(!resumed_code.contains("RX3"));
+        assert!(!resumed_code.contains("RX4"));
+
+        let _ = fs::remove_dir_all(&base_path);
+    }
+
+    #[tokio::test]
+    async fn runtime_diagnose_checkpoint_restores_unfinished_probe_only_once() {
+        let base_path = env::temp_dir().join(format!("i18n-runtime-restore-once-{}", nanoid!()));
+        let _ = fs::remove_dir_all(&base_path);
+        let plugin_dir = base_path.join("demo-plugin");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        let original_code = r#"console.log("A");"#;
+        fs::write(plugin_dir.join("main.js"), original_code).unwrap();
+
+        let paths = paths(base_path.to_str().unwrap());
+        let source_id = "source-restore-once";
+        let translation_json = json!({
+            "schemaVersion": 1,
+            "metadata": {
+                "plugin": "demo-plugin",
+                "language": "zh-CN",
+                "version": "1.0.0",
+                "supportedVersions": "*",
+                "title": "Demo",
+                "description": "",
+                "author": ""
+            },
+            "dict": {
+                "main.js": {
+                    "ast": [],
+                    "regex": [
+                        { "source": "A", "target": "AX" }
+                    ]
+                }
+            }
+        });
+        save_translation(&paths, source_id, &translation_json).unwrap();
+
+        let first_state = test_app_state(base_path.clone());
+        let start_value = handle_plugin_diagnose_cleanup_start(
+            &first_state,
+            json!({
+                "pluginId": "demo-plugin",
+                "pluginDir": plugin_dir.to_string_lossy(),
+                "backupBasePath": base_path.to_string_lossy(),
+                "persistence": { "basePath": base_path.to_string_lossy() },
+                "translationSourceId": source_id,
+                "applyAst": true,
+                "applyRegex": true,
+                "runtimeProbe": true,
+                "isApplied": false
+            }),
+        )
+        .await
+        .unwrap();
+        let start: PluginDiagnoseCleanupResponse = serde_json::from_value(start_value).unwrap();
+        let baseline_probe = start.probe.unwrap();
+        let full_value = handle_plugin_diagnose_cleanup_step(
+            &first_state,
+            json!({
+                "sessionId": start.session_id.unwrap(),
+                "probeId": baseline_probe.probe_id,
+                "success": true
+            }),
+        )
+        .await
+        .unwrap();
+        let full: PluginDiagnoseCleanupResponse = serde_json::from_value(full_value).unwrap();
+        assert!(fs::read_to_string(plugin_dir.join("main.js"))
+            .unwrap()
+            .contains("AX"));
+
+        let restarted_state = test_app_state(base_path.clone());
+        let restored_start_value = handle_plugin_diagnose_cleanup_start(
+            &restarted_state,
+            json!({
+                "pluginId": "demo-plugin",
+                "pluginDir": plugin_dir.to_string_lossy(),
+                "backupBasePath": base_path.to_string_lossy(),
+                "persistence": { "basePath": base_path.to_string_lossy() },
+                "translationSourceId": source_id,
+                "applyAst": true,
+                "applyRegex": true,
+                "runtimeProbe": true,
+                "isApplied": false
+            }),
+        )
+        .await
+        .unwrap();
+        let restored_start: PluginDiagnoseCleanupResponse =
+            serde_json::from_value(restored_start_value).unwrap();
+        assert_eq!(
+            fs::read_to_string(plugin_dir.join("main.js")).unwrap(),
+            original_code
+        );
+        handle_plugin_diagnose_cleanup_cancel(
+            &restarted_state,
+            json!({ "sessionId": restored_start.session_id.unwrap() }),
+        )
+        .await
+        .unwrap();
+        let restored_checkpoint = load_json_or(&paths.diagnose_checkpoint_path, Value::Null);
+        assert_eq!(
+            restored_checkpoint
+                .get("originalFilesRestored")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let user_changed_code = r#"console.log("user changed");"#;
+        fs::write(plugin_dir.join("main.js"), user_changed_code).unwrap();
+        let third_state = test_app_state(base_path.clone());
+        let third_start_value = handle_plugin_diagnose_cleanup_start(
+            &third_state,
+            json!({
+                "pluginId": "demo-plugin",
+                "pluginDir": plugin_dir.to_string_lossy(),
+                "backupBasePath": base_path.to_string_lossy(),
+                "persistence": { "basePath": base_path.to_string_lossy() },
+                "translationSourceId": source_id,
+                "applyAst": true,
+                "applyRegex": true,
+                "runtimeProbe": true,
+                "isApplied": false
+            }),
+        )
+        .await
+        .unwrap();
+        let third_start: PluginDiagnoseCleanupResponse =
+            serde_json::from_value(third_start_value).unwrap();
+        assert_eq!(
+            fs::read_to_string(plugin_dir.join("main.js")).unwrap(),
+            user_changed_code
+        );
+        handle_plugin_diagnose_cleanup_cancel(
+            &third_state,
+            json!({ "sessionId": third_start.session_id.unwrap() }),
+        )
+        .await
+        .unwrap();
+
+        let _ = full;
+        let _ = fs::remove_dir_all(&base_path);
+    }
+
+    #[tokio::test]
+    async fn runtime_diagnose_start_saves_draft_and_backs_up_previous_translation() {
+        let base_path = env::temp_dir().join(format!("i18n-runtime-draft-save-{}", nanoid!()));
+        let _ = fs::remove_dir_all(&base_path);
+        let plugin_dir = base_path.join("demo-plugin");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(plugin_dir.join("main.js"), r#"console.log("A");"#).unwrap();
+
+        let paths = paths(base_path.to_str().unwrap());
+        let source_id = "source-draft";
+        let original_translation = json!({
+            "schemaVersion": 1,
+            "metadata": {
+                "plugin": "demo-plugin",
+                "language": "zh-CN",
+                "version": "1.0.0",
+                "supportedVersions": "*",
+                "title": "Old title",
+                "description": "",
+                "author": ""
+            },
+            "dict": {
+                "main.js": {
+                    "ast": [],
+                    "regex": [
+                        { "source": "A", "target": "OLD" }
+                    ]
+                }
+            }
+        });
+        save_translation(&paths, source_id, &original_translation).unwrap();
+        write_json_pretty(
+            &paths.meta_path,
+            &json!({
+                "schemaVersion": 2,
+                "sources": {
+                    source_id: {
+                        "id": source_id,
+                        "plugin": "demo-plugin",
+                        "title": "Old title",
+                        "type": "plugin",
+                        "origin": "cloud",
+                        "isActive": true,
+                        "checksum": "",
+                        "translationVersion": "1.0.0",
+                        "translationFormatValid": true,
+                        "totalTranslationCount": 1,
+                        "pendingTranslationCount": 0,
+                        "translatedEntryCount": 1,
+                        "processedTranslationCount": 0,
+                        "unprocessedTranslationCount": 1,
+                        "translationProcessingComplete": false,
+                        "createdAt": 1,
+                        "updatedAt": 1
+                    }
+                }
+            }),
+        )
+        .unwrap();
+
+        let state = test_app_state(base_path.clone());
+        let start_value = handle_plugin_diagnose_cleanup_start(
+            &state,
+            json!({
+                "pluginId": "demo-plugin",
+                "pluginDir": plugin_dir.to_string_lossy(),
+                "backupBasePath": base_path.to_string_lossy(),
+                "persistence": { "basePath": base_path.to_string_lossy() },
+                "translationSourceId": source_id,
+                "draft": {
+                    "dict": {
+                        "main.js": {
+                            "ast": [],
+                            "regex": [
+                                { "source": "A", "target": "NEW" }
+                            ]
+                        }
+                    },
+                    "metadata": {
+                        "plugin": "demo-plugin",
+                        "language": "zh-CN",
+                        "version": "1.0.1",
+                        "supportedVersions": "*",
+                        "title": "Draft title",
+                        "description": "",
+                        "author": ""
+                    }
+                },
+                "applyAst": true,
+                "applyRegex": true,
+                "runtimeProbe": true,
+                "isApplied": false
+            }),
+        )
+        .await
+        .unwrap();
+        let start: PluginDiagnoseCleanupResponse = serde_json::from_value(start_value).unwrap();
+        assert_eq!(start.status, "probe");
+
+        let saved = read_translation(&paths, source_id).unwrap();
+        assert_eq!(
+            saved
+                .pointer("/dict/main.js/regex/0/target")
+                .and_then(Value::as_str),
+            Some("NEW")
+        );
+        assert_eq!(
+            saved.pointer("/metadata/title").and_then(Value::as_str),
+            Some("Draft title")
+        );
+        let meta = load_meta(&paths);
+        assert_eq!(
+            meta.pointer(&format!("/sources/{source_id}/translationVersion"))
+                .and_then(Value::as_str),
+            Some("1.0.1")
+        );
+        let backup_path = base_path
+            .join("backups")
+            .join("translations")
+            .join(format!("{source_id}.json.gz"));
+        let compressed = fs::read(backup_path).unwrap();
+        let mut decoder = GzDecoder::new(compressed.as_slice());
+        let mut backup_text = String::new();
+        decoder.read_to_string(&mut backup_text).unwrap();
+        let backup_json: Value = serde_json::from_str(&backup_text).unwrap();
+        assert_eq!(
+            backup_json
+                .pointer("/dict/main.js/regex/0/target")
+                .and_then(Value::as_str),
+            Some("OLD")
+        );
+
+        handle_plugin_diagnose_cleanup_cancel(
+            &state,
+            json!({ "sessionId": start.session_id.unwrap() }),
+        )
+        .await
+        .unwrap();
+
+        let empty_result = handle_plugin_diagnose_cleanup_start(
+            &state,
+            json!({
+                "pluginId": "demo-plugin",
+                "pluginDir": plugin_dir.to_string_lossy(),
+                "backupBasePath": base_path.to_string_lossy(),
+                "persistence": { "basePath": base_path.to_string_lossy() },
+                "translationSourceId": source_id,
+                "draft": {
+                    "dict": {},
+                    "metadata": saved.get("metadata").cloned().unwrap_or_else(|| json!({}))
+                },
+                "applyAst": true,
+                "applyRegex": true,
+                "runtimeProbe": true,
+                "isApplied": false
+            }),
+        )
+        .await;
+        assert!(empty_result.is_err());
+        assert!(empty_result
+            .unwrap_err()
+            .to_string()
+            .contains("运行前检查拒绝保存空草稿"));
+
+        let _ = fs::remove_dir_all(&base_path);
+    }
+
     #[test]
     fn metadata_index_separates_translated_entries_from_processing_progress() {
         let index = metadata_index(&json!({
@@ -9640,9 +12532,20 @@ mod tests {
             ]
         }));
 
-        assert_eq!(index.get("translatedEntryCount").and_then(Value::as_u64), Some(1));
-        assert_eq!(index.get("pendingTranslationCount").and_then(Value::as_u64), Some(2));
-        assert_eq!(index.get("processedTranslationCount").and_then(Value::as_u64), Some(0));
+        assert_eq!(
+            index.get("translatedEntryCount").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            index.get("pendingTranslationCount").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            index
+                .get("processedTranslationCount")
+                .and_then(Value::as_u64),
+            Some(0)
+        );
         assert_eq!(
             index
                 .get("translationProcessingComplete")
@@ -9858,7 +12761,9 @@ mod tests {
 
         let saved = read_translation(&paths, source_id).unwrap();
         assert_eq!(
-            saved.pointer("/dict/main.js/regex/0/target").and_then(Value::as_str),
+            saved
+                .pointer("/dict/main.js/regex/0/target")
+                .and_then(Value::as_str),
             Some("你好")
         );
         let meta = load_meta(&paths);
@@ -9868,11 +12773,15 @@ mod tests {
             Some(1)
         );
         assert_eq!(
-            source.get("processedTranslationCount").and_then(Value::as_u64),
+            source
+                .get("processedTranslationCount")
+                .and_then(Value::as_u64),
             Some(1)
         );
         assert_eq!(
-            source.get("unprocessedTranslationCount").and_then(Value::as_u64),
+            source
+                .get("unprocessedTranslationCount")
+                .and_then(Value::as_u64),
             Some(0)
         );
         assert_eq!(
@@ -9885,6 +12794,44 @@ mod tests {
         assert_eq!(progress.processed_resources, 1);
         assert_eq!(progress.processed_items, 1);
         assert_eq!(progress.success_count, 1);
+        let _ = fs::remove_dir_all(base_path);
+    }
+
+    #[tokio::test]
+    async fn task_route_accepts_large_json_payloads() {
+        let base_path = env::temp_dir().join(format!("i18n-large-body-test-{}", nanoid!(8)));
+        fs::create_dir_all(&base_path).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/task", post(task_route))
+            .with_state(test_app_state(base_path.clone()));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/task"))
+            .json(&json!({
+                "type": "__large_body_test__",
+                "payload": {
+                    "data": "x".repeat(3 * 1024 * 1024)
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status().as_u16(), 500);
+        let payload = response.json::<Value>().await.unwrap();
+        assert_eq!(payload.get("ok").and_then(Value::as_bool), Some(false));
+        assert!(payload
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("未知任务类型"));
+
+        server.abort();
         let _ = fs::remove_dir_all(base_path);
     }
 
@@ -10105,7 +13052,8 @@ mod tests {
             }
         });
 
-        let base_path = env::temp_dir().join(format!("i18n-batch-translate-threshold-{}", nanoid!()));
+        let base_path =
+            env::temp_dir().join(format!("i18n-batch-translate-threshold-{}", nanoid!()));
         let paths = paths(base_path.to_str().unwrap());
         let source_id = "source-a";
         let translation_json = json!({
@@ -10224,7 +13172,9 @@ mod tests {
         assert!(result.is_err());
         let saved = read_translation(&paths, source_id).unwrap();
         assert_eq!(
-            saved.pointer("/dict/main.js/regex/0/target").and_then(Value::as_str),
+            saved
+                .pointer("/dict/main.js/regex/0/target")
+                .and_then(Value::as_str),
             Some("你好")
         );
         let meta = load_meta(&paths);
@@ -10234,11 +13184,15 @@ mod tests {
             Some(1)
         );
         assert_eq!(
-            source.get("processedTranslationCount").and_then(Value::as_u64),
+            source
+                .get("processedTranslationCount")
+                .and_then(Value::as_u64),
             Some(1)
         );
         assert_eq!(
-            source.get("unprocessedTranslationCount").and_then(Value::as_u64),
+            source
+                .get("unprocessedTranslationCount")
+                .and_then(Value::as_u64),
             Some(1)
         );
         assert_eq!(
@@ -10266,7 +13220,10 @@ mod tests {
             let _ = stream.write_all(response.as_bytes()).await;
         });
 
-        let base_path = env::temp_dir().join(format!("i18n-batch-translate-request-failure-{}", nanoid!()));
+        let base_path = env::temp_dir().join(format!(
+            "i18n-batch-translate-request-failure-{}",
+            nanoid!()
+        ));
         let paths = paths(base_path.to_str().unwrap());
         let source_id = "source-a";
         let translation_json = json!({
@@ -10599,7 +13556,9 @@ mod tests {
 
         let saved = read_translation(&paths, source_id).unwrap();
         assert_eq!(
-            saved.pointer("/dict/main.js/regex/3/target").and_then(Value::as_str),
+            saved
+                .pointer("/dict/main.js/regex/3/target")
+                .and_then(Value::as_str),
             Some("译文3")
         );
         let _ = fs::remove_dir_all(base_path);
@@ -10614,9 +13573,18 @@ mod tests {
             json!({ "id": 4, "resourceStateIndex": 1, "dictIndex": 3, "source": "D", "target": "" }),
         ];
         let translated = vec![
-            TranslationPair { i: 1, t: "甲".to_string() },
-            TranslationPair { i: 2, t: " ".to_string() },
-            TranslationPair { i: 4, t: "D".to_string() },
+            TranslationPair {
+                i: 1,
+                t: "甲".to_string(),
+            },
+            TranslationPair {
+                i: 2,
+                t: " ".to_string(),
+            },
+            TranslationPair {
+                i: 4,
+                t: "D".to_string(),
+            },
         ];
         let mut report = PackedBatchReport {
             translated_items: Vec::new(),
@@ -10626,12 +13594,32 @@ mod tests {
         merge_successful_packed_response(&mut report, batch, translated);
 
         assert_eq!(report.translated_items.len(), 2);
-        assert_eq!(report.translated_items[0].get("target").and_then(Value::as_str), Some("甲"));
-        assert_eq!(report.translated_items[1].get("target").and_then(Value::as_str), Some("D"));
-        let failed_items = report.failures.iter().map(|failure| failure.items.len()).sum::<usize>();
+        assert_eq!(
+            report.translated_items[0]
+                .get("target")
+                .and_then(Value::as_str),
+            Some("甲")
+        );
+        assert_eq!(
+            report.translated_items[1]
+                .get("target")
+                .and_then(Value::as_str),
+            Some("D")
+        );
+        let failed_items = report
+            .failures
+            .iter()
+            .map(|failure| failure.items.len())
+            .sum::<usize>();
         assert_eq!(failed_items, 2);
-        assert!(report.failures.iter().any(|failure| failure.resource_state_index == 0));
-        assert!(report.failures.iter().any(|failure| failure.resource_state_index == 1));
+        assert!(report
+            .failures
+            .iter()
+            .any(|failure| failure.resource_state_index == 0));
+        assert!(report
+            .failures
+            .iter()
+            .any(|failure| failure.resource_state_index == 1));
     }
 
     #[test]
@@ -10924,25 +13912,44 @@ mod tests {
             "totalItems": 2
         });
 
-        handle_failure_retry(&state, task, payload, true).await.unwrap();
+        handle_failure_retry(&state, task, payload, true)
+            .await
+            .unwrap();
 
         let saved = read_translation(&paths, source_id).unwrap();
         assert_eq!(
-            saved.pointer("/dict/main.js/regex/0/target").and_then(Value::as_str),
+            saved
+                .pointer("/dict/main.js/regex/0/target")
+                .and_then(Value::as_str),
             Some("")
         );
         assert_eq!(
-            saved.pointer("/dict/main.js/regex/1/target").and_then(Value::as_str),
+            saved
+                .pointer("/dict/main.js/regex/1/target")
+                .and_then(Value::as_str),
             Some("乙")
         );
         let record = load_record(&paths);
         let failures = record.get("failures").and_then(Value::as_array).unwrap();
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].get("id").and_then(Value::as_str), Some("failure-a"));
+        assert_eq!(
+            failures[0].get("id").and_then(Value::as_str),
+            Some("failure-a")
+        );
         let meta = load_meta(&paths);
         let source = meta.pointer("/sources/source-a").unwrap();
-        assert_eq!(source.get("processedTranslationCount").and_then(Value::as_u64), Some(1));
-        assert_eq!(source.get("unprocessedTranslationCount").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            source
+                .get("processedTranslationCount")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            source
+                .get("unprocessedTranslationCount")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
         let _ = fs::remove_dir_all(base_path);
     }
 
@@ -11063,19 +14070,27 @@ mod tests {
             "totalItems": 3
         });
 
-        handle_failure_retry(&state, task, payload, true).await.unwrap();
+        handle_failure_retry(&state, task, payload, true)
+            .await
+            .unwrap();
 
         let saved = read_translation(&paths, source_id).unwrap();
         assert_eq!(
-            saved.pointer("/dict/main.js/regex/0/target").and_then(Value::as_str),
+            saved
+                .pointer("/dict/main.js/regex/0/target")
+                .and_then(Value::as_str),
             Some("甲")
         );
         assert_eq!(
-            saved.pointer("/dict/main.js/regex/1/target").and_then(Value::as_str),
+            saved
+                .pointer("/dict/main.js/regex/1/target")
+                .and_then(Value::as_str),
             Some("")
         );
         assert_eq!(
-            saved.pointer("/dict/main.js/regex/2/target").and_then(Value::as_str),
+            saved
+                .pointer("/dict/main.js/regex/2/target")
+                .and_then(Value::as_str),
             Some("")
         );
         let record = load_record(&paths);
@@ -11089,8 +14104,18 @@ mod tests {
         assert_eq!(remaining_indexes, vec![1, 2]);
         let meta = load_meta(&paths);
         let source = meta.pointer("/sources/source-a").unwrap();
-        assert_eq!(source.get("processedTranslationCount").and_then(Value::as_u64), Some(1));
-        assert_eq!(source.get("unprocessedTranslationCount").and_then(Value::as_u64), Some(2));
+        assert_eq!(
+            source
+                .get("processedTranslationCount")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            source
+                .get("unprocessedTranslationCount")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
         let _ = fs::remove_dir_all(base_path);
     }
 
@@ -11223,16 +14248,22 @@ mod tests {
             "totalItems": 2
         });
 
-        handle_failure_retry(&state, task, payload, true).await.unwrap();
+        handle_failure_retry(&state, task, payload, true)
+            .await
+            .unwrap();
 
         assert_eq!(*request_count.lock().await, 2);
         let saved = read_translation(&paths, source_id).unwrap();
         assert_eq!(
-            saved.pointer("/dict/main.js/regex/0/target").and_then(Value::as_str),
+            saved
+                .pointer("/dict/main.js/regex/0/target")
+                .and_then(Value::as_str),
             Some("")
         );
         assert_eq!(
-            saved.pointer("/dict/main.js/regex/1/target").and_then(Value::as_str),
+            saved
+                .pointer("/dict/main.js/regex/1/target")
+                .and_then(Value::as_str),
             Some("乙")
         );
         let record = load_record(&paths);
@@ -11519,7 +14550,8 @@ mod tests {
             }
         });
 
-        let base_path = env::temp_dir().join(format!("i18n-no-new-batches-after-threshold-{}", nanoid!()));
+        let base_path =
+            env::temp_dir().join(format!("i18n-no-new-batches-after-threshold-{}", nanoid!()));
         let paths = paths(base_path.to_str().unwrap());
         let state = AppState {
             tasks: Arc::new(Mutex::new(HashMap::new())),
@@ -11550,14 +14582,16 @@ mod tests {
             failures: Vec::new(),
         }];
         let items = (0..4)
-            .map(|id| json!({
-                "id": id,
-                "resourceStateIndex": 0,
-                "file": "main.js",
-                "dictIndex": id,
-                "source": format!("Source {id}"),
-                "target": ""
-            }))
+            .map(|id| {
+                json!({
+                    "id": id,
+                    "resourceStateIndex": 0,
+                    "file": "main.js",
+                    "dictIndex": id,
+                    "source": format!("Source {id}"),
+                    "target": ""
+                })
+            })
             .collect::<Vec<_>>();
         let config = CompanionTranslationConfig {
             chat_completions_url: format!("http://{addr}/v1/chat/completions"),
@@ -11673,14 +14707,16 @@ mod tests {
             failures: Vec::new(),
         }];
         let items = (0..3)
-            .map(|id| json!({
-                "id": id,
-                "resourceStateIndex": 0,
-                "file": "main.js",
-                "dictIndex": id,
-                "source": format!("Source {id}"),
-                "target": ""
-            }))
+            .map(|id| {
+                json!({
+                    "id": id,
+                    "resourceStateIndex": 0,
+                    "file": "main.js",
+                    "dictIndex": id,
+                    "source": format!("Source {id}"),
+                    "target": ""
+                })
+            })
             .collect::<Vec<_>>();
         let config = CompanionTranslationConfig {
             chat_completions_url: format!("http://{addr}/v1/chat/completions"),
@@ -11722,9 +14758,20 @@ mod tests {
             }
         });
 
-        let _ = tokio_timeout(TokioDuration::from_secs(2), request_rx.recv()).await.unwrap().unwrap();
-        let _ = tokio_timeout(TokioDuration::from_secs(2), request_rx.recv()).await.unwrap().unwrap();
-        let third_arrived_before_release = tokio_timeout(TokioDuration::from_millis(300), request_rx.recv()).await.ok().flatten().is_some();
+        let _ = tokio_timeout(TokioDuration::from_secs(2), request_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = tokio_timeout(TokioDuration::from_secs(2), request_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let third_arrived_before_release =
+            tokio_timeout(TokioDuration::from_millis(300), request_rx.recv())
+                .await
+                .ok()
+                .flatten()
+                .is_some();
         let _ = release_tx.send(());
         task_handle.await.unwrap().unwrap();
 
@@ -11797,6 +14844,64 @@ mod tests {
         assert!(regex_only.contains("Hello"));
         assert!(!regex_only.contains("你好"));
         assert!(regex_only.contains("世界"));
+
+        let _ = fs::remove_dir_all(base_path);
+    }
+
+    #[test]
+    fn plugin_apply_translation_reads_persisted_source_and_writes_plugin_file() {
+        let base_path = env::temp_dir().join(format!("i18n-apply-persisted-source-{}", nanoid!()));
+        let plugin_dir = base_path.join("plugin");
+        let source_base_path = base_path.join("source-data");
+        let backup_base_path = base_path.join("plugin-data");
+        let source_id = "source-a";
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("main.js"),
+            r#"const title = "Hello"; console.log("World");"#,
+        )
+        .unwrap();
+
+        let translation_json = json!({
+            "schemaVersion": 1,
+            "metadata": {
+                "plugin": "plugin-a",
+                "title": "Plugin A",
+                "version": "1.2.3"
+            },
+            "dict": {
+                "main.js": {
+                    "ast": [
+                        { "type": "VariableDeclarator", "name": "title", "source": "Hello", "target": "你好" }
+                    ],
+                    "regex": [
+                        { "source": "World", "target": "世界" }
+                    ]
+                }
+            }
+        });
+        save_translation(&paths(source_base_path.to_str().unwrap()), source_id, &translation_json).unwrap();
+
+        let response = apply_plugin_translation_blocking(PluginApplyTranslationPayload {
+            plugin_id: "plugin-a".to_string(),
+            plugin_dir: plugin_dir.to_string_lossy().to_string(),
+            backup_base_path: backup_base_path.to_string_lossy().to_string(),
+            translation_json: None,
+            persistence: Some(PersistenceConfig {
+                base_path: source_base_path.to_string_lossy().to_string(),
+            }),
+            translation_source_id: Some(source_id.to_string()),
+            apply_ast: Some(true),
+            apply_regex: Some(true),
+        })
+        .unwrap();
+
+        assert!(response.state);
+        assert_eq!(response.processed_files, 1);
+        assert_eq!(response.translation_version, "1.2.3");
+        let applied = fs::read_to_string(plugin_dir.join("main.js")).unwrap();
+        assert!(applied.contains("你好"));
+        assert!(applied.contains("世界"));
 
         let _ = fs::remove_dir_all(base_path);
     }
@@ -11935,7 +15040,8 @@ mod tests {
             error: None,
         };
 
-        let checkpoint = create_checkpoint("plugin", "translate", &resources, &completed, &progress);
+        let checkpoint =
+            create_checkpoint("plugin", "translate", &resources, &completed, &progress);
 
         assert_eq!(checkpoint.completed_resources, 1);
         assert_eq!(checkpoint.processed_items, 2);

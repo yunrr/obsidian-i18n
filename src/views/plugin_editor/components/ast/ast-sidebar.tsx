@@ -18,7 +18,7 @@ import { QuickActionsCard } from '../common/quick-actions-card';
 import { DiagnoseCard } from '../common/diagnose-card';
 import { Library, Settings2 } from 'lucide-react';
 import { useAstTranslation } from './use-ast-translation';
-import { DiagnoseError } from '../../types';
+import { DiagnoseError, DiagnoseProgress } from '../../types';
 
 /**
  * AstSidebar 容器组件：整合所有Card子组件
@@ -45,8 +45,11 @@ const AstSidebar = ({
     onJumpError,
     onCleanIssues,
     isCleaningIssues,
+    diagnoseProgress,
     switchCooldownMs,
-    onSwitchCooldownChange
+    onSwitchCooldownChange,
+    timeoutGraceMs,
+    onTimeoutGraceChange
 }: {
     translationEntries?: any[],
     progress?: number,
@@ -69,8 +72,11 @@ const AstSidebar = ({
     onJumpError?: (error: DiagnoseError) => void,
     onCleanIssues?: () => void,
     isCleaningIssues?: boolean,
+    diagnoseProgress?: DiagnoseProgress | null,
     switchCooldownMs: number,
-    onSwitchCooldownChange: (value: number) => number
+    onSwitchCooldownChange: (value: number) => number,
+    timeoutGraceMs: number,
+    onTimeoutGraceChange: (value: number) => number
 }) => {
     const { t } = useTranslation();
     // 5. AST Translation Controller (Received via props)
@@ -158,8 +164,11 @@ const AstSidebar = ({
                         onJumpError={onJumpError}
                         onCleanIssues={onCleanIssues}
                         isCleaningIssues={isCleaningIssues}
+                        diagnoseProgress={diagnoseProgress}
                         switchCooldownMs={switchCooldownMs}
                         onSwitchCooldownChange={onSwitchCooldownChange}
+                        timeoutGraceMs={timeoutGraceMs}
+                        onTimeoutGraceChange={onTimeoutGraceChange}
                     />
 
                     {showLLM && (

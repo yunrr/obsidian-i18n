@@ -4,6 +4,14 @@ import { requestUrl } from 'obsidian';
 import { spawn } from 'child_process';
 import type { ChildProcess } from 'child_process';
 import type I18N from '../main';
+import {
+    getCompanionWorkerPortCandidates,
+    type WorkerBackend,
+} from './companion-worker-ports';
+import {
+    classifyCompanionWorkerIdentity,
+    type CompanionWorkerIdentityState,
+} from './companion-worker-identity';
 import type {
     CompanionAsyncTaskType,
     CompanionApplyTranslationResponse,
@@ -108,8 +116,6 @@ export type {
     CompanionTranslateResult,
 } from './companion-worker-types';
 
-type WorkerBackend = 'rust' | 'cjs';
-
 interface WorkerRuntime {
     process: ChildProcess | null;
     endpoint: string;
@@ -177,6 +183,10 @@ export class CompanionWorkerManager {
 
     public async codeExtract(request: CompanionCodeExtractRequest): Promise<CompanionCodeExtractResponse> {
         return this.runTask<CompanionCodeExtractResponse>('code-extract', request);
+    }
+
+    public async getCjsEndpoint(): Promise<string> {
+        return this.getEndpoint('cjs');
     }
 
     public async applyPluginTranslation(request: CompanionPluginApplyTranslationRequest): Promise<CompanionApplyTranslationResponse> {
@@ -321,7 +331,8 @@ export class CompanionWorkerManager {
             type === 'plugin-batch-extract' ||
             type === 'theme-batch-extract' ||
             type === 'code-extract' ||
-            type === 'ast-replace'
+            type === 'ast-replace' ||
+            type === 'plugin-diagnose-render-probe'
         ) {
             return 'cjs';
         }
@@ -375,25 +386,42 @@ export class CompanionWorkerManager {
 
     private async startBackendInner(backend: WorkerBackend): Promise<boolean> {
         try {
-            const port = this.getPort(backend);
-            const endpoint = `http://127.0.0.1:${port}`;
-            if (await this.isWorkerReady(endpoint, 500)) {
-                this.runtimes[backend].endpoint = endpoint;
-                return true;
-            }
-
-            if (backend === 'rust') {
-                if (!existsSync(this.rustWorkerPath)) {
-                    throw new Error(`Rust companion worker not found: ${this.rustWorkerPath}`);
+            for (const port of this.getPortCandidates(backend)) {
+                const endpoint = `http://127.0.0.1:${port}`;
+                const identity = await this.getWorkerIdentity(backend, endpoint, 500);
+                if (identity === 'same') {
+                    this.runtimes[backend].endpoint = endpoint;
+                    return true;
                 }
-                return this.spawnWorker(backend, this.rustWorkerPath, [String(port)], port);
-            }
+                if (identity === 'stale') {
+                    await this.stopWorkerEndpoint(endpoint).catch(() => undefined);
+                    if (await this.getWorkerIdentity(backend, endpoint, 500) !== 'missing') {
+                        continue;
+                    }
+                }
+                if (identity === 'other') {
+                    continue;
+                }
 
-            if (!existsSync(this.cjsWorkerPath)) {
-                throw new Error(`CJS companion worker not found: ${this.cjsWorkerPath}`);
+                if (backend === 'rust') {
+                    if (!existsSync(this.rustWorkerPath)) {
+                        throw new Error(`Rust companion worker not found: ${this.rustWorkerPath}`);
+                    }
+                    if (await this.spawnWorker(backend, this.rustWorkerPath, [String(port)], port)) {
+                        return true;
+                    }
+                    continue;
+                }
+
+                if (!existsSync(this.cjsWorkerPath)) {
+                    throw new Error(`CJS companion worker not found: ${this.cjsWorkerPath}`);
+                }
+                const nodePath = this.plugin.settings.llmCompanionNodePath?.trim() || 'node';
+                if (await this.spawnWorker(backend, nodePath, [this.cjsWorkerPath, String(port)], port)) {
+                    return true;
+                }
             }
-            const nodePath = this.plugin.settings.llmCompanionNodePath?.trim() || 'node';
-            return this.spawnWorker(backend, nodePath, [this.cjsWorkerPath, String(port)], port);
+            return false;
         } catch (error) {
             console.warn(`[I18N Companion] Failed to start ${backend} worker`, error);
             await this.stopBackend(backend);
@@ -429,9 +457,11 @@ export class CompanionWorkerManager {
             }
         });
 
-        const ready = await this.isWorkerReady(runtime.endpoint, 5000);
+        const ready = await this.isWorkerReady(backend, runtime.endpoint, 5000);
         if (!ready) {
-            await this.stopBackend(backend);
+            runtime.endpoint = '';
+            runtime.process = null;
+            if (!worker.killed) worker.kill();
             return false;
         }
 
@@ -440,17 +470,18 @@ export class CompanionWorkerManager {
 
     private async stopBackend(backend: WorkerBackend): Promise<void> {
         const runtime = this.runtimes[backend];
-        const endpoint = runtime.endpoint || `http://127.0.0.1:${this.getPort(backend)}`;
+        const endpoint = runtime.endpoint;
         const worker = runtime.process;
 
         runtime.endpoint = '';
         runtime.process = null;
 
+        if (!endpoint && !worker) return;
+
         try {
-            await Promise.race([
-                requestUrl({ url: `${endpoint}/shutdown`, method: 'POST', throw: false }),
-                new Promise((_, reject) => setTimeout(() => reject(new Error('shutdown timeout')), 500)),
-            ]);
+            if (endpoint && await this.getWorkerIdentity(backend, endpoint, 500) === 'same') {
+                await this.stopWorkerEndpoint(endpoint);
+            }
         } catch {
             if (worker && !worker.killed) worker.kill();
             return;
@@ -463,30 +494,42 @@ export class CompanionWorkerManager {
         }
     }
 
-    private getPort(backend: WorkerBackend): number {
-        const basePort = Number(this.plugin.settings.llmCompanionWorkerPort || 18743);
-        const port = Number.isFinite(basePort) && basePort > 0 && basePort <= 65534 ? Math.floor(basePort) : 18743;
-        return backend === 'rust' ? port : port + 1;
+    private getPortCandidates(backend: WorkerBackend): number[] {
+        return getCompanionWorkerPortCandidates(this.plugin.settings.llmCompanionWorkerPort, backend);
     }
 
-    private async isWorkerReady(endpoint: string, timeoutMs: number): Promise<boolean> {
+    private async isWorkerReady(backend: WorkerBackend, endpoint: string, timeoutMs: number): Promise<boolean> {
         const startedAt = Date.now();
         while (Date.now() - startedAt < timeoutMs) {
-            try {
-                const response = await Promise.race([
-                    requestUrl({ url: `${endpoint}/identity`, method: 'GET', throw: false }),
-                    new Promise((_, reject) => setTimeout(() => reject(new Error('identity timeout')), 500)),
-                ]) as any;
-                const payload = response.json || (response.text ? JSON.parse(response.text) : null);
-                if (response.status === 200 && payload?.ok && this.isSamePluginDir(payload.pluginDir)) return true;
-            } catch {
-                await new Promise(resolve => setTimeout(resolve, 150));
-            }
+            const identity = await this.getWorkerIdentity(backend, endpoint, 500);
+            if (identity === 'same') return true;
+            if (identity === 'other' || identity === 'stale') return false;
+            await new Promise(resolve => setTimeout(resolve, 150));
         }
         return false;
     }
 
-    private isSamePluginDir(pluginDir: unknown): boolean {
-        return typeof pluginDir === 'string' && path.resolve(pluginDir) === this.normalizedPluginDir;
+    private async getWorkerIdentity(backend: WorkerBackend, endpoint: string, timeoutMs: number): Promise<CompanionWorkerIdentityState> {
+        try {
+            const response = await Promise.race([
+                requestUrl({ url: `${endpoint}/identity`, method: 'GET', throw: false }),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('identity timeout')), timeoutMs)),
+            ]) as any;
+            const payload = response.json || (response.text ? JSON.parse(response.text) : null);
+            if (response.status === 200 && payload?.ok) {
+                return classifyCompanionWorkerIdentity(payload, this.normalizedPluginDir, backend);
+            }
+        } catch {
+            // Endpoint is either not a companion worker yet, or not reachable.
+        }
+        return 'missing';
     }
+
+    private async stopWorkerEndpoint(endpoint: string): Promise<void> {
+        await Promise.race([
+            requestUrl({ url: `${endpoint}/shutdown`, method: 'POST', throw: false }),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('shutdown timeout')), 500)),
+        ]);
+    }
+
 }

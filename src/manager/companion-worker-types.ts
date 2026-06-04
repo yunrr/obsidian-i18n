@@ -141,6 +141,22 @@ export interface CompanionCodeExtractResponse {
     error?: string;
 }
 
+export interface CompanionPluginDiagnoseRenderProbeRequest {
+    files: CompanionRuntimeProbeFile[];
+    candidates: Array<{
+        file: string;
+        kind: 'ast' | 'regex';
+        index: number;
+        item: any;
+    }>;
+}
+
+export interface CompanionPluginDiagnoseRenderProbeResponse {
+    state: boolean;
+    files: CompanionRuntimeProbeFile[];
+    error?: string;
+}
+
 export interface CompanionPluginApplyTranslationRequest {
     pluginId: string;
     pluginDir: string;
@@ -181,7 +197,7 @@ export interface CompanionTranslationIssueItem {
 
 export interface CompanionRuntimeProbeFile {
     file: string;
-    code: string;
+    code?: string;
 }
 
 export interface CompanionRuntimeProbeRequest {
@@ -190,12 +206,23 @@ export interface CompanionRuntimeProbeRequest {
     label: string;
 }
 
+export interface CompanionDiagnoseProgress {
+    phase: 'baseline' | 'ast' | 'regex' | 'completed' | string;
+    queueGroups: number;
+    currentGroupItems: number;
+}
+
 export interface CompanionPluginDiagnoseCleanupStartRequest {
     pluginId: string;
     pluginDir: string;
     backupBasePath: string;
     persistence: CompanionWorkerPersistenceConfig;
     translationSourceId: string;
+    draft?: {
+        dict?: any;
+        metadata?: any;
+    };
+    cjsEndpoint?: string;
     applyAst?: boolean;
     applyRegex?: boolean;
     runtimeProbe?: boolean;
@@ -240,6 +267,7 @@ export interface CompanionPluginDiagnoseCleanupResponse {
     clearedItems: CompanionTranslationIssueItem[];
     processedFiles: number;
     translationVersion: string;
+    progress: CompanionDiagnoseProgress;
 }
 
 export interface CompanionSourceManagerRequest {
@@ -554,4 +582,4 @@ export interface CompanionThemeFailureRetryPayload {
 
 export type CompanionAsyncTaskType = 'plugin-batch-extract' | 'theme-batch-extract' | 'plugin-batch-translate' | 'theme-batch-translate' | 'plugin-failure-retry' | 'theme-failure-retry' | 'cloud-backup-all';
 
-export type CompanionBatchTaskType = 'plugin-extract' | 'theme-extract' | 'plugin-translate' | 'theme-translate' | 'plugin-retry' | 'theme-retry' | 'ast-replace' | 'code-extract' | 'plugin-apply-translation' | 'plugin-diagnose-cleanup-start' | 'plugin-diagnose-cleanup-step' | 'plugin-diagnose-cleanup-cancel' | 'plugin-diagnose-cleanup-apply' | 'theme-apply-translation' | 'source-read' | 'source-export' | 'source-import' | 'source-remove' | 'source-set-active' | 'source-index' | 'source-clear-batch-records' | CompanionCloudTaskType;
+export type CompanionBatchTaskType = 'plugin-extract' | 'theme-extract' | 'plugin-translate' | 'theme-translate' | 'plugin-retry' | 'theme-retry' | 'ast-replace' | 'code-extract' | 'plugin-diagnose-render-probe' | 'plugin-apply-translation' | 'plugin-diagnose-cleanup-start' | 'plugin-diagnose-cleanup-step' | 'plugin-diagnose-cleanup-cancel' | 'plugin-diagnose-cleanup-apply' | 'theme-apply-translation' | 'source-read' | 'source-export' | 'source-import' | 'source-remove' | 'source-set-active' | 'source-index' | 'source-clear-batch-records' | CompanionCloudTaskType;

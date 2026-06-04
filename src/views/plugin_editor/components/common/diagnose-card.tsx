@@ -7,7 +7,7 @@ import {
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { cn } from "~/shadcn/lib/utils";
-import { DiagnoseError } from '../../types';
+import { DiagnoseError, DiagnoseProgress } from '../../types';
 
 interface DiagnoseCardProps {
     onDiagnose: () => void;
@@ -19,8 +19,11 @@ interface DiagnoseCardProps {
     onJumpError?: (error: DiagnoseError) => void;
     onCleanIssues?: () => void;
     isCleaningIssues?: boolean;
+    diagnoseProgress?: DiagnoseProgress | null;
     switchCooldownMs: number;
     onSwitchCooldownChange: (value: number) => number;
+    timeoutGraceMs: number;
+    onTimeoutGraceChange: (value: number) => number;
 }
 
 export const DiagnoseCard: React.FC<DiagnoseCardProps> = ({
@@ -33,15 +36,23 @@ export const DiagnoseCard: React.FC<DiagnoseCardProps> = ({
     onJumpError,
     onCleanIssues,
     isCleaningIssues,
+    diagnoseProgress,
     switchCooldownMs,
-    onSwitchCooldownChange
+    onSwitchCooldownChange,
+    timeoutGraceMs,
+    onTimeoutGraceChange
 }) => {
     const { t } = useTranslation();
     const [cooldownInput, setCooldownInput] = React.useState(String(switchCooldownMs));
+    const [timeoutGraceInput, setTimeoutGraceInput] = React.useState(String(timeoutGraceMs));
 
     React.useEffect(() => {
         setCooldownInput(String(switchCooldownMs));
     }, [switchCooldownMs]);
+
+    React.useEffect(() => {
+        setTimeoutGraceInput(String(timeoutGraceMs));
+    }, [timeoutGraceMs]);
 
     const handleCooldownBlur = () => {
         const nextValue = Number.parseInt(cooldownInput, 10);
@@ -49,6 +60,15 @@ export const DiagnoseCard: React.FC<DiagnoseCardProps> = ({
             setCooldownInput(String(onSwitchCooldownChange(nextValue)));
         } else {
             setCooldownInput(String(switchCooldownMs));
+        }
+    };
+
+    const handleTimeoutGraceBlur = () => {
+        const nextValue = Number.parseInt(timeoutGraceInput, 10);
+        if (Number.isFinite(nextValue)) {
+            setTimeoutGraceInput(String(onTimeoutGraceChange(nextValue)));
+        } else {
+            setTimeoutGraceInput(String(timeoutGraceMs));
         }
     };
 
@@ -77,6 +97,13 @@ export const DiagnoseCard: React.FC<DiagnoseCardProps> = ({
         return error.type.toUpperCase();
     };
 
+    const getPhaseLabel = (phase: string) => {
+        if (phase === 'ast') return 'AST';
+        if (phase === 'regex') return 'Regex';
+        if (phase === 'baseline') return t('Editor.Labels.DiagnosisPhaseBaseline');
+        return phase || '-';
+    };
+
     return (
         <TemplateCard
             title={t('Editor.Actions.PreflightCheck')}
@@ -102,6 +129,35 @@ export const DiagnoseCard: React.FC<DiagnoseCardProps> = ({
                     )}
                 </Button>
 
+                {isDiagnosing && diagnoseProgress && (
+                    <div className="grid grid-cols-3 gap-1.5 rounded-md border bg-muted/30 p-2">
+                        <div className="min-w-0">
+                            <div className="text-[9px] text-muted-foreground">
+                                {t('Editor.Labels.DiagnosisPhase')}
+                            </div>
+                            <div className="truncate text-[11px] font-medium">
+                                {getPhaseLabel(diagnoseProgress.phase)}
+                            </div>
+                        </div>
+                        <div className="min-w-0">
+                            <div className="text-[9px] text-muted-foreground">
+                                {t('Editor.Labels.DiagnosisQueueGroups')}
+                            </div>
+                            <div className="truncate text-[11px] font-medium">
+                                {diagnoseProgress.queueGroups}
+                            </div>
+                        </div>
+                        <div className="min-w-0">
+                            <div className="text-[9px] text-muted-foreground">
+                                {t('Editor.Labels.DiagnosisCurrentGroupItems')}
+                            </div>
+                            <div className="truncate text-[11px] font-medium">
+                                {diagnoseProgress.currentGroupItems}
+                            </div>
+                        </div>
+                    </div>
+                )}
+
                 <div className="space-y-1.5">
                     <Label
                         htmlFor="i18n-preflight-switch-cooldown"
@@ -122,6 +178,29 @@ export const DiagnoseCard: React.FC<DiagnoseCardProps> = ({
                         disabled={isDiagnosing}
                         className="h-8 text-xs"
                         aria-label={t('Editor.Labels.PreflightSwitchCooldown')}
+                    />
+                </div>
+
+                <div className="space-y-1.5">
+                    <Label
+                        htmlFor="i18n-preflight-timeout-grace"
+                        className="flex items-center gap-1.5 text-[10px] font-medium text-muted-foreground"
+                    >
+                        <Clock3 className="w-3 h-3" />
+                        {t('Editor.Labels.PreflightTimeoutGrace')}
+                    </Label>
+                    <Input
+                        id="i18n-preflight-timeout-grace"
+                        type="number"
+                        min={0}
+                        max={60000}
+                        step={500}
+                        value={timeoutGraceInput}
+                        onChange={(event) => setTimeoutGraceInput(event.target.value)}
+                        onBlur={handleTimeoutGraceBlur}
+                        disabled={isDiagnosing}
+                        className="h-8 text-xs"
+                        aria-label={t('Editor.Labels.PreflightTimeoutGrace')}
                     />
                 </div>
 

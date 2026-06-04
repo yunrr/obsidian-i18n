@@ -33,6 +33,12 @@ export type DiagnoseError = {
     message?: string;
 };
 
+export type DiagnoseProgress = {
+    phase: string;
+    queueGroups: number;
+    currentGroupItems: number;
+};
+
 // ======================== Slice Interfaces ========================
 
 export interface AstSlice {

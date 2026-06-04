@@ -19,7 +19,7 @@ import { QuickActionsCard } from '../common/quick-actions-card';
 import { DiagnoseCard } from '../common/diagnose-card';
 import { useRegexTranslation } from './use-regex-translation';
 import { Library, Settings2 } from 'lucide-react';
-import { DiagnoseError } from '../../types';
+import { DiagnoseError, DiagnoseProgress } from '../../types';
 
 interface Props {
     regexController?: ReturnType<typeof useRegexTranslation>;
@@ -37,8 +37,11 @@ interface Props {
     onJumpError?: (error: DiagnoseError) => void;
     onCleanIssues?: () => void;
     isCleaningIssues?: boolean;
+    diagnoseProgress?: DiagnoseProgress | null;
     switchCooldownMs: number;
     onSwitchCooldownChange: (value: number) => number;
+    timeoutGraceMs: number;
+    onTimeoutGraceChange: (value: number) => number;
 }
 
 /**
@@ -60,8 +63,11 @@ const RegexSidebar: React.FC<Props> = ({
     onJumpError,
     onCleanIssues,
     isCleaningIssues,
+    diagnoseProgress,
     switchCooldownMs,
-    onSwitchCooldownChange
+    onSwitchCooldownChange,
+    timeoutGraceMs,
+    onTimeoutGraceChange
 }) => {
     const { t } = useTranslation();
 
@@ -150,8 +156,11 @@ const RegexSidebar: React.FC<Props> = ({
                         onJumpError={onJumpError}
                         onCleanIssues={onCleanIssues}
                         isCleaningIssues={isCleaningIssues}
+                        diagnoseProgress={diagnoseProgress}
                         switchCooldownMs={switchCooldownMs}
                         onSwitchCooldownChange={onSwitchCooldownChange}
+                        timeoutGraceMs={timeoutGraceMs}
+                        onTimeoutGraceChange={onTimeoutGraceChange}
                     />
                     {showLLM && (
                         <RegexLLMCard controller={activeController} />

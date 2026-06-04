@@ -10,7 +10,7 @@ import { Button, Tabs, TabsContent, TabsList, TabsTrigger, Select, SelectContent
 import { Save, Loader2, Plus, Trash2, ChevronDown, Folder, File, Info, Calendar, Hash, ChevronRight } from 'lucide-react';
 import { useRegexStore } from './store';
 
-import { EditorProps, DiagnoseError } from './types';
+import { EditorProps, DiagnoseError, DiagnoseProgress } from './types';
 import { RegexEditor, AstEditor } from '.';
 
 import { useGlobalStoreInstance } from '~/utils/store/global';
@@ -30,9 +30,16 @@ import { RegexSidebar } from './components/regex/regex-sidebar';
 import { TemplateCard } from './components/common/template-card';
 import { saveCurrentPluginEditorTranslation } from './save-current-translation';
 import {
+    getPluginFailureMessage,
     getPluginLoadState,
     getPluginRestorePlan,
+    forceUnloadPluginRuntime,
+    getRuntimeProbeSwitchError,
     normalizePluginSwitchCooldownMs,
+    normalizePluginTimeoutGraceMs,
+    PLUGIN_LOAD_TIMEOUT_DEFAULT_MS,
+    pluginSwitchTimeoutFromBaseline,
+    RuntimeCommandsApi,
     RuntimePluginApi,
 } from './runtime-plugin-state';
 
@@ -104,6 +111,7 @@ type PluginApi = RuntimePluginApi & {
     disablePlugin(id: string): Promise<void>;
     enablePlugin(id: string): Promise<void>;
     loadPlugin?(id: string): Promise<void>;
+    unloadPlugin?(id: string): Promise<void>;
     disablePluginAndSave?(id: string): Promise<void>;
     enablePluginAndSave?(id: string): Promise<void>;
 };
@@ -124,7 +132,33 @@ type PluginDiagnoseRuntime = {
 };
 
 type RuntimeProbeRequest = {
-    files: Array<{ file: string; code: string }>;
+    probeId: string;
+    files: Array<{ file: string }>;
+    label: string;
+};
+
+type PluginDiagnoseDraft = {
+    dict: Record<string, unknown>;
+    metadata?: unknown;
+};
+
+type EnablePluginProbeResult = {
+    state: ReturnType<typeof getPluginLoadState>;
+    loadDurationMs: number;
+};
+
+type RuntimeProbeResult = {
+    success: boolean;
+    error: string;
+    loadDurationMs?: number;
+    stopDurationMs?: number;
+};
+
+type DisablePluginProbeResult = {
+    state: ReturnType<typeof getPluginLoadState>;
+    durationMs: number;
+    usedForcedUnload: boolean;
+    forcedUnloadReason: string;
 };
 
 const countTranslationDictItems = (dict: unknown): number => {
@@ -156,20 +190,89 @@ const wait = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, r
 });
 const PLUGIN_POLL_INTERVAL_MS = 100;
 const PLUGIN_STOP_TIMEOUT_MS = 10000;
-const PLUGIN_LOAD_TIMEOUT_MS = 15000;
+const PLUGIN_LOAD_TIMEOUT_MS = PLUGIN_LOAD_TIMEOUT_DEFAULT_MS;
+
+const getManifestName = (manifest: unknown): string => {
+    if (!manifest || typeof manifest !== 'object') return '';
+    const name = (manifest as Record<string, unknown>).name;
+    return typeof name === 'string' ? name : '';
+};
+
+const readNoticeTexts = (): string[] => {
+    if (typeof document === 'undefined') return [];
+    const texts = new Set<string>();
+    document.querySelectorAll('.notice, .notice-message').forEach((element) => {
+        const text = element.textContent?.trim();
+        if (text) texts.add(text);
+    });
+    return Array.from(texts);
+};
+
+const readNewNoticeTexts = (snapshot: Set<string>): string[] => (
+    readNoticeTexts().filter(text => !snapshot.has(text))
+);
+
+const buildDiagnoseDraft = (
+    currentFile: string,
+    dictData: Record<string, any>,
+    astItems: Array<Record<string, any>>,
+    regexItems: Array<Record<string, any>>,
+    metadata: unknown,
+): PluginDiagnoseDraft => {
+    const dict = { ...dictData };
+    if (currentFile) {
+        dict[currentFile] = {
+            ast: astItems.map(item => ({
+                type: item.type,
+                name: item.name,
+                source: item.source,
+                target: item.target,
+            })),
+            regex: regexItems.map(item => ({
+                source: item.source,
+                target: item.target,
+            })),
+        };
+    }
+    return {
+        dict,
+        metadata: metadata && typeof metadata === 'object'
+            ? { ...(metadata as Record<string, unknown>) }
+            : metadata,
+    };
+};
 
 const waitForPluginLoaded = async (
     pluginsApi: PluginApi,
     pluginId: string,
-    timeoutMs = PLUGIN_LOAD_TIMEOUT_MS,
-    signal?: AbortSignal,
+    options: {
+        timeoutMs?: number;
+        signal?: AbortSignal;
+        noticeSnapshot?: Set<string>;
+        pluginName?: string;
+        ignoredRuntimeFailure?: string;
+    } = {},
 ) => {
+    const timeoutMs = options.timeoutMs ?? PLUGIN_LOAD_TIMEOUT_MS;
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-        throwIfDiagnoseStopped(signal);
+        throwIfDiagnoseStopped(options.signal);
         const state = getPluginLoadState(pluginsApi, pluginId);
         if (state.loaded) return state;
-        await wait(PLUGIN_POLL_INTERVAL_MS, signal);
+        const noticeFailure = getPluginFailureMessage(
+            {} as RuntimePluginApi,
+            pluginId,
+            options.noticeSnapshot ? readNewNoticeTexts(options.noticeSnapshot) : [],
+            options.pluginName,
+        );
+        if (noticeFailure) {
+            throw new Error(noticeFailure);
+        }
+        const runtimeFailure = getPluginFailureMessage(pluginsApi, pluginId, [], options.pluginName);
+        if (runtimeFailure && runtimeFailure !== options.ignoredRuntimeFailure) {
+            throw new Error(runtimeFailure);
+        }
+        await wait(PLUGIN_POLL_INTERVAL_MS, options.signal);
     }
     return getPluginLoadState(pluginsApi, pluginId);
 };
@@ -191,6 +294,24 @@ const waitForPluginStopped = async (
     return getPluginLoadState(pluginsApi, pluginId);
 };
 
+const withTimeout = async <T,>(
+    promise: Promise<T>,
+    timeoutMs: number,
+    message: string,
+): Promise<T> => {
+    let timer: number | null = null;
+    try {
+        return await Promise.race([
+            promise,
+            new Promise<T>((_, reject) => {
+                timer = window.setTimeout(() => reject(new Error(message)), timeoutMs);
+            }),
+        ]);
+    } finally {
+        if (timer !== null) window.clearTimeout(timer);
+    }
+};
+
 const formatPluginErrors = (...items: Array<[string, unknown | null]>) => {
     const details = items
         .filter(([, error]) => !!error)
@@ -208,28 +329,102 @@ const restorePluginAfterProbe = async (
     pluginId: string,
     startedState: ReturnType<typeof getPluginLoadState>,
     switchCooldownMs: number,
+    commandsApi?: RuntimeCommandsApi,
+    timeoutGraceMs?: number,
+    baselineLoadDurationMs?: number | null,
+    baselineStopDurationMs?: number | null,
 ) => {
     const normalizedSwitchCooldownMs = normalizePluginSwitchCooldownMs(switchCooldownMs);
     const restorePlan = getPluginRestorePlan(startedState);
+    const stopTimeoutMs = baselineStopDurationMs === null || baselineStopDurationMs === undefined
+        ? PLUGIN_STOP_TIMEOUT_MS
+        : pluginSwitchTimeoutFromBaseline(baselineStopDurationMs, timeoutGraceMs, PLUGIN_STOP_TIMEOUT_MS);
     const beforeRestoreState = getPluginLoadState(pluginsApi, pluginId);
     if (beforeRestoreState.loaded || beforeRestoreState.enabled) {
-        await pluginsApi.disablePlugin(pluginId);
-        await waitForPluginStopped(pluginsApi, pluginId, false);
+        await disablePluginForProbe(pluginsApi, pluginId, { commandsApi, timeoutMs: stopTimeoutMs });
         await wait(normalizedSwitchCooldownMs);
     }
     if (restorePlan.restoreLoaded) {
         await enablePluginForProbe(pluginsApi, pluginId, {
             save: restorePlan.saveEnabledState,
             requireLoaded: true,
+            loadTimeoutMs: baselineLoadDurationMs === null || baselineLoadDurationMs === undefined
+                ? PLUGIN_LOAD_TIMEOUT_MS
+                : pluginSwitchTimeoutFromBaseline(baselineLoadDurationMs, timeoutGraceMs, PLUGIN_LOAD_TIMEOUT_MS),
         });
         await wait(normalizedSwitchCooldownMs);
     } else {
         const stoppedState = getPluginLoadState(pluginsApi, pluginId);
         if (stoppedState.loaded || stoppedState.enabled) {
-            await pluginsApi.disablePlugin(pluginId);
-            await waitForPluginStopped(pluginsApi, pluginId, false);
+            await disablePluginForProbe(pluginsApi, pluginId, { commandsApi, timeoutMs: stopTimeoutMs });
         }
     }
+};
+
+const disablePluginForProbe = async (
+    pluginsApi: PluginApi,
+    pluginId: string,
+    options: {
+        signal?: AbortSignal;
+        timeoutMs?: number;
+        commandsApi?: RuntimeCommandsApi;
+    } = {},
+): Promise<DisablePluginProbeResult> => {
+    const startedAt = Date.now();
+    throwIfDiagnoseStopped(options.signal);
+    let state = getPluginLoadState(pluginsApi, pluginId);
+    if (!state.loaded && !state.enabled) {
+        return {
+            state,
+            durationMs: Date.now() - startedAt,
+            usedForcedUnload: false,
+            forcedUnloadReason: '',
+        };
+    }
+
+    let disableError: unknown = null;
+    const timeoutMs = options.timeoutMs ?? PLUGIN_STOP_TIMEOUT_MS;
+    try {
+        await withTimeout(
+            pluginsApi.disablePlugin(pluginId).then(() => waitForPluginStopped(
+                pluginsApi,
+                pluginId,
+                false,
+                timeoutMs,
+                options.signal,
+            )),
+            timeoutMs,
+            `插件关闭超时：${pluginId}`,
+        );
+    } catch (error) {
+        if (error instanceof DiagnoseStoppedError) {
+            throw error;
+        }
+        disableError = error;
+        console.warn(`[i18n] app.plugins.disablePlugin failed or timed out for ${pluginId}:`, error);
+    }
+
+    state = getPluginLoadState(pluginsApi, pluginId);
+    let usedForcedUnload = false;
+    let forcedUnloadReason = '';
+
+    if (state.loaded || state.enabled) {
+        usedForcedUnload = true;
+        forcedUnloadReason = disableError instanceof Error
+            ? disableError.message
+            : disableError
+                ? String(disableError)
+                : `插件关闭后状态异常：enabled=${state.enabled}, loaded=${state.loaded}`;
+        state = await forceUnloadPluginRuntime(pluginsApi, pluginId, {
+            commandsApi: options.commandsApi,
+        });
+    }
+    return {
+        state,
+        durationMs: Date.now() - startedAt,
+        usedForcedUnload,
+        forcedUnloadReason,
+    };
 };
 
 const enablePluginForProbe = async (
@@ -239,10 +434,14 @@ const enablePluginForProbe = async (
         save?: boolean;
         requireLoaded?: boolean;
         signal?: AbortSignal;
+        loadTimeoutMs?: number;
+        pluginName?: string;
     } = {},
-) => {
+): Promise<EnablePluginProbeResult> => {
     let enableError: unknown = null;
-    let loadError: unknown = null;
+    const noticeSnapshot = new Set(readNoticeTexts());
+    const ignoredRuntimeFailure = getPluginFailureMessage(pluginsApi, pluginId, [], options.pluginName);
+    const enableStartedAt = Date.now();
     try {
         if (options.save && pluginsApi.enablePluginAndSave) {
             await pluginsApi.enablePluginAndSave(pluginId);
@@ -254,21 +453,17 @@ const enablePluginForProbe = async (
     }
 
     let state = options.requireLoaded
-        ? await waitForPluginLoaded(pluginsApi, pluginId, PLUGIN_LOAD_TIMEOUT_MS, options.signal)
+        ? await waitForPluginLoaded(pluginsApi, pluginId, {
+            timeoutMs: options.loadTimeoutMs ?? PLUGIN_LOAD_TIMEOUT_MS,
+            signal: options.signal,
+            noticeSnapshot,
+            pluginName: options.pluginName,
+            ignoredRuntimeFailure,
+        })
         : getPluginLoadState(pluginsApi, pluginId);
-    if (options.requireLoaded && !state.loaded && pluginsApi.loadPlugin) {
-        throwIfDiagnoseStopped(options.signal);
-        try {
-            await pluginsApi.loadPlugin(pluginId);
-        } catch (error) {
-            loadError = error;
-        }
-        state = await waitForPluginLoaded(pluginsApi, pluginId, PLUGIN_LOAD_TIMEOUT_MS, options.signal);
-    }
     if (options.requireLoaded && !state.loaded) {
         const suffix = formatPluginErrors(
             [options.save ? 'enablePluginAndSave 错误' : 'enablePlugin 错误', enableError],
-            ['loadPlugin 错误', loadError],
         );
         throw new Error(`插件启用后状态异常：enabled=${state.enabled}, loaded=${state.loaded}${suffix}`);
     }
@@ -276,7 +471,10 @@ const enablePluginForProbe = async (
     if (enableError) {
         console.warn('[i18n] Plugin enable API reported an error, but final state is acceptable:', enableError);
     }
-    return state;
+    return {
+        state,
+        loadDurationMs: Date.now() - enableStartedAt,
+    };
 };
 
 const throwIfDiagnoseStopped = (signal?: AbortSignal) => {
@@ -318,12 +516,16 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
     const [isDiagnosing, setIsDiagnosing] = useState(false);
     const [isCleaningIssues, setIsCleaningIssues] = useState(false);
     const [errorItems, setErrorItems] = useState<DiagnoseError[]>([]);
+    const [diagnoseProgress, setDiagnoseProgress] = useState<DiagnoseProgress | null>(null);
     const [hasChecked, setHasChecked] = useState(false);
     const [activeTab, setActiveTab] = useState('ast');
     const [isAddPathDialogOpen, setIsAddPathDialogOpen] = useState(false);
     const [newPathInput, setNewPathInput] = useState('');
     const [switchCooldownMs, setSwitchCooldownMs] = useState(() => (
         normalizePluginSwitchCooldownMs(i18n.settings.preflightPluginSwitchCooldownMs)
+    ));
+    const [timeoutGraceMs, setTimeoutGraceMs] = useState(() => (
+        normalizePluginTimeoutGraceMs(i18n.settings.preflightPluginTimeoutGraceMs)
     ));
 
     const getExtractionSettings = React.useCallback(() => getEffectiveExtractionSettings(i18n.settings), [i18n.settings]);
@@ -332,6 +534,14 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
         const normalized = normalizePluginSwitchCooldownMs(value);
         setSwitchCooldownMs(normalized);
         i18n.settings.preflightPluginSwitchCooldownMs = normalized;
+        void i18n.saveSettings();
+        return normalized;
+    }, [i18n]);
+
+    const handleTimeoutGraceChange = React.useCallback((value: number) => {
+        const normalized = normalizePluginTimeoutGraceMs(value);
+        setTimeoutGraceMs(normalized);
+        i18n.settings.preflightPluginTimeoutGraceMs = normalized;
         void i18n.saveSettings();
         return normalized;
     }, [i18n]);
@@ -511,11 +721,7 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
     const handleStopDiagnose = React.useCallback(() => {
         const controller = diagnoseAbortRef.current;
         if (!isDiagnosing || !controller || controller.signal.aborted) return;
-        const runtime = diagnoseRuntimeRef.current;
         controller.abort();
-        if (runtime?.sessionId) {
-            void i18n.companionWorkerManager.cancelPluginDiagnoseCleanup({ sessionId: runtime.sessionId });
-        }
         notice.info(t('Editor.Notices.DiagnosisStopping'));
     }, [i18n, isDiagnosing, notice, t]);
 
@@ -525,7 +731,10 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
         diagnoseAbortRef.current = abortController;
         setIsDiagnosing(true);
         setErrorItems([]);
+        setDiagnoseProgress(null);
         setHasChecked(true);
+        let stopPluginForBackendWrite: ((useAbortSignal?: boolean) => Promise<void>) | null = null;
+        let restoreAfterBackendChange: (() => Promise<void>) | null = null;
         try {
             const signal = abortController.signal;
             const { metadata } = useRegexStore.getState();
@@ -553,22 +762,12 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
                 notice.error(t('Editor.Errors.NoMetadata'));
                 return;
             }
-            const { currentFile, astItems, regexItems, syncFileDictInfo } = useRegexStore.getState();
-            syncFileDictInfo(currentFile, astItems, regexItems);
-            const draftDict = useRegexStore.getState().dictData;
-            const draftCount = countTranslationDictItems(draftDict);
-            const diskSource = i18n.sourceManager.readSourceFile(activeSourceId);
-            const diskCount = countTranslationDictItems(diskSource?.dict);
-            if (diskCount > 0 && draftCount === 0) {
-                setHasChecked(false);
-                notice.error(t('Editor.Errors.DiagnosisWouldClearTranslations', { count: diskCount }));
-                return;
-            }
-            i18n.backupManager.backupTranslationSync(activeSourceId, i18n.sourceManager.sourcesDir);
-            await save(true);
+            const { currentFile, astItems, regexItems, dictData } = useRegexStore.getState();
+            const draft = buildDiagnoseDraft(currentFile, dictData, astItems, regexItems, metadata);
             throwIfDiagnoseStopped(signal);
 
             const pluginsApi = i18n.app.plugins as PluginApi;
+            const commandsApi = (i18n.app as any).commands as RuntimeCommandsApi | undefined;
             const normalizedSwitchCooldownMs = normalizePluginSwitchCooldownMs(switchCooldownMs);
             diagnoseRuntimeRef.current = {
                 pluginId,
@@ -582,83 +781,123 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
             const isApplied = !!(state && state.isApplied);
             // @ts-ignore
             const backupBasePath = path.join(basePath, i18n.manifest.dir || '');
+            const manifestName = getManifestName(manifest);
+            let baselineLoadDurationMs: number | null = null;
+            let baselineStopDurationMs: number | null = null;
 
-            const runProbe = async (probe: RuntimeProbeRequest) => {
-                const originals = new Map<string, string | null>();
-                const startedState = getPluginLoadState(pluginsApi, pluginId);
-                let stoppedError: DiagnoseStoppedError | null = null;
+            const startedState = getPluginLoadState(pluginsApi, pluginId);
+            restoreAfterBackendChange = async () => {
+                try {
+                    await restorePluginAfterProbe(
+                        pluginsApi,
+                        pluginId,
+                        startedState,
+                        normalizedSwitchCooldownMs,
+                        commandsApi,
+                        timeoutGraceMs,
+                        baselineLoadDurationMs,
+                        baselineStopDurationMs,
+                    );
+                } catch (restoreError) {
+                    console.error('[i18n] Failed to restore plugin state after diagnose probe:', restoreError);
+                }
+            };
+
+            stopPluginForBackendWrite = async (useAbortSignal = true) => {
+                const waitSignal = useAbortSignal ? signal : undefined;
+                const state = getPluginLoadState(pluginsApi, pluginId);
+                if (state.loaded || state.enabled) {
+                    await disablePluginForProbe(pluginsApi, pluginId, {
+                        signal: waitSignal,
+                        timeoutMs: baselineStopDurationMs === null
+                            ? PLUGIN_STOP_TIMEOUT_MS
+                            : pluginSwitchTimeoutFromBaseline(baselineStopDurationMs, timeoutGraceMs, PLUGIN_STOP_TIMEOUT_MS),
+                        commandsApi,
+                    });
+                    await wait(normalizedSwitchCooldownMs, waitSignal);
+                }
+            };
+
+            const runProbe = async (probe: RuntimeProbeRequest): Promise<RuntimeProbeResult> => {
                 try {
                     throwIfDiagnoseStopped(signal);
-                    for (const file of probe.files) {
-                        const targetPath = path.join(pluginDir, file.file);
-                        originals.set(file.file, fs.existsSync(targetPath) ? fs.readFileSync(targetPath, 'utf8') : null);
+                    const loadTimeoutMs = baselineLoadDurationMs === null
+                        ? PLUGIN_LOAD_TIMEOUT_MS
+                        : pluginSwitchTimeoutFromBaseline(baselineLoadDurationMs, timeoutGraceMs, PLUGIN_LOAD_TIMEOUT_MS);
+                    const enabled = await enablePluginForProbe(pluginsApi, pluginId, {
+                        requireLoaded: true,
+                        signal,
+                        loadTimeoutMs,
+                        pluginName: manifestName,
+                    });
+                    if (probe.label === '原始运行验证' && enabled.state.loaded) {
+                        baselineLoadDurationMs = enabled.loadDurationMs;
                     }
-
-                    const beforeReloadState = getPluginLoadState(pluginsApi, pluginId);
-                    if (beforeReloadState.loaded || beforeReloadState.enabled) {
-                        await pluginsApi.disablePlugin(pluginId);
-                        await waitForPluginStopped(pluginsApi, pluginId, false, PLUGIN_STOP_TIMEOUT_MS, signal);
-                        await wait(normalizedSwitchCooldownMs, signal);
-                    }
-
-                    throwIfDiagnoseStopped(signal);
-                    for (const file of probe.files) {
-                        const targetPath = path.join(pluginDir, file.file);
-                        fs.ensureDirSync(path.dirname(targetPath));
-                        fs.writeFileSync(targetPath, file.code, 'utf8');
-                    }
-
-                    await enablePluginForProbe(pluginsApi, pluginId, { requireLoaded: true, signal });
                     await wait(normalizedSwitchCooldownMs, signal);
                     const loadState = getPluginLoadState(pluginsApi, pluginId);
+                    const stopTimeoutMs = baselineStopDurationMs === null
+                        ? PLUGIN_STOP_TIMEOUT_MS
+                        : pluginSwitchTimeoutFromBaseline(baselineStopDurationMs, timeoutGraceMs, PLUGIN_STOP_TIMEOUT_MS);
+                    const stopped = await disablePluginForProbe(pluginsApi, pluginId, {
+                        signal,
+                        timeoutMs: stopTimeoutMs,
+                        commandsApi,
+                    });
+                    if (probe.label === '原始运行验证') {
+                        baselineStopDurationMs = stopped.durationMs;
+                    }
+                    const switchError = getRuntimeProbeSwitchError(
+                        loadState,
+                        stopped.usedForcedUnload,
+                        stopped.forcedUnloadReason,
+                    );
+                    await wait(normalizedSwitchCooldownMs, signal);
                     return {
-                        success: loadState.loaded,
-                        error: loadState.loaded ? '' : `插件启用后状态异常：enabled=${loadState.enabled}, loaded=${loadState.loaded}`,
+                        success: !switchError,
+                        error: switchError,
+                        loadDurationMs: enabled.loadDurationMs,
+                        stopDurationMs: stopped.durationMs,
                     };
                 } catch (error) {
                     if (error instanceof DiagnoseStoppedError) {
-                        stoppedError = error;
+                        throw error;
                     }
                     return {
                         success: false,
                         error: formatDiagnosticError(error),
                     };
-                } finally {
-                    for (const [file, content] of originals) {
-                        const targetPath = path.join(pluginDir, file);
-                        if (content === null) {
-                            if (fs.existsSync(targetPath)) fs.removeSync(targetPath);
-                        } else {
-                            fs.ensureDirSync(path.dirname(targetPath));
-                            fs.writeFileSync(targetPath, content, 'utf8');
-                        }
-                    }
-                    try {
-                        await restorePluginAfterProbe(pluginsApi, pluginId, startedState, normalizedSwitchCooldownMs);
-                    } catch (restoreError) {
-                        console.error('[i18n] Failed to restore plugin state after diagnose probe:', restoreError);
-                    }
-                    if (stoppedError) {
-                        throw stoppedError;
-                    }
                 }
             };
 
+            await stopPluginForBackendWrite();
+            const cjsEndpoint = await i18n.companionWorkerManager.getCjsEndpoint();
+            throwIfDiagnoseStopped(signal);
             let response = await i18n.companionWorkerManager.startPluginDiagnoseCleanup({
                 pluginId,
                 pluginDir,
                 backupBasePath,
                 persistence: { basePath: i18n.sourceManager.getBasePath() },
                 translationSourceId: activeSourceId,
+                draft,
+                cjsEndpoint,
                 applyAst,
                 applyRegex,
                 runtimeProbe: true,
                 isApplied,
             });
             throwIfDiagnoseStopped(signal);
+            i18n.sourceManager.reloadFromDisk();
+            useGlobalStoreInstance.setState({
+                editorPluginTranslation: {
+                    ...pluginTranslation,
+                    dict: draft.dict as any,
+                    metadata: draft.metadata as any,
+                },
+            });
             if (response.sessionId && diagnoseRuntimeRef.current) {
                 diagnoseRuntimeRef.current.sessionId = response.sessionId;
             }
+            setDiagnoseProgress(response.progress || null);
 
             while (response.status === 'probe' && response.sessionId && response.probe) {
                 throwIfDiagnoseStopped(signal);
@@ -677,7 +916,12 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
                 if (response.sessionId && diagnoseRuntimeRef.current) {
                     diagnoseRuntimeRef.current.sessionId = response.sessionId;
                 }
+                if (response.status === 'probe') {
+                    await stopPluginForBackendWrite();
+                }
+                setDiagnoseProgress(response.progress || null);
             }
+            await restoreAfterBackendChange();
 
             const results: DiagnoseError[] = (response.issueItems || []).map((item) => ({
                 type: item.kind,
@@ -704,23 +948,41 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
                 if (sessionId) {
                     try {
                         await i18n.companionWorkerManager.cancelPluginDiagnoseCleanup({ sessionId });
+                        await stopPluginForBackendWrite?.(false);
+                        await restoreAfterBackendChange?.();
                     } catch (cancelError) {
                         console.error('[i18n] Failed to cancel plugin diagnose cleanup:', cancelError);
                     }
+                } else {
+                    await restoreAfterBackendChange?.();
                 }
                 setHasChecked(false);
+                setDiagnoseProgress(null);
                 notice.info(t('Editor.Notices.DiagnosisStopped'));
             } else {
-                notice.error(t('Common.Status.Failure') + ' ' + t('Editor.Notices.DiagnosisSuccess') + ': ' + e);
+                const sessionId = diagnoseRuntimeRef.current?.sessionId;
+                if (sessionId) {
+                    try {
+                        await i18n.companionWorkerManager.cancelPluginDiagnoseCleanup({ sessionId });
+                        await stopPluginForBackendWrite?.(false);
+                        await restoreAfterBackendChange?.();
+                    } catch (cleanupError) {
+                        console.error('[i18n] Failed to cleanup plugin diagnose after error:', cleanupError);
+                    }
+                } else {
+                    await restoreAfterBackendChange?.();
+                }
+                notice.error(t('Common.Status.Failure') + ' ' + t('Editor.Notices.DiagnosisFailed') + ': ' + e);
             }
         } finally {
             if (diagnoseAbortRef.current === abortController) {
                 diagnoseAbortRef.current = null;
             }
             diagnoseRuntimeRef.current = null;
+            setDiagnoseProgress(null);
             setIsDiagnosing(false);
         }
-    }, [i18n, notice, t, isDiagnosing, save, setDictData, setCurrentFile, switchCooldownMs]);
+    }, [i18n, notice, t, isDiagnosing, save, setDictData, setCurrentFile, switchCooldownMs, timeoutGraceMs]);
 
     const handleJumpError = React.useCallback((error: DiagnoseError) => {
         if (error.file) {
@@ -969,8 +1231,11 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
                                     onJumpError={handleJumpError}
                                     onCleanIssues={handleCleanDiagnoseIssues}
                                     isCleaningIssues={isCleaningIssues}
+                                    diagnoseProgress={diagnoseProgress}
                                     switchCooldownMs={switchCooldownMs}
                                     onSwitchCooldownChange={handleSwitchCooldownChange}
+                                    timeoutGraceMs={timeoutGraceMs}
+                                    onTimeoutGraceChange={handleTimeoutGraceChange}
                                 />
                             </TabsContent>
                             <TabsContent value="regex" className="flex-1 min-h-0 m-0 overflow-hidden outline-none">
@@ -988,8 +1253,11 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
                                     onJumpError={handleJumpError}
                                     onCleanIssues={handleCleanDiagnoseIssues}
                                     isCleaningIssues={isCleaningIssues}
+                                    diagnoseProgress={diagnoseProgress}
                                     switchCooldownMs={switchCooldownMs}
                                     onSwitchCooldownChange={handleSwitchCooldownChange}
+                                    timeoutGraceMs={timeoutGraceMs}
+                                    onTimeoutGraceChange={handleTimeoutGraceChange}
                                 />
                             </TabsContent>
                         </div>
