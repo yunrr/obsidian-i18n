@@ -1,6 +1,5 @@
 import React, { useState, useMemo } from 'react';
 import { PluginManifest, Notice } from 'obsidian';
-import * as path from 'path';
 import * as fs from 'fs-extra';
 import { useTranslation } from 'react-i18next';
 import { Settings, FolderOpen, Pen, FileOutput, XCircle, Loader2, MoreHorizontal, CloudDownload, Cloud } from 'lucide-react';
@@ -9,6 +8,7 @@ import { i18nOpen } from '../../../utils/common/general';
 import { getPluginTranslationSources, hasExtractedTranslationContent, calculateChecksum } from '../../../utils/translator/light';
 import { openPluginSourceEditor } from '../utils/source-editor';
 import { getEffectiveExtractionSettings } from '../../../utils/translator/config';
+import { getSlowestApplyPluginStage, runPluginApplyTranslationFlow, type ApplyPluginLogEvent } from './plugin-apply-flow';
 import {
     Button,
     Select,
@@ -71,6 +71,30 @@ interface PluginItemProps {
     reloadPlugin: (id: string) => Promise<boolean>;
     close: () => void;
     viewMode: 'list' | 'grid';
+}
+
+function notifyApplyLog(i18n: I18N, event: ApplyPluginLogEvent) {
+    const prefix = '应用译文日志';
+    const consolePayload = {
+        stage: event.stage,
+        status: event.status,
+        durationMs: event.durationMs,
+        error: event.error,
+        message: event.message,
+    };
+
+    if (event.status === 'failure') {
+        console.warn('[i18n] Apply translation step failed', consolePayload);
+        i18n.notice.errorPrefix(prefix, event.message, 10000);
+        return;
+    }
+
+    console.info('[i18n] Apply translation step', consolePayload);
+    if (event.status === 'success') {
+        i18n.notice.successPrefix(prefix, event.message, 5000);
+        return;
+    }
+    i18n.notice.infoPrefix(prefix, event.message, 5000);
 }
 
 export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n, settings, isEnabled, data, reloadPlugin, refreshParent, close, viewMode }) => {
@@ -243,51 +267,27 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
         }
         setReplacing(true);
         try {
-            if (!activeSourceId) throw new Error(t('Manager.Common.Errors.ErrorDesc'));
-            const applyAst = i18n.settings.applyAstTranslations !== false;
-            const applyRegex = i18n.settings.applyRegexTranslations !== false;
-            if (!applyAst && !applyRegex) {
-                i18n.notice.warning(t('Common.Notices.NoApplyTranslationKinds'));
-                return;
-            }
-            // @ts-ignore
-            const backupBasePath = path.join(path.normalize(i18n.app.vault.adapter.getBasePath()), i18n.manifest.dir || '');
-            const cjsEndpoint = await i18n.companionWorkerManager.getCjsEndpoint();
-            const result = await i18n.companionWorkerManager.applyPluginTranslation({
-                pluginId: plugin.id,
+            const result = await runPluginApplyTranslationFlow({
+                plugin,
                 pluginDir,
-                backupBasePath,
-                persistence: { basePath: i18n.sourceManager.getBasePath() },
-                translationSourceId: activeSourceId,
-                applyAst,
-                applyRegex,
-                cjsEndpoint,
+                activeSourceId,
+                isEnabled,
+                translationVersion,
+                i18n,
+                refreshParent,
+                onLog: event => notifyApplyLog(i18n, event),
+                messages: {
+                    genericError: t('Manager.Common.Errors.ErrorDesc'),
+                    noApplyTranslationKinds: t('Common.Notices.NoApplyTranslationKinds'),
+                    reloadSuccessTitle: t('Manager.Plugins.Notices.ReloadSuccess') || '插件重载成功',
+                    loadFailedAfterApply: t('Manager.Plugins.Errors.LoadFailedAfterApply') || '插件重载失败，译文已写入，请手动检查插件状态。',
+                },
             });
-            if (!result.state) throw new Error(result.error || t('Manager.Common.Errors.ErrorDesc'));
-            i18n.stateManager.setPluginState(plugin.id, {
-                id: plugin.id,
-                isApplied: true,
-                pluginVersion: plugin.version,
-                translationVersion: result.translationVersion || translationVersion || '0.0.0',
-            });
-            if (isEnabled) {
-                try {
-                    // @ts-ignore
-                    if (i18n.app.plugins.enabledPlugins.has(plugin.id)) {
-                        // @ts-ignore
-                        await i18n.app.plugins.disablePlugin(plugin.id);
-                    }
-                    // @ts-ignore
-                    await i18n.app.plugins.enablePlugin(plugin.id);
-                    i18n.notice.successPrefix(t('Manager.Plugins.Notices.ReloadSuccess') || '插件重载成功', plugin.id);
-                } catch (error) {
-                    console.warn('[i18n] Plugin reload failed after apply:', error);
-                    i18n.notice.warning(`${t('Manager.Plugins.Errors.LoadFailedAfterApply') || '插件重载失败，译文已写入，请手动检查插件状态。'} ${String(error)}`);
-                }
+            const slowest = getSlowestApplyPluginStage(result.timings);
+            if (slowest) {
+                i18n.notice.infoPrefix('应用译文日志', `最慢步骤：${slowest.stage}（${slowest.durationMs}ms）`, 8000);
+                console.info('[i18n] Apply translation slowest step', slowest);
             }
-            refreshParent();
-        } catch (error) {
-            i18n.notice.result(false, String(error));
         } finally {
             setReplacing(false);
         }
