@@ -7841,7 +7841,7 @@ async fn handle_plugin_translate(
 
     let mut failures = Vec::new();
     let mut processed_items = 0usize;
-    let ast_result = translate_value_batches(&ast_items, &config.prompts.ast, &config, |item| json!({ "i": item["id"], "s": item["source"], "y": item["type"], "n": item["name"] }), task.clone()).await;
+    let ast_result = translate_value_batch_report_with_policy(&ast_items, &config.prompts.ast, &config, |item| json!({ "i": item["id"], "s": item["source"], "y": item["type"], "n": item["name"] }), task.clone(), false).await?;
     apply_plugin_batch_result(
         &mut translation_json,
         ast_result,
@@ -7852,14 +7852,15 @@ async fn handle_plugin_translate(
         &mut failures,
         &mut processed_items,
     )?;
-    let regex_result = translate_value_batches(
+    let regex_result = translate_value_batch_report_with_policy(
         &regex_items,
         &config.prompts.regex,
         &config,
         |item| json!({ "i": item["id"], "s": item["source"] }),
         task.clone(),
+        false,
     )
-    .await;
+    .await?;
     apply_plugin_batch_result(
         &mut translation_json,
         regex_result,
@@ -7880,7 +7881,7 @@ async fn handle_plugin_translate(
 
 fn apply_plugin_batch_result(
     translation_json: &mut Value,
-    result: Result<Vec<Value>>,
+    report: ValueBatchReport,
     batch_type: &str,
     resource_id: &str,
     resource_label: &str,
@@ -7888,40 +7889,62 @@ fn apply_plugin_batch_result(
     failures: &mut Vec<CompanionBatchFailure>,
     processed_items: &mut usize,
 ) -> Result<()> {
-    match result {
-        Ok(items) => {
-            for item in &items {
-                let file = item.get("file").and_then(Value::as_str).unwrap_or_default();
-                let index = item
-                    .get("dictIndex")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(usize::MAX as u64) as usize;
-                if let Some(target) = item.get("target").and_then(Value::as_str) {
-                    if let Some(target_slot) = translation_json.pointer_mut(&format!(
-                        "/dict/{}/{}/{}/target",
-                        escape_pointer(file),
-                        batch_type,
-                        index
-                    )) {
-                        *target_slot = Value::String(target.to_string());
-                    }
-                }
+    for item in &report.translated_items {
+        let file = item.get("file").and_then(Value::as_str).unwrap_or_default();
+        let index = item
+            .get("dictIndex")
+            .and_then(Value::as_u64)
+            .unwrap_or(usize::MAX as u64) as usize;
+        if let Some(target) = item.get("target").and_then(Value::as_str) {
+            if let Some(target_slot) = translation_json.pointer_mut(&format!(
+                "/dict/{}/{}/{}/target",
+                escape_pointer(file),
+                batch_type,
+                index
+            )) {
+                *target_slot = Value::String(target.to_string());
             }
-            *processed_items += items.len();
-        }
-        Err(error) if error.to_string().contains(MANUAL_STOP) => return Err(error),
-        Err(error) => {
-            failures.push(CompanionBatchFailure {
-                resource_id: resource_id.to_string(),
-                resource_label: resource_label.to_string(),
-                source_id: source_id.to_string(),
-                batch_type: batch_type.to_string(),
-                error_message: error.to_string(),
-                items: Vec::new(),
-            });
         }
     }
+    *processed_items += report.translated_items.len();
+    append_value_batch_failures(
+        failures,
+        report.failures,
+        resource_id,
+        resource_label,
+        source_id,
+        batch_type,
+    );
     Ok(())
+}
+
+fn append_value_batch_failures(
+    failures: &mut Vec<CompanionBatchFailure>,
+    batch_failures: Vec<ValueBatchFailure>,
+    resource_id: &str,
+    resource_label: &str,
+    source_id: &str,
+    batch_type: &str,
+) {
+    for failure in batch_failures {
+        let items = failure
+            .items
+            .iter()
+            .map(packed_failure_item)
+            .filter(|item| item.dict_index >= 0)
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            continue;
+        }
+        failures.push(CompanionBatchFailure {
+            resource_id: resource_id.to_string(),
+            resource_label: resource_label.to_string(),
+            source_id: source_id.to_string(),
+            batch_type: batch_type.to_string(),
+            error_message: failure.error_message,
+            items,
+        });
+    }
 }
 
 async fn handle_theme_translate(
@@ -7957,43 +7980,39 @@ async fn handle_theme_translate(
             .collect()
     }).unwrap_or_default();
 
-    let result = translate_value_batches(
+    let report = translate_value_batch_report_with_policy(
         &items,
         &config.prompts.theme,
         &config,
         |item| json!({ "i": item["id"], "s": item["source"], "y": item["type"] }),
         task,
+        false,
     )
-    .await;
+    .await?;
     let mut failures = Vec::new();
     let mut processed_items = 0;
-    match result {
-        Ok(items) => {
-            for item in &items {
-                let index = item
-                    .get("dictIndex")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(usize::MAX as u64) as usize;
-                if let Some(target) = item.get("target").and_then(Value::as_str) {
-                    if let Some(target_slot) =
-                        translation_json.pointer_mut(&format!("/dict/{}/target", index))
-                    {
-                        *target_slot = Value::String(target.to_string());
-                    }
-                }
+    for item in &report.translated_items {
+        let index = item
+            .get("dictIndex")
+            .and_then(Value::as_u64)
+            .unwrap_or(usize::MAX as u64) as usize;
+        if let Some(target) = item.get("target").and_then(Value::as_str) {
+            if let Some(target_slot) =
+                translation_json.pointer_mut(&format!("/dict/{}/target", index))
+            {
+                *target_slot = Value::String(target.to_string());
             }
-            processed_items += items.len();
         }
-        Err(error) if error.to_string().contains(MANUAL_STOP) => return Err(error),
-        Err(error) => failures.push(CompanionBatchFailure {
-            resource_id,
-            resource_label,
-            source_id,
-            batch_type: "theme".to_string(),
-            error_message: error.to_string(),
-            items: Vec::new(),
-        }),
     }
+    processed_items += report.translated_items.len();
+    append_value_batch_failures(
+        &mut failures,
+        report.failures,
+        &resource_id,
+        &resource_label,
+        &source_id,
+        "theme",
+    );
     Ok(TranslateResult {
         translation_json,
         processed_items,
@@ -8001,6 +8020,7 @@ async fn handle_theme_translate(
     })
 }
 
+#[cfg(test)]
 async fn translate_value_batches<F>(
     items: &[Value],
     prompt: &str,
@@ -8011,15 +8031,48 @@ async fn translate_value_batches<F>(
 where
     F: Fn(&Value) -> Value,
 {
-    if items.is_empty() {
-        return Ok(Vec::new());
+    let report = translate_value_batch_report(items, prompt, config, simplify, task).await?;
+    if let Some(error) = report.first_error {
+        return Err(anyhow!(error));
     }
-    let mut output = Vec::new();
+    if !report.failed_items.is_empty() {
+        return Err(anyhow!("翻译返回缺少部分条目或包含空译文"));
+    }
+    Ok(report.translated_items)
+}
+
+async fn translate_value_batch_report<F>(
+    items: &[Value],
+    prompt: &str,
+    config: &CompanionTranslationConfig,
+    simplify: F,
+    task: Option<Arc<TaskRuntime>>,
+) -> Result<ValueBatchReport>
+where
+    F: Fn(&Value) -> Value,
+{
+    translate_value_batch_report_with_policy(items, prompt, config, simplify, task, true).await
+}
+
+async fn translate_value_batch_report_with_policy<F>(
+    items: &[Value],
+    prompt: &str,
+    config: &CompanionTranslationConfig,
+    simplify: F,
+    task: Option<Arc<TaskRuntime>>,
+    stop_on_request_error: bool,
+) -> Result<ValueBatchReport>
+where
+    F: Fn(&Value) -> Value,
+{
+    if items.is_empty() {
+        return Ok(ValueBatchReport::default());
+    }
+    let mut report = ValueBatchReport::default();
     let batches = split_translation_batches(items, config.batch_size, config.batch_char_limit);
     let concurrency = config.concurrency.max(1).min(batches.len().max(1));
     let mut handles = JoinSet::new();
     let mut next_batch = 0usize;
-    let mut first_error: Option<anyhow::Error> = None;
 
     while next_batch < batches.len() && handles.len() < concurrency {
         if let Some(task) = &task {
@@ -8053,6 +8106,7 @@ where
         }
         match result {
             Ok(translated) => {
+                let mut failed_items = Vec::new();
                 for item in &batch {
                     let id = item.get("id").and_then(Value::as_u64).unwrap_or(0);
                     let mut mapped = item.clone();
@@ -8062,24 +8116,33 @@ where
                         .map(|entry| entry.t.as_str())
                         .filter(|value| is_valid_translated_target(value));
                     let Some(target) = target else {
-                        if first_error.is_none() {
-                            first_error = Some(anyhow!("翻译返回缺少部分条目或包含空译文"));
-                        }
+                        failed_items.push(item.clone());
                         continue;
                     };
                     mapped["target"] = Value::String(target.to_string());
-                    output.push(mapped);
+                    report.translated_items.push(mapped);
+                }
+                if !failed_items.is_empty() {
+                    report.push_failure(
+                        "翻译返回缺少部分条目或包含空译文".to_string(),
+                        failed_items,
+                    );
                 }
             }
             Err(error) if error.to_string().contains(MANUAL_STOP) => return Err(error),
             Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
+                let error_message = error.to_string();
+                if stop_on_request_error && report.first_error.is_none() {
+                    report.first_error = Some(error_message.clone());
                 }
+                report.push_failure(error_message, batch);
             }
         }
 
-        while first_error.is_none() && next_batch < batches.len() && handles.len() < concurrency {
+        while (!stop_on_request_error || report.first_error.is_none())
+            && next_batch < batches.len()
+            && handles.len() < concurrency
+        {
             if let Some(task) = &task {
                 ensure_not_cancelled(task).await?;
             }
@@ -8101,10 +8164,7 @@ where
             });
         }
     }
-    if let Some(error) = first_error {
-        return Err(error);
-    }
-    Ok(output)
+    Ok(report)
 }
 
 fn split_translation_batches(items: &[Value], batch_size: usize, batch_char_limit: usize) -> Vec<Vec<Value>> {
@@ -8156,6 +8216,33 @@ fn translation_batch_source_char_count(batch: &[Value]) -> usize {
 struct TranslationPair {
     i: u64,
     t: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ValueBatchReport {
+    translated_items: Vec<Value>,
+    failed_items: Vec<Value>,
+    failures: Vec<ValueBatchFailure>,
+    first_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ValueBatchFailure {
+    error_message: String,
+    items: Vec<Value>,
+}
+
+impl ValueBatchReport {
+    fn push_failure(&mut self, error_message: String, items: Vec<Value>) {
+        if items.is_empty() {
+            return;
+        }
+        self.failed_items.extend(items.iter().cloned());
+        self.failures.push(ValueBatchFailure {
+            error_message,
+            items,
+        });
+    }
 }
 
 async fn call_chat_completion(
@@ -8482,39 +8569,43 @@ fn parse_translation_response(content: &str) -> Result<Vec<TranslationPair>> {
             }
         }
     }
-    let cleaned = Regex::new(r"[\u{0000}-\u{001F}]+")?
-        .replace_all(&text, " ")
-        .to_string();
-    let cleaned = Regex::new(r",\s*([\]}])")?
-        .replace_all(&cleaned, "$1")
-        .to_string();
-    if let Ok(parsed) = serde_json::from_str::<Value>(&cleaned) {
-        if let Ok(items) = extract_translation_array(&parsed) {
-            if !items.is_empty() {
-                return Ok(items);
-            }
-        }
-    }
-
-    let fallback_re = Regex::new(r#""i"\s*:\s*(\d+)\s*,\s*"t"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)""#)?;
+    let fallback_re = Regex::new(r#""i"\s*:\s*(\d+)\s*,\s*"t"\s*:\s*""#)?;
     let mut output = Vec::new();
-    for captures in fallback_re.captures_iter(content) {
+    for captures in fallback_re.captures_iter(&text) {
         let i = captures.get(1).unwrap().as_str().parse::<u64>()?;
-        let raw = captures.get(2).unwrap().as_str();
-        let t = serde_json::from_str::<String>(&format!("\"{}\"", raw)).unwrap_or_else(|_| {
-            raw.replace("\\n", "\n")
-                .replace("\\\"", "\"")
-                .replace("\\\\", "\\")
-        });
-        output.push(TranslationPair { i, t });
+        let Some(marker) = captures.get(0) else {
+            continue;
+        };
+        if let Some(t) = raw_t_field_until_object_end(&text, marker.end()) {
+            output.push(TranslationPair { i, t });
+        }
     }
     if output.is_empty() {
         Err(anyhow!(
-            "AI 返回数据格式严重损坏，正则急救也未能提取到业务结构 ({{i, t}})。"
+            "AI 返回数据格式严重损坏，原样提取也未能提取到业务结构 ({{i, t}})。"
         ))
     } else {
         Ok(output)
     }
+}
+
+fn raw_t_field_until_object_end(text: &str, start: usize) -> Option<String> {
+    let tail = text.get(start..)?;
+    for (offset, ch) in tail.char_indices() {
+        if ch != '"' {
+            continue;
+        }
+        let quote_end = start + offset + ch.len_utf8();
+        if text
+            .get(quote_end..)?
+            .trim_start()
+            .starts_with('}')
+        {
+            return text.get(start..start + offset).map(str::to_string);
+        }
+    }
+    tail.find('}')
+        .and_then(|end| text.get(start..start + end).map(str::to_string))
 }
 
 fn extract_translation_array(value: &Value) -> Result<Vec<TranslationPair>> {
@@ -8621,7 +8712,6 @@ async fn handle_plugin_retry(payload: Value, task: Option<Arc<TaskRuntime>>) -> 
     let mut regex_id = 0u64;
     let mut ast_failure_item_counts = HashMap::<String, usize>::new();
     let mut regex_failure_item_counts = HashMap::<String, usize>::new();
-    let mut retry_failure_ids = Vec::<String>::new();
     let mut processed_items = 0usize;
 
     for failure in failures {
@@ -8648,7 +8738,6 @@ async fn handle_plugin_retry(payload: Value, task: Option<Arc<TaskRuntime>>) -> 
             skipped_ids.push(failure_id);
             continue;
         }
-        retry_failure_ids.push(failure_id.clone());
         if batch_type == "ast" {
             ast_failure_item_counts.insert(failure_id.clone(), failure_items.len());
         } else {
@@ -8681,7 +8770,7 @@ async fn handle_plugin_retry(payload: Value, task: Option<Arc<TaskRuntime>>) -> 
         }
     }
 
-    let ast_result = translate_value_batches(
+    let ast_result = translate_value_batch_report(
         &ast_items,
         &config.prompts.ast,
         &config,
@@ -8699,7 +8788,7 @@ async fn handle_plugin_retry(payload: Value, task: Option<Arc<TaskRuntime>>) -> 
         &ast_failure_item_counts,
     )?;
 
-    let regex_result = translate_value_batches(
+    let regex_result = translate_value_batch_report(
         &regex_items,
         &config.prompts.regex,
         &config,
@@ -8717,22 +8806,13 @@ async fn handle_plugin_retry(payload: Value, task: Option<Arc<TaskRuntime>>) -> 
         &regex_failure_item_counts,
     )?;
 
-    for failure_id in retry_failure_ids {
-        if !completed_ids.contains(&failure_id)
-            && !failed_ids.contains(&failure_id)
-            && !skipped_ids.contains(&failure_id)
-        {
-            failed_ids.push(failure_id);
-        }
-    }
-
     Ok(
         json!({ "updates": updates, "processedItems": processed_items, "completedFailureIds": completed_ids, "failedFailureIds": failed_ids, "skippedFailureIds": skipped_ids }),
     )
 }
 
 fn apply_plugin_retry_result(
-    result: Result<Vec<Value>>,
+    result: Result<ValueBatchReport>,
     batch_type: &str,
     updates: &mut Vec<Value>,
     processed_items: &mut usize,
@@ -8741,10 +8821,10 @@ fn apply_plugin_retry_result(
     failure_item_counts: &HashMap<String, usize>,
 ) -> Result<()> {
     match result {
-        Ok(result_items) => {
-            *processed_items += result_items.len();
+        Ok(report) => {
+            *processed_items += report.translated_items.len() + report.failed_items.len();
             let mut result_counts = HashMap::<String, usize>::new();
-            for item in result_items {
+            for item in report.translated_items {
                 let failure_id = item
                     .get("failureId")
                     .and_then(Value::as_str)
@@ -8760,6 +8840,16 @@ fn apply_plugin_retry_result(
                     push_unique(failed_ids, failure_id.clone());
                 }
             }
+            for item in report.failed_items {
+                let failure_id = item
+                    .get("failureId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if !failure_id.is_empty() {
+                    push_unique(failed_ids, failure_id);
+                }
+            }
         }
         Err(error) if error.to_string().contains(MANUAL_STOP) => return Err(error),
         Err(_) => {
@@ -8773,7 +8863,7 @@ fn apply_plugin_retry_result(
 }
 
 fn apply_theme_retry_result(
-    result: Result<Vec<Value>>,
+    result: Result<ValueBatchReport>,
     updates: &mut Vec<Value>,
     processed_items: &mut usize,
     completed_ids: &mut Vec<String>,
@@ -8781,10 +8871,10 @@ fn apply_theme_retry_result(
     failure_item_counts: &HashMap<String, usize>,
 ) -> Result<()> {
     match result {
-        Ok(result_items) => {
-            *processed_items += result_items.len();
+        Ok(report) => {
+            *processed_items += report.translated_items.len() + report.failed_items.len();
             let mut result_counts = HashMap::<String, usize>::new();
-            for item in result_items {
+            for item in report.translated_items {
                 let failure_id = item
                     .get("failureId")
                     .and_then(Value::as_str)
@@ -8798,6 +8888,16 @@ fn apply_theme_retry_result(
                     push_unique(completed_ids, failure_id.clone());
                 } else if result_counts.contains_key(failure_id) {
                     push_unique(failed_ids, failure_id.clone());
+                }
+            }
+            for item in report.failed_items {
+                let failure_id = item
+                    .get("failureId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if !failure_id.is_empty() {
+                    push_unique(failed_ids, failure_id);
                 }
             }
         }
@@ -8868,7 +8968,7 @@ async fn handle_theme_retry(payload: Value, task: Option<Arc<TaskRuntime>>) -> R
         }
     }
 
-    let result = translate_value_batches(
+    let result = translate_value_batch_report(
         &items,
         &config.prompts.theme,
         &config,
@@ -8884,15 +8984,6 @@ async fn handle_theme_retry(payload: Value, task: Option<Arc<TaskRuntime>>) -> R
         &mut failed_ids,
         &failure_item_counts,
     )?;
-
-    for failure_id in failure_item_counts.keys() {
-        if !completed_ids.contains(failure_id)
-            && !failed_ids.contains(failure_id)
-            && !skipped_ids.contains(failure_id)
-        {
-            failed_ids.push(failure_id.clone());
-        }
-    }
 
     Ok(
         json!({ "updates": updates, "processedItems": processed_items, "completedFailureIds": completed_ids, "failedFailureIds": failed_ids, "skippedFailureIds": skipped_ids }),
@@ -9116,6 +9207,55 @@ mod tests {
         time::{sleep, Duration as TokioDuration},
     };
 
+    fn test_app_state(plugin_dir: PathBuf) -> AppState {
+        AppState {
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            diagnose_sessions: Arc::new(Mutex::new(HashMap::new())),
+            persistence_lock: Arc::new(Mutex::new(())),
+            plugin_dir,
+            http: reqwest::Client::new(),
+            shutdown: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn test_task(total_resources: usize, total_items: usize) -> Arc<TaskRuntime> {
+        Arc::new(TaskRuntime {
+            progress: Mutex::new(CompanionTaskProgress {
+                task_id: "task".to_string(),
+                scope: "plugin".to_string(),
+                mode: "translate".to_string(),
+                status: "running".to_string(),
+                current_label: String::new(),
+                processed_resources: 0,
+                total_resources,
+                processed_items: 0,
+                total_items,
+                success_count: 0,
+                failed_count: 0,
+                skipped_count: 0,
+                source_revision: 0,
+                record_revision: 0,
+                updated_at: 0,
+                error: None,
+            }),
+            cancel_requested: Mutex::new(false),
+        })
+    }
+
+    async fn write_test_http_json_response(
+        stream: &mut tokio::net::TcpStream,
+        status: &str,
+        body: &Value,
+    ) {
+        let body = body.to_string();
+        let response = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+    }
+
     #[test]
     fn translate_window_item_limit_feeds_concurrency_without_scaling_to_resources() {
         assert_eq!(translate_window_item_limit(5, 3, 4), 60);
@@ -9173,6 +9313,28 @@ mod tests {
             Some("abcdefghijk")
         );
         assert_eq!(batches[1].len(), 1);
+    }
+
+    #[test]
+    fn parse_translation_response_reads_malformed_t_field_raw() {
+        let items =
+            parse_translation_response(r#"{"items":[{"i":350,"t":""text:sdjifsjk"}]}"#)
+                .unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].i, 350);
+        assert_eq!(items[0].t, r#""text:sdjifsjk"#);
+    }
+
+    #[test]
+    fn parse_translation_response_raw_fallback_does_not_unescape() {
+        let items = parse_translation_response(
+            r#"{"items":[{"i":350,"t":"line\nraw"broken"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].t, r#"line\nraw"broken"#);
     }
 
     #[test]
@@ -9724,6 +9886,191 @@ mod tests {
         assert_eq!(progress.processed_items, 1);
         assert_eq!(progress.success_count, 1);
         let _ = fs::remove_dir_all(base_path);
+    }
+
+    #[tokio::test]
+    async fn plugin_translate_keeps_successes_when_response_has_item_level_failures() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = read_test_http_request(&mut stream).await;
+            write_test_http_json_response(
+                &mut stream,
+                "200 OK",
+                &json!({
+                    "choices": [{
+                        "message": { "content": "{\"items\":[{\"i\":0,\"t\":\"甲\"},{\"i\":1,\"t\":\"\"}]}" },
+                        "finish_reason": "stop"
+                    }]
+                }),
+            )
+            .await;
+        });
+
+        let result = handle_plugin_translate(
+            json!({
+                "resourceId": "plugin-a",
+                "resourceLabel": "Plugin A",
+                "sourceId": "source-a",
+                "translationJson": {
+                    "schemaVersion": 1,
+                    "metadata": { "plugin": "plugin-a", "title": "Plugin A", "version": "1.0.0" },
+                    "dict": {
+                        "main.js": {
+                            "ast": [],
+                            "regex": [
+                                { "source": "A", "target": "" },
+                                { "source": "B", "target": "" },
+                                { "source": "C", "target": "" }
+                            ]
+                        }
+                    }
+                },
+                "config": {
+                    "chatCompletionsUrl": format!("http://{addr}/v1/chat/completions"),
+                    "apiKey": "test",
+                    "model": "test",
+                    "timeoutMs": 5000,
+                    "responseFormat": "json_object",
+                    "batchSize": 3,
+                    "batchCharLimit": 0,
+                    "batchWindowMultiplier": 4,
+                    "overwriteExistingTranslations": false,
+                    "concurrency": 1,
+                    "prompts": { "ast": "", "regex": "", "theme": "" }
+                }
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result
+                .translation_json
+                .pointer("/dict/main.js/regex/0/target")
+                .and_then(Value::as_str),
+            Some("甲")
+        );
+        assert_eq!(
+            result
+                .translation_json
+                .pointer("/dict/main.js/regex/1/target")
+                .and_then(Value::as_str),
+            Some("")
+        );
+        assert_eq!(
+            result
+                .translation_json
+                .pointer("/dict/main.js/regex/2/target")
+                .and_then(Value::as_str),
+            Some("")
+        );
+        assert_eq!(result.processed_items, 1);
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(result.failures[0].batch_type, "regex");
+        let failed_indexes = result.failures[0]
+            .items
+            .iter()
+            .map(|item| item.dict_index)
+            .collect::<Vec<_>>();
+        assert_eq!(failed_indexes, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn plugin_translate_keeps_successes_when_sibling_request_batch_fails() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let request = read_test_http_request(&mut stream).await;
+                    let id = request_item_id(&request);
+                    if id == 0 {
+                        write_test_http_json_response(
+                            &mut stream,
+                            "500 Internal Server Error",
+                            &json!({ "error": { "message": "bad batch" } }),
+                        )
+                        .await;
+                    } else {
+                        write_test_http_json_response(
+                            &mut stream,
+                            "200 OK",
+                            &json!({
+                                "choices": [{
+                                    "message": { "content": "{\"items\":[{\"i\":1,\"t\":\"乙\"}]}" },
+                                    "finish_reason": "stop"
+                                }]
+                            }),
+                        )
+                        .await;
+                    }
+                });
+            }
+        });
+
+        let result = handle_plugin_translate(
+            json!({
+                "resourceId": "plugin-a",
+                "resourceLabel": "Plugin A",
+                "sourceId": "source-a",
+                "translationJson": {
+                    "schemaVersion": 1,
+                    "metadata": { "plugin": "plugin-a", "title": "Plugin A", "version": "1.0.0" },
+                    "dict": {
+                        "main.js": {
+                            "ast": [],
+                            "regex": [
+                                { "source": "A", "target": "" },
+                                { "source": "B", "target": "" }
+                            ]
+                        }
+                    }
+                },
+                "config": {
+                    "chatCompletionsUrl": format!("http://{addr}/v1/chat/completions"),
+                    "apiKey": "test",
+                    "model": "test",
+                    "timeoutMs": 5000,
+                    "responseFormat": "json_object",
+                    "batchSize": 1,
+                    "batchCharLimit": 0,
+                    "batchWindowMultiplier": 4,
+                    "overwriteExistingTranslations": false,
+                    "concurrency": 2,
+                    "prompts": { "ast": "", "regex": "", "theme": "" }
+                }
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result
+                .translation_json
+                .pointer("/dict/main.js/regex/0/target")
+                .and_then(Value::as_str),
+            Some("")
+        );
+        assert_eq!(
+            result
+                .translation_json
+                .pointer("/dict/main.js/regex/1/target")
+                .and_then(Value::as_str),
+            Some("乙")
+        );
+        assert_eq!(result.processed_items, 1);
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(result.failures[0].items.len(), 1);
+        assert_eq!(result.failures[0].items[0].dict_index, 0);
     }
 
     #[tokio::test]
@@ -10401,7 +10748,16 @@ mod tests {
 
     #[test]
     fn plugin_retry_counts_attempted_items_when_batch_fails() {
-        let result: Result<Vec<Value>> = Err(anyhow!("AI offline"));
+        let result: Result<ValueBatchReport> = Ok(ValueBatchReport {
+            translated_items: Vec::new(),
+            failed_items: vec![
+                json!({ "failureId": "failure-a" }),
+                json!({ "failureId": "failure-a" }),
+                json!({ "failureId": "failure-b" }),
+            ],
+            failures: Vec::new(),
+            first_error: Some("AI offline".to_string()),
+        });
         let mut updates = Vec::new();
         let mut processed_items = 0usize;
         let mut completed_ids = Vec::new();
@@ -10427,6 +10783,523 @@ mod tests {
         assert!(completed_ids.is_empty());
         assert!(failed_ids.contains(&"failure-a".to_string()));
         assert!(failed_ids.contains(&"failure-b".to_string()));
+    }
+
+    #[tokio::test]
+    async fn failure_retry_only_marks_failed_request_batch_and_keeps_successes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let request = read_test_http_request(&mut stream).await;
+                    let id = request_item_id(&request);
+                    if id == 0 {
+                        write_test_http_json_response(
+                            &mut stream,
+                            "500 Internal Server Error",
+                            &json!({ "error": { "message": "bad batch" } }),
+                        )
+                        .await;
+                    } else {
+                        write_test_http_json_response(
+                            &mut stream,
+                            "200 OK",
+                            &json!({
+                                "choices": [{
+                                    "message": { "content": "{\"items\":[{\"i\":1,\"t\":\"乙\"}]}" },
+                                    "finish_reason": "stop"
+                                }]
+                            }),
+                        )
+                        .await;
+                    }
+                });
+            }
+        });
+
+        let base_path = env::temp_dir().join(format!("i18n-retry-precise-request-{}", nanoid!()));
+        let paths = paths(base_path.to_str().unwrap());
+        let source_id = "source-a";
+        save_translation(
+            &paths,
+            source_id,
+            &json!({
+                "schemaVersion": 1,
+                "metadata": {
+                    "plugin": "plugin-a",
+                    "language": "zh-CN",
+                    "version": "1.0.0",
+                    "supportedVersions": "*",
+                    "title": "Plugin A",
+                    "description": "",
+                    "author": ""
+                },
+                "dict": {
+                    "main.js": {
+                        "ast": [],
+                        "regex": [
+                            { "source": "A", "target": "" },
+                            { "source": "B", "target": "" }
+                        ]
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        write_json_pretty(
+            &paths.meta_path,
+            &json!({
+                "schemaVersion": 2,
+                "sources": {
+                    source_id: {
+                        "id": source_id,
+                        "plugin": "plugin-a",
+                        "type": "plugin",
+                        "totalTranslationCount": 2,
+                        "processedTranslationCount": 0,
+                        "unprocessedTranslationCount": 2,
+                        "translationProcessingComplete": false
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        write_json_pretty(
+            &paths.batch_task_record_path,
+            &json!({
+                "schemaVersion": 1,
+                "checkpoints": {},
+                "failures": [
+                    {
+                        "id": "failure-a",
+                        "scope": "plugin",
+                        "resourceId": "plugin-a",
+                        "resourceLabel": "Plugin A",
+                        "sourceId": source_id,
+                        "batchType": "regex",
+                        "errorMessage": "failed",
+                        "items": [{ "source": "A", "target": "", "dictIndex": 0, "file": "main.js" }],
+                        "failedAt": 1
+                    },
+                    {
+                        "id": "failure-b",
+                        "scope": "plugin",
+                        "resourceId": "plugin-a",
+                        "resourceLabel": "Plugin A",
+                        "sourceId": source_id,
+                        "batchType": "regex",
+                        "errorMessage": "failed",
+                        "items": [{ "source": "B", "target": "", "dictIndex": 1, "file": "main.js" }],
+                        "failedAt": 2
+                    }
+                ],
+                "successBatches": [],
+                "updatedAt": 0
+            }),
+        )
+        .unwrap();
+        let state = test_app_state(base_path.clone());
+        let task = test_task(2, 2);
+        let payload = json!({
+            "persistence": { "basePath": base_path.to_string_lossy() },
+            "config": {
+                "chatCompletionsUrl": format!("http://{addr}/v1/chat/completions"),
+                "apiKey": "test",
+                "model": "test",
+                "timeoutMs": 5000,
+                "responseFormat": "json_object",
+                "batchSize": 1,
+                "batchCharLimit": 0,
+                "batchWindowMultiplier": 4,
+                "overwriteExistingTranslations": false,
+                "concurrency": 2,
+                "prompts": { "ast": "", "regex": "", "theme": "" }
+            },
+            "concurrency": 1,
+            "totalResources": 2,
+            "totalItems": 2
+        });
+
+        handle_failure_retry(&state, task, payload, true).await.unwrap();
+
+        let saved = read_translation(&paths, source_id).unwrap();
+        assert_eq!(
+            saved.pointer("/dict/main.js/regex/0/target").and_then(Value::as_str),
+            Some("")
+        );
+        assert_eq!(
+            saved.pointer("/dict/main.js/regex/1/target").and_then(Value::as_str),
+            Some("乙")
+        );
+        let record = load_record(&paths);
+        let failures = record.get("failures").and_then(Value::as_array).unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].get("id").and_then(Value::as_str), Some("failure-a"));
+        let meta = load_meta(&paths);
+        let source = meta.pointer("/sources/source-a").unwrap();
+        assert_eq!(source.get("processedTranslationCount").and_then(Value::as_u64), Some(1));
+        assert_eq!(source.get("unprocessedTranslationCount").and_then(Value::as_u64), Some(1));
+        let _ = fs::remove_dir_all(base_path);
+    }
+
+    #[tokio::test]
+    async fn failure_retry_keeps_only_missing_or_empty_translation_items_failed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = read_test_http_request(&mut stream).await;
+            write_test_http_json_response(
+                &mut stream,
+                "200 OK",
+                &json!({
+                    "choices": [{
+                        "message": { "content": "{\"items\":[{\"i\":0,\"t\":\"甲\"},{\"i\":1,\"t\":\"\"}]}" },
+                        "finish_reason": "stop"
+                    }]
+                }),
+            )
+            .await;
+        });
+
+        let base_path = env::temp_dir().join(format!("i18n-retry-precise-items-{}", nanoid!()));
+        let paths = paths(base_path.to_str().unwrap());
+        let source_id = "source-a";
+        save_translation(
+            &paths,
+            source_id,
+            &json!({
+                "schemaVersion": 1,
+                "metadata": {
+                    "plugin": "plugin-a",
+                    "language": "zh-CN",
+                    "version": "1.0.0",
+                    "supportedVersions": "*",
+                    "title": "Plugin A",
+                    "description": "",
+                    "author": ""
+                },
+                "dict": {
+                    "main.js": {
+                        "ast": [],
+                        "regex": [
+                            { "source": "A", "target": "" },
+                            { "source": "B", "target": "" },
+                            { "source": "C", "target": "" }
+                        ]
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        write_json_pretty(
+            &paths.meta_path,
+            &json!({
+                "schemaVersion": 2,
+                "sources": {
+                    source_id: {
+                        "id": source_id,
+                        "plugin": "plugin-a",
+                        "type": "plugin",
+                        "totalTranslationCount": 3,
+                        "processedTranslationCount": 0,
+                        "unprocessedTranslationCount": 3,
+                        "translationProcessingComplete": false
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        write_json_pretty(
+            &paths.batch_task_record_path,
+            &json!({
+                "schemaVersion": 1,
+                "checkpoints": {},
+                "failures": [{
+                    "id": "failure-a",
+                    "scope": "plugin",
+                    "resourceId": "plugin-a",
+                    "resourceLabel": "Plugin A",
+                    "sourceId": source_id,
+                    "batchType": "regex",
+                    "errorMessage": "failed",
+                    "items": [
+                        { "source": "A", "target": "", "dictIndex": 0, "file": "main.js" },
+                        { "source": "B", "target": "", "dictIndex": 1, "file": "main.js" },
+                        { "source": "C", "target": "", "dictIndex": 2, "file": "main.js" }
+                    ],
+                    "failedAt": 1
+                }],
+                "successBatches": [],
+                "updatedAt": 0
+            }),
+        )
+        .unwrap();
+        let state = test_app_state(base_path.clone());
+        let task = test_task(1, 3);
+        let payload = json!({
+            "persistence": { "basePath": base_path.to_string_lossy() },
+            "config": {
+                "chatCompletionsUrl": format!("http://{addr}/v1/chat/completions"),
+                "apiKey": "test",
+                "model": "test",
+                "timeoutMs": 5000,
+                "responseFormat": "json_object",
+                "batchSize": 3,
+                "batchCharLimit": 0,
+                "batchWindowMultiplier": 4,
+                "overwriteExistingTranslations": false,
+                "concurrency": 1,
+                "prompts": { "ast": "", "regex": "", "theme": "" }
+            },
+            "concurrency": 1,
+            "totalResources": 1,
+            "totalItems": 3
+        });
+
+        handle_failure_retry(&state, task, payload, true).await.unwrap();
+
+        let saved = read_translation(&paths, source_id).unwrap();
+        assert_eq!(
+            saved.pointer("/dict/main.js/regex/0/target").and_then(Value::as_str),
+            Some("甲")
+        );
+        assert_eq!(
+            saved.pointer("/dict/main.js/regex/1/target").and_then(Value::as_str),
+            Some("")
+        );
+        assert_eq!(
+            saved.pointer("/dict/main.js/regex/2/target").and_then(Value::as_str),
+            Some("")
+        );
+        let record = load_record(&paths);
+        let failures = record.get("failures").and_then(Value::as_array).unwrap();
+        assert_eq!(failures.len(), 1);
+        let items = failures[0].get("items").and_then(Value::as_array).unwrap();
+        let remaining_indexes = items
+            .iter()
+            .filter_map(|item| item.get("dictIndex").and_then(Value::as_i64))
+            .collect::<Vec<_>>();
+        assert_eq!(remaining_indexes, vec![1, 2]);
+        let meta = load_meta(&paths);
+        let source = meta.pointer("/sources/source-a").unwrap();
+        assert_eq!(source.get("processedTranslationCount").and_then(Value::as_u64), Some(1));
+        assert_eq!(source.get("unprocessedTranslationCount").and_then(Value::as_u64), Some(2));
+        let _ = fs::remove_dir_all(base_path);
+    }
+
+    #[tokio::test]
+    async fn failure_retry_item_level_errors_do_not_stop_new_request_batches() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request_count = Arc::new(Mutex::new(0usize));
+        let server_request_count = request_count.clone();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let server_request_count = server_request_count.clone();
+                tokio::spawn(async move {
+                    let request = read_test_http_request(&mut stream).await;
+                    let id = request_item_id(&request);
+                    *server_request_count.lock().await += 1;
+                    let content = if id == 0 {
+                        "{\"items\":[{\"i\":0,\"t\":\"\"}]}"
+                    } else {
+                        "{\"items\":[{\"i\":1,\"t\":\"乙\"}]}"
+                    };
+                    write_test_http_json_response(
+                        &mut stream,
+                        "200 OK",
+                        &json!({
+                            "choices": [{
+                                "message": { "content": content },
+                                "finish_reason": "stop"
+                            }]
+                        }),
+                    )
+                    .await;
+                });
+            }
+        });
+
+        let base_path = env::temp_dir().join(format!("i18n-retry-item-level-{}", nanoid!()));
+        let paths = paths(base_path.to_str().unwrap());
+        let source_id = "source-a";
+        save_translation(
+            &paths,
+            source_id,
+            &json!({
+                "schemaVersion": 1,
+                "metadata": {
+                    "plugin": "plugin-a",
+                    "language": "zh-CN",
+                    "version": "1.0.0",
+                    "supportedVersions": "*",
+                    "title": "Plugin A",
+                    "description": "",
+                    "author": ""
+                },
+                "dict": {
+                    "main.js": {
+                        "ast": [],
+                        "regex": [
+                            { "source": "A", "target": "" },
+                            { "source": "B", "target": "" }
+                        ]
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        write_json_pretty(
+            &paths.meta_path,
+            &json!({
+                "schemaVersion": 2,
+                "sources": {
+                    source_id: {
+                        "id": source_id,
+                        "plugin": "plugin-a",
+                        "type": "plugin",
+                        "totalTranslationCount": 2,
+                        "processedTranslationCount": 0,
+                        "unprocessedTranslationCount": 2,
+                        "translationProcessingComplete": false
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        write_json_pretty(
+            &paths.batch_task_record_path,
+            &json!({
+                "schemaVersion": 1,
+                "checkpoints": {},
+                "failures": [{
+                    "id": "failure-a",
+                    "scope": "plugin",
+                    "resourceId": "plugin-a",
+                    "resourceLabel": "Plugin A",
+                    "sourceId": source_id,
+                    "batchType": "regex",
+                    "errorMessage": "failed",
+                    "items": [
+                        { "source": "A", "target": "", "dictIndex": 0, "file": "main.js" },
+                        { "source": "B", "target": "", "dictIndex": 1, "file": "main.js" }
+                    ],
+                    "failedAt": 1
+                }],
+                "successBatches": [],
+                "updatedAt": 0
+            }),
+        )
+        .unwrap();
+        let state = test_app_state(base_path.clone());
+        let task = test_task(1, 2);
+        let payload = json!({
+            "persistence": { "basePath": base_path.to_string_lossy() },
+            "config": {
+                "chatCompletionsUrl": format!("http://{addr}/v1/chat/completions"),
+                "apiKey": "test",
+                "model": "test",
+                "timeoutMs": 5000,
+                "responseFormat": "json_object",
+                "batchSize": 1,
+                "batchCharLimit": 0,
+                "batchWindowMultiplier": 4,
+                "overwriteExistingTranslations": false,
+                "concurrency": 1,
+                "prompts": { "ast": "", "regex": "", "theme": "" }
+            },
+            "concurrency": 1,
+            "totalResources": 1,
+            "totalItems": 2
+        });
+
+        handle_failure_retry(&state, task, payload, true).await.unwrap();
+
+        assert_eq!(*request_count.lock().await, 2);
+        let saved = read_translation(&paths, source_id).unwrap();
+        assert_eq!(
+            saved.pointer("/dict/main.js/regex/0/target").and_then(Value::as_str),
+            Some("")
+        );
+        assert_eq!(
+            saved.pointer("/dict/main.js/regex/1/target").and_then(Value::as_str),
+            Some("乙")
+        );
+        let record = load_record(&paths);
+        let failures = record.get("failures").and_then(Value::as_array).unwrap();
+        assert_eq!(failures.len(), 1);
+        let items = failures[0].get("items").and_then(Value::as_array).unwrap();
+        let remaining_indexes = items
+            .iter()
+            .filter_map(|item| item.get("dictIndex").and_then(Value::as_i64))
+            .collect::<Vec<_>>();
+        assert_eq!(remaining_indexes, vec![0]);
+        let _ = fs::remove_dir_all(base_path);
+    }
+
+    #[tokio::test]
+    async fn translate_value_batches_reports_item_level_failures_to_regular_callers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = read_test_http_request(&mut stream).await;
+            write_test_http_json_response(
+                &mut stream,
+                "200 OK",
+                &json!({
+                    "choices": [{
+                        "message": { "content": "{\"items\":[{\"i\":0,\"t\":\"\"}]}" },
+                        "finish_reason": "stop"
+                    }]
+                }),
+            )
+            .await;
+        });
+        let config = CompanionTranslationConfig {
+            chat_completions_url: format!("http://{addr}/v1/chat/completions"),
+            api_key: "test-key".to_string(),
+            model: "test-model".to_string(),
+            timeout_ms: 5_000,
+            response_format: "json_object".to_string(),
+            batch_size: 1,
+            batch_char_limit: 0,
+            batch_window_multiplier: 4,
+            overwrite_existing_translations: false,
+            concurrency: 1,
+            prompts: PromptConfig {
+                ast: String::new(),
+                regex: String::new(),
+                theme: String::new(),
+            },
+        };
+
+        let result = translate_value_batches(
+            &[json!({ "id": 0, "source": "bad" })],
+            "prompt",
+            &config,
+            |item| json!({ "i": item["id"], "s": item["source"] }),
+            None,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("翻译返回缺少部分条目或包含空译文"));
     }
 
     #[tokio::test]

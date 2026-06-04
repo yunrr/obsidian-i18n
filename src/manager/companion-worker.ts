@@ -334,15 +334,19 @@ async function callChatCompletion(items: JsonRecord[], systemPrompt: string, con
     }
 }
 
-function mapResultsBack<T extends { id: number; source: string; target: string }>(items: T[], simplifiedResults: Array<{ i: number; t: string }>): T[] {
-    return items.map(item => {
+function mapResultsBack<T extends { id: number; source: string; target: string }>(items: T[], simplifiedResults: Array<{ i: number; t: string }>): { translatedItems: T[]; failedItems: T[] } {
+    const translatedItems: T[] = [];
+    const failedItems: T[] = [];
+    for (const item of items) {
         const result = simplifiedResults.find(r => r.i === item.id);
         const target = result ? result.t : undefined;
         if (!target || target.trim() === '' || target.trim() === '空') {
-            throw new Error('翻译返回缺少部分条目或包含空译文');
+            failedItems.push(item);
+            continue;
         }
-        return { ...item, target };
-    });
+        translatedItems.push({ ...item, target });
+    }
+    return { translatedItems, failedItems };
 }
 
 async function translateBatches<T extends { id: number; source: string; target: string }>(
@@ -363,7 +367,11 @@ async function translateBatches<T extends { id: number; source: string; target: 
             const translated = runAiRequest
                 ? await runAiRequest(() => callChatCompletion(simplified, prompt, config))
                 : await callChatCompletion(simplified, prompt, config);
-            onBatchComplete(mapResultsBack(batch, translated));
+            const batchReport = mapResultsBack(batch, translated);
+            if (batchReport.translatedItems.length > 0) onBatchComplete(batchReport.translatedItems);
+            if (batchReport.failedItems.length > 0) {
+                onBatchFailure(batchReport.failedItems, new Error('翻译返回缺少部分条目或包含空译文'));
+            }
         } catch (error) {
             const normalizedError = error instanceof Error ? error : new Error(String(error));
             if (isManualStopError(normalizedError)) throw normalizedError;

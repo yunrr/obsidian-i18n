@@ -1,6 +1,5 @@
 /**
  * 大模型响应返回解析工具箱
- * 包含强制自愈技术，以应对不规则或被截断的 JSON 格式
  */
 
 export function parseTranslationResponse(content: string): Array<{ i: number; t: string }> {
@@ -12,7 +11,7 @@ export function parseTranslationResponse(content: string): Array<{ i: number; t:
     let parsedData: unknown;
     let isParsedObject = false;
 
-    // 【阶段 1: 规范化清理】
+    // 【阶段 1: 定位 JSON 内容】
     const codeBlockMatch = jsonText.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
     if (codeBlockMatch) {
         jsonText = codeBlockMatch[1].trim();
@@ -28,21 +27,11 @@ export function parseTranslationResponse(content: string): Array<{ i: number; t:
         }
     }
 
-    // 【阶段 2: 畸形修复与 JSON 尝试】
     try {
         parsedData = JSON.parse(jsonText);
         isParsedObject = true;
-    } catch {
-        try {
-            // 清除非法控制字符
-            let cleaned = jsonText.replace(/[\u0000-\u001F]+/g, ' ');
-            // 修复尾随逗号 
-            cleaned = cleaned.replace(/,\s*([\]}])/g, '$1');
-            parsedData = JSON.parse(cleaned);
-            isParsedObject = true;
-        } catch (e) {
-            isParsedObject = false;
-        }
+    } catch (e) {
+        isParsedObject = false;
     }
 
     if (isParsedObject) {
@@ -59,38 +48,40 @@ export function parseTranslationResponse(content: string): Array<{ i: number; t:
                 return validated as Array<{ i: number; t: string }>;
             }
         } catch (e) {
-            console.warn('[AI Response] 抽取 JSON 对象失败，准备降级为正则提取...', (e as Error).message);
+            console.warn('[AI Response] 抽取 JSON 对象失败，准备按原样提取 t 字段...', (e as Error).message);
         }
     }
 
-    // 【阶段 3: 终极降维打击（正则表达式强行外科手术提取）】
-    console.warn('[AI Response] 标准 JSON 解析失败或无有效条目，启动正则外科手术强行提取数据...');
     const fallbackResults: Array<{ i: number; t: string }> = [];
-    const extractRegex = /"i"\s*:\s*(\d+)\s*,\s*"t"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/g;
+    const extractRegex = /"i"\s*:\s*(\d+)\s*,\s*"t"\s*:\s*"/g;
 
     let match;
-    while ((match = extractRegex.exec(content)) !== null) {
+    while ((match = extractRegex.exec(jsonText)) !== null) {
         try {
             const id = parseInt(match[1]);
-            let unescapedText = match[2];
-            try {
-                // 最快且安全的反转义
-                unescapedText = JSON.parse(`"${match[2]}"`);
-            } catch {
-                unescapedText = unescapedText.replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-            }
-            fallbackResults.push({ i: id, t: unescapedText });
+            const rawText = rawTFieldUntilObjectEnd(jsonText, extractRegex.lastIndex);
+            if (rawText !== null) fallbackResults.push({ i: id, t: rawText });
         } catch (e) {
             // 忽略单个畸形项
         }
     }
 
     if (fallbackResults.length > 0) {
-        console.warn(`[AI Response] 成功通过正则抢救出 ${fallbackResults.length} 条数据！`);
         return fallbackResults;
     }
 
-    throw new Error('AI 返回数据格式严重损坏，正则急救也未能提取到业务结构 ({i, t})。');
+    throw new Error('AI 返回数据格式严重损坏，原样提取也未能提取到业务结构 ({i, t})。');
+}
+
+function rawTFieldUntilObjectEnd(text: string, start: number): string | null {
+    for (let index = start; index < text.length; index++) {
+        if (text[index] !== '"') continue;
+        if (text.slice(index + 1).trimStart().startsWith('}')) {
+            return text.slice(start, index);
+        }
+    }
+    const objectEnd = text.indexOf('}', start);
+    return objectEnd >= 0 ? text.slice(start, objectEnd) : null;
 }
 
 /**
