@@ -100,6 +100,69 @@ test('CJS worker returns a JSON 413 response when request body exceeds the confi
     }
 });
 
+test('CJS worker rejects workflow and persistence tasks owned by Rust', async () => {
+    const port = await getFreePort();
+    const worker = spawn(process.execPath, [workerPath, String(port)], {
+        cwd: path.resolve('.'),
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    try {
+        await waitForReady(worker, port);
+        for (const taskType of ['source-read', 'plugin-translate', 'theme-retry']) {
+            const response = await postJson(port, JSON.stringify({
+                type: taskType,
+                payload: {
+                    persistence: { basePath: path.join(os.tmpdir(), 'i18n-cjs-boundary') },
+                },
+            }));
+
+            assert.equal(response.status, 500, taskType);
+            const payload = JSON.parse(response.text);
+            assert.equal(payload.ok, false, taskType);
+            assert.match(payload.error, /Rust companion worker owns task/, taskType);
+        }
+    } finally {
+        worker.kill();
+        await Promise.race([
+            once(worker, 'exit'),
+            new Promise(resolve => setTimeout(resolve, 1_000)),
+        ]);
+    }
+});
+
+test('CJS worker rejects async workflow tasks owned by Rust', async () => {
+    const port = await getFreePort();
+    const worker = spawn(process.execPath, [workerPath, String(port)], {
+        cwd: path.resolve('.'),
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    try {
+        await waitForReady(worker, port);
+        for (const taskType of ['plugin-batch-translate', 'theme-failure-retry', 'cloud-backup-all']) {
+            const response = await request(port, '/task/start', 'POST', JSON.stringify({
+                type: taskType,
+                payload: {
+                    resources: [],
+                    persistence: { basePath: path.join(os.tmpdir(), 'i18n-cjs-boundary') },
+                },
+            }));
+
+            assert.equal(response.status, 500, taskType);
+            const payload = JSON.parse(response.text);
+            assert.equal(payload.ok, false, taskType);
+            assert.match(payload.error, /Rust companion worker owns task/, taskType);
+        }
+    } finally {
+        worker.kill();
+        await Promise.race([
+            once(worker, 'exit'),
+            new Promise(resolve => setTimeout(resolve, 1_000)),
+        ]);
+    }
+});
+
 test('CJS worker renders plugin translation code without owning apply file writes', async () => {
     const port = await getFreePort();
     const worker = spawn(process.execPath, [workerPath, String(port)], {

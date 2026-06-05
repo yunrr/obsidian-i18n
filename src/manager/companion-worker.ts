@@ -31,6 +31,7 @@ import type {
     CompanionTranslationConfig,
     CompanionBatchFailure,
     CompanionAsyncTaskType,
+    CompanionBatchTaskType,
     CompanionBatchResource,
     CompanionPluginBatchExtractPayload,
     CompanionPluginBatchTranslatePayload,
@@ -63,6 +64,50 @@ const maxBodyBytes = Number.isFinite(configuredMaxBodyBytes) && configuredMaxBod
 const extractCheckpointEveryResources = 100;
 const extractCheckpointEveryMs = 10_000;
 const extractThreadScript = path.join(__dirname, 'i18n-companion-extract-thread.cjs');
+
+const cjsSyncTaskTypes = new Set<string>([
+    'plugin-extract',
+    'theme-extract',
+    'code-extract',
+    'ast-replace',
+    'plugin-render-translation',
+    'plugin-diagnose-render-probe',
+    'plugin-apply-translation',
+    'theme-apply-translation',
+] satisfies CompanionBatchTaskType[]);
+
+const cjsAsyncTaskTypes = new Set<string>([
+    'plugin-batch-extract',
+    'theme-batch-extract',
+] satisfies CompanionAsyncTaskType[]);
+
+const rustOwnedTaskTypes = new Set<string>([
+    'plugin-translate',
+    'theme-translate',
+    'plugin-retry',
+    'theme-retry',
+    'plugin-batch-translate',
+    'theme-batch-translate',
+    'plugin-failure-retry',
+    'theme-failure-retry',
+    'plugin-diagnose-cleanup-start',
+    'plugin-diagnose-cleanup-step',
+    'plugin-diagnose-cleanup-cancel',
+    'plugin-diagnose-cleanup-apply',
+    'source-read',
+    'source-export',
+    'source-import',
+    'source-remove',
+    'source-set-active',
+    'source-index',
+    'source-clear-batch-records',
+    'cloud-publish-source',
+    'cloud-download-source',
+    'cloud-update-sources',
+    'cloud-prepare-backup',
+    'cloud-restore-all',
+    'cloud-backup-all',
+] satisfies Array<CompanionBatchTaskType | CompanionAsyncTaskType>);
 
 type JsonRecord = Record<string, any>;
 
@@ -2065,12 +2110,11 @@ async function runAsyncTask(task: CompanionTaskRuntime, type: CompanionAsyncTask
             processedItems: Number(payload.processedItems || task.progress.processedItems || 0),
             totalItems: Number(payload.totalItems || task.progress.totalItems || 0),
         });
+        if (!cjsAsyncTaskTypes.has(type)) {
+            throw new Error(`Rust companion worker owns task: ${type}`);
+        }
         if (type === 'plugin-batch-extract') await handlePluginBatchExtract(task, payload);
         else if (type === 'theme-batch-extract') await handleThemeBatchExtract(task, payload);
-        else if (type === 'plugin-batch-translate') await handlePluginBatchTranslate(task, payload);
-        else if (type === 'theme-batch-translate') await handleThemeBatchTranslate(task, payload);
-        else if (type === 'plugin-failure-retry') await handlePluginFailureRetry(task, payload);
-        else if (type === 'theme-failure-retry') await handleThemeFailureRetry(task, payload);
         else throw new Error(`未知任务类型: ${type}`);
 
         touchProgress(task, {
@@ -2107,6 +2151,9 @@ async function handleSourceRead(payload: CompanionSourceManagerRequest): Promise
 }
 
 function startAsyncTask(type: CompanionAsyncTaskType, payload: any) {
+    if (!cjsAsyncTaskTypes.has(type)) {
+        throw new Error(`Rust companion worker owns task: ${type}`);
+    }
     const taskId = nanoid(16);
     const task: CompanionTaskRuntime = {
         progress: createInitialProgress(type, payload, taskId),
@@ -2133,6 +2180,12 @@ function getTask(taskId: string): CompanionTaskRuntime {
 }
 
 async function handleTask(type: string, payload: any) {
+    if (rustOwnedTaskTypes.has(type)) {
+        throw new Error(`Rust companion worker owns task: ${type}`);
+    }
+    if (!cjsSyncTaskTypes.has(type)) {
+        throw new Error(`未知任务类型: ${type}`);
+    }
     if (type === 'plugin-extract') return handlePluginExtract(payload);
     if (type === 'theme-extract') return handleThemeExtract(payload);
     if (type === 'code-extract') return handleCodeExtract(payload);
@@ -2140,11 +2193,6 @@ async function handleTask(type: string, payload: any) {
     if (type === 'plugin-render-translation' || type === 'plugin-diagnose-render-probe') return handlePluginRenderTranslation(payload);
     if (type === 'plugin-apply-translation') return handlePluginApplyTranslation(payload);
     if (type === 'theme-apply-translation') return handleThemeApplyTranslation(payload);
-    if (type === 'source-read') return handleSourceRead(payload);
-    if (type === 'plugin-translate') return handlePluginTranslate(payload);
-    if (type === 'theme-translate') return handleThemeTranslate(payload);
-    if (type === 'plugin-retry') return handlePluginRetry(payload);
-    if (type === 'theme-retry') return handleThemeRetry(payload);
     throw new Error(`未知任务类型: ${type}`);
 }
 

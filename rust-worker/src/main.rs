@@ -28,10 +28,10 @@ use swc_common::{sync::Lrc, FileName, SourceMap};
 use swc_ecma_ast::*;
 use swc_ecma_codegen::{text_writer::JsWriter, Emitter};
 use swc_ecma_parser::{lexer::Lexer, Parser, StringInput, Syntax, TsSyntax};
-use swc_ecma_visit::{Visit, VisitMut, VisitMutWith, VisitWith};
+use swc_ecma_visit::{VisitMut, VisitMutWith};
 use tokio::{
     io::AsyncReadExt,
-    sync::{oneshot, Mutex, Semaphore},
+    sync::{oneshot, Mutex},
     task::JoinSet,
     time::timeout as tokio_timeout,
 };
@@ -40,9 +40,6 @@ use url::Url;
 const HOST: &str = "127.0.0.1";
 const COMPANION_WORKER_PROTOCOL_VERSION: u32 = 2;
 const MANUAL_STOP: &str = "批量任务已手动停止";
-const EXTRACT_CHECKPOINT_EVERY_RESOURCES: usize = 100;
-const EXTRACT_CHECKPOINT_EVERY_MS: u64 = 10_000;
-const MAX_EXTRACT_CPU_CONCURRENCY: usize = 32;
 const CLOUD_BACKUP_CHUNK_SIZE: usize = 20;
 const DEFAULT_TRANSLATE_WINDOW_BATCH_MULTIPLIER: usize = 4;
 const MAX_JSON_BODY_BYTES: usize = 128 * 1024 * 1024;
@@ -79,20 +76,6 @@ struct CompanionProxyResponse {
     status_text: String,
     headers: HashMap<String, String>,
     body: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AstReplacePayload {
-    code: String,
-    translations: Vec<Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CodeExtractPayload {
-    code: String,
-    settings: ExtractionSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -437,25 +420,6 @@ struct FailureRetryPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ExtractBatchPayload {
-    persistence: PersistenceConfig,
-    resources: Vec<Value>,
-    concurrency: usize,
-    checkpoint_key: String,
-    #[serde(default)]
-    language: String,
-    #[serde(default)]
-    settings: ExtractionSettings,
-    #[serde(default = "default_translation_version")]
-    translation_version: String,
-    #[serde(default)]
-    completed_resources: Option<usize>,
-    #[serde(default)]
-    total_resources: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct CloudTaskPayload {
     persistence: PersistenceConfig,
     token: Option<String>,
@@ -483,252 +447,6 @@ struct CloudTaskPayload {
 
 fn default_branch() -> String {
     "main".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct ExtractionSettings {
-    #[serde(default)]
-    author: String,
-    #[serde(default = "default_translation_version")]
-    translation_version: String,
-    #[serde(default = "default_re_flags")]
-    re_flags: String,
-    #[serde(default = "default_max_length")]
-    re_length: usize,
-    #[serde(default)]
-    re_datas: Vec<String>,
-    #[serde(default)]
-    re_reject_re: Vec<String>,
-    #[serde(default)]
-    re_valid_re: Vec<String>,
-    #[serde(default = "default_enabled")]
-    re_extraction_enabled: bool,
-    #[serde(default = "default_chinese_skip_mode")]
-    chinese_skip_mode: String,
-    #[serde(default)]
-    ast_assignments: Vec<String>,
-    #[serde(default)]
-    ast_functions: Vec<String>,
-    #[serde(default)]
-    ast_keys: Vec<String>,
-    #[serde(default = "default_max_length")]
-    ast_max_length: usize,
-    #[serde(default)]
-    ast_reject_re: Vec<String>,
-    #[serde(default)]
-    ast_valid_re: Vec<String>,
-    #[serde(default = "default_enabled")]
-    ast_extraction_enabled: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PluginExtractPayload {
-    resource_id: String,
-    label: String,
-    plugin_name: String,
-    plugin_version: String,
-    main_doc: String,
-    manifest_doc: String,
-    language: String,
-    settings: ExtractionSettings,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ThemeExtractPayload {
-    resource_id: String,
-    label: String,
-    theme_name: String,
-    theme_dir: String,
-    theme_css_path: String,
-    #[serde(default)]
-    theme_css_relative_path: Option<String>,
-    #[serde(default)]
-    is_legacy: bool,
-    settings: ExtractionSettings,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CompanionExtractResult {
-    status: String,
-    resource_id: String,
-    label: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    plugin_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    options: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct AstMatch {
-    node_type: String,
-    name: String,
-    source: String,
-}
-
-struct SwcAstConfig {
-    assignments: HashSet<String>,
-    functions: HashSet<String>,
-    keys: HashSet<String>,
-    reject: Vec<Regex>,
-    valid: Vec<Regex>,
-    max_length: usize,
-}
-
-impl SwcAstConfig {
-    fn from_settings(settings: &ExtractionSettings) -> Self {
-        let assignments = if settings.ast_assignments.is_empty() {
-            vec![
-                "overwriteName",
-                "innerHTML",
-                "outerHTML",
-                "title",
-                "alt",
-                "placeholder",
-                "textContent",
-                "innerText",
-                "ariaLabel",
-                "nodeValue",
-                "buttonText",
-                "confirmText",
-                "cancelText",
-                "labelText",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect()
-        } else {
-            settings.ast_assignments.clone()
-        };
-        let functions = if settings.ast_functions.is_empty() {
-            vec![
-                "Notice",
-                "setTitle",
-                "setContent",
-                "setName",
-                "setDesc",
-                "setButtonText",
-                "setPlaceholder",
-                "setTooltip",
-                "addOption",
-                "addOptions",
-                "addHeading",
-                "addText",
-                "setHint",
-                "setWarning",
-                "setText",
-                "appendText",
-                "createEl",
-                "createDiv",
-                "createSpan",
-                "addCommand",
-                "insertText",
-                "replaceRange",
-                "replaceSelection",
-                "log",
-                "error",
-                "warn",
-                "info",
-                "alert",
-                "confirm",
-                "prompt",
-                "renderMarkdown",
-                "setLabel",
-                "setConfirmText",
-                "setCancelText",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect()
-        } else {
-            settings.ast_functions.clone()
-        };
-        let keys = if settings.ast_keys.is_empty() {
-            vec![
-                "name",
-                "description",
-                "text",
-                "placeholder",
-                "label",
-                "tooltip",
-                "title",
-                "header",
-                "desc",
-                "message",
-                "buttontext",
-                "aria-label",
-                "heading",
-                "content",
-                "tab",
-                "caption",
-                "subtitle",
-                "summary",
-                "info",
-                "warning",
-                "error",
-                "success",
-                "hint",
-                "instructions",
-                "link",
-                "selection",
-                "annotation",
-                "search",
-                "speech",
-                "page",
-                "empty",
-                "detail",
-                "body",
-                "option",
-                "notice",
-                "confirmText",
-                "cancelText",
-                "ariaLabel",
-                "buttonText",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect()
-        } else {
-            settings.ast_keys.clone()
-        };
-        Self {
-            assignments: assignments.into_iter().collect(),
-            functions: functions.into_iter().collect(),
-            keys: keys.into_iter().collect(),
-            reject: regex_list(&settings.ast_reject_re, DEFAULT_REJECT_PATTERNS),
-            valid: regex_list(&settings.ast_valid_re, DEFAULT_VALID_PATTERNS),
-            max_length: settings.ast_max_length,
-        }
-    }
-}
-
-fn default_re_flags() -> String {
-    "gs".to_string()
-}
-
-fn default_translation_version() -> String {
-    "1.0.1".to_string()
-}
-
-fn default_enabled() -> bool {
-    true
-}
-
-fn default_max_length() -> usize {
-    300
-}
-
-fn default_chinese_skip_mode() -> String {
-    "source".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1176,420 +894,6 @@ fn obsidian_relative_path(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().to_string())
 }
 
-fn is_chinese_code_point(code_point: u32) -> bool {
-    (0x3400..=0x4dbf).contains(&code_point)
-        || (0x4e00..=0x9fff).contains(&code_point)
-        || (0xf900..=0xfaff).contains(&code_point)
-        || (0x20000..=0x2fa1f).contains(&code_point)
-}
-
-fn is_hex_text(text: &str) -> bool {
-    !text.is_empty() && text.chars().all(|ch| ch.is_ascii_hexdigit())
-}
-
-fn chinese_unicode_escape_len(text: &str, index: usize) -> usize {
-    let bytes = text.as_bytes();
-    if bytes.get(index) != Some(&b'\\') || bytes.get(index + 1) != Some(&b'u') {
-        return 0;
-    }
-    if bytes.get(index + 2) == Some(&b'{') {
-        let Some(close_offset) = text[index + 3..].find('}') else {
-            return 0;
-        };
-        let close_index = index + 3 + close_offset;
-        let hex = &text[index + 3..close_index];
-        if (4..=6).contains(&hex.len())
-            && is_hex_text(hex)
-            && is_chinese_code_point(u32::from_str_radix(hex, 16).unwrap_or(0))
-        {
-            return close_index - index + 1;
-        }
-        return 0;
-    }
-    if index + 6 <= text.len() {
-        let hex = &text[index + 2..index + 6];
-        if is_hex_text(hex) && is_chinese_code_point(u32::from_str_radix(hex, 16).unwrap_or(0)) {
-            return 6;
-        }
-    }
-    0
-}
-
-fn count_chinese_unicode_escapes(text: &str, limit: usize) -> usize {
-    let mut count = 0;
-    let mut index = 0;
-    while let Some(offset) = text[index..].find("\\u") {
-        let absolute = index + offset;
-        let escape_len = chinese_unicode_escape_len(text, absolute);
-        if escape_len > 0 {
-            count += 1;
-            if count >= limit {
-                return count;
-            }
-            index = absolute + escape_len;
-        } else {
-            index = absolute + 2;
-        }
-        if index >= text.len() {
-            break;
-        }
-    }
-    count
-}
-
-fn has_chinese_text(text: &str) -> bool {
-    text.chars().any(|ch| is_chinese_code_point(ch as u32))
-        || count_chinese_unicode_escapes(text, 1) > 0
-}
-
-fn has_chinese_run_pattern(
-    text: &str,
-    min_run_length: usize,
-    min_run_count: usize,
-    required_run_length: usize,
-) -> bool {
-    let mut matched_runs = 0;
-    let mut has_required_run = false;
-    let mut run_length = 0;
-    let mut index = 0;
-
-    let flush_run =
-        |run_length: &mut usize, matched_runs: &mut usize, has_required_run: &mut bool| {
-            if *run_length >= min_run_length {
-                *matched_runs += 1;
-            }
-            if *run_length >= required_run_length {
-                *has_required_run = true;
-            }
-            *run_length = 0;
-        };
-
-    while index < text.len() {
-        let escape_len = chinese_unicode_escape_len(text, index);
-        if escape_len > 0 {
-            run_length += 1;
-            index += escape_len;
-            continue;
-        }
-        let Some(ch) = text[index..].chars().next() else {
-            break;
-        };
-        if is_chinese_code_point(ch as u32) {
-            run_length += 1;
-        } else {
-            flush_run(&mut run_length, &mut matched_runs, &mut has_required_run);
-            if matched_runs >= min_run_count && has_required_run {
-                return true;
-            }
-        }
-        index += ch.len_utf8();
-    }
-    flush_run(&mut run_length, &mut matched_runs, &mut has_required_run);
-    matched_runs >= min_run_count && has_required_run
-}
-
-fn chinese_skip_mode(settings: &ExtractionSettings) -> &str {
-    match settings.chinese_skip_mode.as_str() {
-        "none" => "none",
-        "extracted" => "extracted",
-        _ => "source",
-    }
-}
-
-fn is_chinese_skip_mode(settings: &ExtractionSettings, mode: &str) -> bool {
-    chinese_skip_mode(settings) == mode
-}
-
-fn should_skip_chinese_by_source(metadata_text: &str, source_text: &str) -> bool {
-    has_chinese_text(metadata_text) || has_chinese_run_pattern(source_text, 2, 5, 5)
-}
-
-fn should_skip_chinese_by_extracted_items(metadata_text: &str, sources: &[String]) -> bool {
-    has_chinese_text(metadata_text)
-        || sources
-            .iter()
-            .any(|source| has_chinese_run_pattern(source, 5, 1, 5))
-}
-
-fn has_extracted_translation_content(sources: &[String]) -> bool {
-    sources.iter().any(|source| !source.trim().is_empty())
-}
-
-fn regex_list(patterns: &[String], defaults: &[&str]) -> Vec<Regex> {
-    let source = if patterns.is_empty() {
-        defaults
-            .iter()
-            .map(|item| item.to_string())
-            .collect::<Vec<_>>()
-    } else {
-        patterns.to_vec()
-    };
-    source
-        .iter()
-        .filter_map(|pattern| Regex::new(pattern).ok())
-        .collect()
-}
-
-fn is_valid_text_with_options(
-    text: &str,
-    max_length: usize,
-    reject: &[Regex],
-    valid: &[Regex],
-    zero_means_unlimited: bool,
-    allow_plain_word: bool,
-) -> bool {
-    if text.is_empty() {
-        return false;
-    }
-    if max_length == 0 {
-        if !zero_means_unlimited {
-            return false;
-        }
-    } else if text.chars().count() > max_length {
-        return false;
-    }
-    if reject.iter().any(|pattern| pattern.is_match(text)) {
-        return false;
-    }
-    if valid.is_empty() || valid.iter().any(|pattern| pattern.is_match(text)) {
-        return true;
-    }
-    allow_plain_word && text.chars().all(|ch| ch.is_ascii_alphabetic()) && text.chars().count() >= 2
-}
-
-fn is_valid_regex_text(text: &str, max_length: usize, reject: &[Regex], valid: &[Regex]) -> bool {
-    is_valid_text_with_options(text, max_length, reject, valid, false, false)
-}
-
-fn is_valid_ast_text(text: &str, max_length: usize, reject: &[Regex], valid: &[Regex]) -> bool {
-    is_valid_text_with_options(text, max_length, reject, valid, true, true)
-}
-
-fn capture_js_string(code: &str, quote_index: usize) -> Option<(String, usize)> {
-    let quote = *code.as_bytes().get(quote_index)?;
-    if quote != b'\'' && quote != b'"' && quote != b'`' {
-        return None;
-    }
-    let mut escaped = false;
-    let mut index = quote_index + 1;
-    while index < code.len() {
-        let byte = code.as_bytes()[index];
-        if escaped {
-            escaped = false;
-            index += 1;
-            continue;
-        }
-        if byte == b'\\' {
-            escaped = true;
-            index += 1;
-            continue;
-        }
-        if byte == quote {
-            return Some((code[quote_index + 1..index].to_string(), index + 1));
-        }
-        index += 1;
-    }
-    None
-}
-
-fn unescape_simple_js_string(text: &str) -> String {
-    let mut result = String::new();
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            result.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => result.push('\n'),
-            Some('r') => result.push('\r'),
-            Some('t') => result.push('\t'),
-            Some('b') => result.push('\u{0008}'),
-            Some('f') => result.push('\u{000c}'),
-            Some('v') => result.push('\u{000b}'),
-            Some('0') => result.push('\0'),
-            Some('\\') => result.push('\\'),
-            Some('\'') => result.push('\''),
-            Some('"') => result.push('"'),
-            Some('`') => result.push('`'),
-            Some('u') => {
-                if chars.peek() == Some(&'{') {
-                    chars.next();
-                    let mut hex = String::new();
-                    for next in chars.by_ref() {
-                        if next == '}' {
-                            break;
-                        }
-                        hex.push(next);
-                    }
-                    if let Ok(value) = u32::from_str_radix(&hex, 16) {
-                        if let Some(decoded) = char::from_u32(value) {
-                            result.push(decoded);
-                        }
-                    }
-                } else {
-                    let hex: String = chars.by_ref().take(4).collect();
-                    if let Ok(value) = u32::from_str_radix(&hex, 16) {
-                        if let Some(decoded) = char::from_u32(value) {
-                            result.push(decoded);
-                        }
-                    }
-                }
-            }
-            Some(other) => result.push(other),
-            None => result.push('\\'),
-        }
-    }
-    result
-}
-
-fn contains_word(list: &[String], word: &str) -> bool {
-    list.iter().any(|item| item == word)
-}
-
-fn previous_assignment_name(code: &str, before_index: usize) -> Option<String> {
-    let start = code[..before_index]
-        .rfind(['\n', ';', '{', '}'])
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    let prefix = &code[start..before_index];
-    let patterns = [
-        r"\.\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*$",
-        r#"\[\s*["']([^"']+)["']\s*\]\s*=\s*$"#,
-    ];
-    for pattern in patterns {
-        let re = Regex::new(pattern).ok()?;
-        if let Some(captures) = re.captures(prefix) {
-            if let Some(value) = captures.get(1) {
-                return Some(value.as_str().to_string());
-            }
-        }
-    }
-    None
-}
-
-fn previous_object_key_name(code: &str, before_index: usize) -> Option<String> {
-    let start = code[..before_index]
-        .rfind(['\n', ',', '{', '('])
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    let prefix = &code[start..before_index];
-    let patterns = [
-        r"([A-Za-z_$][A-Za-z0-9_$]*)\s*:\s*$",
-        r#"["']([^"']+)["']\s*:\s*$"#,
-    ];
-    for pattern in patterns {
-        let re = Regex::new(pattern).ok()?;
-        if let Some(captures) = re.captures(prefix) {
-            if let Some(value) = captures.get(1) {
-                return Some(value.as_str().to_string());
-            }
-        }
-    }
-    None
-}
-
-fn previous_variable_name(code: &str, before_index: usize) -> Option<String> {
-    let start = code[..before_index]
-        .rfind(['\n', ';', '{', '}'])
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    let prefix = &code[start..before_index];
-    let re = Regex::new(r"(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*$").ok()?;
-    re.captures(prefix)
-        .and_then(|captures| captures.get(1).map(|m| m.as_str().to_string()))
-}
-
-fn call_name_before(code: &str, before_index: usize) -> Option<(String, bool)> {
-    let start = code[..before_index]
-        .rfind(['\n', ';', '{', '}'])
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    let prefix = &code[start..before_index];
-    let re = Regex::new(r"(new\s+)?([A-Za-z_$][A-Za-z0-9_$.]*)\s*\([^()]*$").ok()?;
-    re.captures(prefix).and_then(|captures| {
-        captures.get(2).map(|m| {
-            let name = m
-                .as_str()
-                .rsplit('.')
-                .next()
-                .unwrap_or_default()
-                .to_string();
-            (name, captures.get(1).is_some())
-        })
-    })
-}
-
-fn builtin_regex_extract(
-    code: &str,
-    settings: &ExtractionSettings,
-    reject: &[Regex],
-    valid: &[Regex],
-) -> Vec<Value> {
-    let watched_calls = [
-        "Notice",
-        "log",
-        "error",
-        "setText",
-        "setButtonText",
-        "setName",
-        "setDesc",
-        "setPlaceholder",
-        "setTooltip",
-        "appendText",
-        "setTitle",
-        "addHeading",
-        "renderMarkdown",
-    ];
-    let watched_fields = [
-        "textContent",
-        "innerText",
-        "name",
-        "description",
-        "selection",
-        "annotation",
-        "link",
-        "text",
-        "search",
-        "speech",
-        "page",
-        "settings",
-    ];
-    let mut seen = HashSet::new();
-    let mut items = Vec::new();
-    let mut index = 0;
-    while index < code.len() {
-        let Some(relative) = code[index..].find(['\'', '"', '`']) else {
-            break;
-        };
-        let quote_index = index + relative;
-        let Some((raw, end_index)) = capture_js_string(code, quote_index) else {
-            index = quote_index + 1;
-            continue;
-        };
-        let source = unescape_simple_js_string(&raw);
-        let mut matched_context = false;
-        if let Some((name, _)) = call_name_before(code, quote_index) {
-            matched_context = watched_calls.contains(&name.as_str());
-        }
-        if !matched_context {
-            if let Some(name) = previous_assignment_name(code, quote_index)
-                .or_else(|| previous_object_key_name(code, quote_index))
-            {
-                matched_context = watched_fields.contains(&name.as_str());
-            }
-        }
-        if matched_context
-            && is_valid_regex_text(&source, settings.re_length, reject, valid)
-            && seen.insert(source.clone())
-        {
-            items.push(json!({ "source": source, "target": source }));
-        }
-        index = end_index;
-    }
-    items
-}
-
 fn parse_swc_module(code: &str) -> Result<(Lrc<SourceMap>, Module)> {
     let cm: Lrc<SourceMap> = Default::default();
     let fm = cm.new_source_file(FileName::Anon.into(), code.to_string());
@@ -1674,426 +978,6 @@ fn swc_expr_name(expr: &Expr) -> Option<String> {
             OptChainBase::Call(call) => swc_expr_name(&call.callee),
         },
         _ => None,
-    }
-}
-
-fn push_swc_match(
-    matches: &mut Vec<AstMatch>,
-    config: &SwcAstConfig,
-    node_type: &str,
-    name: &str,
-    expr: &Expr,
-) {
-    let Some(source) = swc_string_source(expr) else {
-        return;
-    };
-    if is_valid_ast_text(&source, config.max_length, &config.reject, &config.valid) {
-        matches.push(AstMatch {
-            node_type: node_type.to_string(),
-            name: name.to_string(),
-            source,
-        });
-    }
-}
-
-fn visit_object_arg_properties(
-    matches: &mut Vec<AstMatch>,
-    config: &SwcAstConfig,
-    object: &ObjectLit,
-) {
-    for prop in &object.props {
-        if let PropOrSpread::Prop(prop) = prop {
-            if let Prop::KeyValue(key_value) = &**prop {
-                if let Some(name) = swc_prop_name(&key_value.key) {
-                    if let Expr::Lit(_) | Expr::Tpl(_) = &*key_value.value {
-                        push_swc_match(matches, config, "ObjectProperty", &name, &key_value.value);
-                    }
-                }
-            }
-        }
-    }
-}
-
-struct SwcExtractVisitor<'a> {
-    config: &'a SwcAstConfig,
-    matches: Vec<AstMatch>,
-}
-
-impl Visit for SwcExtractVisitor<'_> {
-    fn visit_var_declarator(&mut self, node: &VarDeclarator) {
-        if let Pat::Ident(ident) = &node.name {
-            let name = ident.id.sym.to_string();
-            if self.config.assignments.contains(&name) {
-                if let Some(init) = node.init.as_deref() {
-                    push_swc_match(
-                        &mut self.matches,
-                        self.config,
-                        "VariableDeclarator",
-                        &name,
-                        init,
-                    );
-                }
-            }
-        }
-        node.visit_children_with(self);
-    }
-
-    fn visit_assign_expr(&mut self, node: &AssignExpr) {
-        if let Some(name) = swc_assign_name(&node.left) {
-            if self.config.assignments.contains(&name) {
-                push_swc_match(
-                    &mut self.matches,
-                    self.config,
-                    "AssignmentExpression",
-                    &name,
-                    &node.right,
-                );
-            }
-        }
-        node.visit_children_with(self);
-    }
-
-    fn visit_prop(&mut self, node: &Prop) {
-        if let Prop::KeyValue(key_value) = node {
-            if let Some(name) = swc_prop_name(&key_value.key) {
-                if self.config.keys.contains(&name) {
-                    push_swc_match(
-                        &mut self.matches,
-                        self.config,
-                        "ObjectProperty",
-                        &name,
-                        &key_value.value,
-                    );
-                }
-            }
-        }
-        node.visit_children_with(self);
-    }
-
-    fn visit_call_expr(&mut self, node: &CallExpr) {
-        if let Some(name) = swc_callee_name(&node.callee) {
-            if self.config.functions.contains(&name) {
-                for arg in &node.args {
-                    match &*arg.expr {
-                        Expr::Object(object) => {
-                            visit_object_arg_properties(&mut self.matches, self.config, object)
-                        }
-                        expr => push_swc_match(
-                            &mut self.matches,
-                            self.config,
-                            "CallExpression",
-                            &name,
-                            expr,
-                        ),
-                    }
-                }
-            }
-        }
-        node.visit_children_with(self);
-    }
-
-    fn visit_new_expr(&mut self, node: &NewExpr) {
-        if let Some(name) = swc_expr_name(&node.callee) {
-            if self.config.functions.contains(&name) {
-                for arg in node.args.iter().flatten() {
-                    match &*arg.expr {
-                        Expr::Object(object) => {
-                            visit_object_arg_properties(&mut self.matches, self.config, object)
-                        }
-                        expr => push_swc_match(
-                            &mut self.matches,
-                            self.config,
-                            "NewExpression",
-                            &name,
-                            expr,
-                        ),
-                    }
-                }
-            }
-        }
-        node.visit_children_with(self);
-    }
-}
-
-fn extract_ast_items_swc(code: &str, settings: &ExtractionSettings) -> Result<Vec<Value>> {
-    let (_, module) = parse_swc_module(code)?;
-    let config = SwcAstConfig::from_settings(settings);
-    let mut visitor = SwcExtractVisitor {
-        config: &config,
-        matches: Vec::new(),
-    };
-    module.visit_with(&mut visitor);
-    let mut seen = HashSet::new();
-    let mut matches = visitor
-        .matches
-        .into_iter()
-        .filter_map(|item| {
-            let key = format!("{}:{}:{}", item.node_type, item.name, item.source);
-            if seen.insert(key) {
-                Some(json!({
-                    "type": item.node_type,
-                    "name": item.name,
-                    "source": item.source,
-                    "target": item.source,
-                }))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    matches.sort_by(|left, right| {
-        let left_key = format!(
-            "{}:{}",
-            left.get("type").and_then(Value::as_str).unwrap_or_default(),
-            left.get("name").and_then(Value::as_str).unwrap_or_default()
-        );
-        let right_key = format!(
-            "{}:{}",
-            right
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-            right
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-        );
-        left_key.cmp(&right_key)
-    });
-    Ok(matches)
-}
-
-fn extract_ast_items_heuristic(code: &str, settings: &ExtractionSettings) -> Vec<Value> {
-    let assignments = if settings.ast_assignments.is_empty() {
-        vec![
-            "overwriteName",
-            "innerHTML",
-            "outerHTML",
-            "title",
-            "alt",
-            "placeholder",
-            "textContent",
-            "innerText",
-            "ariaLabel",
-            "nodeValue",
-            "buttonText",
-            "confirmText",
-            "cancelText",
-            "labelText",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect()
-    } else {
-        settings.ast_assignments.clone()
-    };
-    let functions = if settings.ast_functions.is_empty() {
-        vec![
-            "Notice",
-            "setTitle",
-            "setContent",
-            "setName",
-            "setDesc",
-            "setButtonText",
-            "setPlaceholder",
-            "setTooltip",
-            "addOption",
-            "addOptions",
-            "addHeading",
-            "addText",
-            "setHint",
-            "setWarning",
-            "setText",
-            "appendText",
-            "createEl",
-            "createDiv",
-            "createSpan",
-            "addCommand",
-            "insertText",
-            "replaceRange",
-            "replaceSelection",
-            "log",
-            "error",
-            "warn",
-            "info",
-            "alert",
-            "confirm",
-            "prompt",
-            "renderMarkdown",
-            "setLabel",
-            "setConfirmText",
-            "setCancelText",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect()
-    } else {
-        settings.ast_functions.clone()
-    };
-    let keys = if settings.ast_keys.is_empty() {
-        vec![
-            "name",
-            "description",
-            "text",
-            "placeholder",
-            "label",
-            "tooltip",
-            "title",
-            "header",
-            "desc",
-            "message",
-            "buttontext",
-            "aria-label",
-            "heading",
-            "content",
-            "tab",
-            "caption",
-            "subtitle",
-            "summary",
-            "info",
-            "warning",
-            "error",
-            "success",
-            "hint",
-            "instructions",
-            "link",
-            "selection",
-            "annotation",
-            "search",
-            "speech",
-            "page",
-            "empty",
-            "detail",
-            "body",
-            "option",
-            "notice",
-            "confirmText",
-            "cancelText",
-            "ariaLabel",
-            "buttonText",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect()
-    } else {
-        settings.ast_keys.clone()
-    };
-    let reject = regex_list(&settings.ast_reject_re, DEFAULT_REJECT_PATTERNS);
-    let valid = regex_list(&settings.ast_valid_re, DEFAULT_VALID_PATTERNS);
-    let mut seen = HashSet::new();
-    let mut matches = Vec::new();
-    let mut index = 0;
-
-    while index < code.len() {
-        let Some(relative) = code[index..].find(['\'', '"', '`']) else {
-            break;
-        };
-        let quote_index = index + relative;
-        let Some((raw, end_index)) = capture_js_string(code, quote_index) else {
-            index = quote_index + 1;
-            continue;
-        };
-        if raw.contains("${") {
-            index = end_index;
-            continue;
-        }
-        let source = unescape_simple_js_string(&raw);
-        let mut ast_match: Option<AstMatch> = None;
-
-        if let Some(name) = previous_assignment_name(code, quote_index) {
-            if contains_word(&assignments, &name) {
-                ast_match = Some(AstMatch {
-                    node_type: "AssignmentExpression".to_string(),
-                    name,
-                    source: source.clone(),
-                });
-            }
-        }
-        if ast_match.is_none() {
-            if let Some(name) = previous_object_key_name(code, quote_index) {
-                if contains_word(&keys, &name) {
-                    ast_match = Some(AstMatch {
-                        node_type: "ObjectProperty".to_string(),
-                        name,
-                        source: source.clone(),
-                    });
-                }
-            }
-        }
-        if ast_match.is_none() {
-            if let Some(name) = previous_variable_name(code, quote_index) {
-                if contains_word(&assignments, &name) {
-                    ast_match = Some(AstMatch {
-                        node_type: "VariableDeclarator".to_string(),
-                        name,
-                        source: source.clone(),
-                    });
-                }
-            }
-        }
-        if ast_match.is_none() {
-            if let Some((name, is_new)) = call_name_before(code, quote_index) {
-                if contains_word(&functions, &name) {
-                    ast_match = Some(AstMatch {
-                        node_type: if is_new {
-                            "NewExpression"
-                        } else {
-                            "CallExpression"
-                        }
-                        .to_string(),
-                        name,
-                        source: source.clone(),
-                    });
-                }
-            }
-        }
-        if let Some(item) = ast_match {
-            if is_valid_ast_text(&item.source, settings.ast_max_length, &reject, &valid) {
-                let key = format!("{}:{}:{}", item.node_type, item.name, item.source);
-                if seen.insert(key) {
-                    matches.push(json!({
-                        "type": item.node_type,
-                        "name": item.name,
-                        "source": item.source,
-                        "target": item.source,
-                    }));
-                }
-            }
-        }
-        index = end_index;
-    }
-    matches.sort_by(|left, right| {
-        let left_key = format!(
-            "{}:{}",
-            left.get("type").and_then(Value::as_str).unwrap_or_default(),
-            left.get("name").and_then(Value::as_str).unwrap_or_default()
-        );
-        let right_key = format!(
-            "{}:{}",
-            right
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-            right
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-        );
-        left_key.cmp(&right_key)
-    });
-    matches
-}
-
-fn extract_ast_items(code: &str, settings: &ExtractionSettings) -> Vec<Value> {
-    if !settings.ast_extraction_enabled {
-        return Vec::new();
-    }
-    match extract_ast_items_swc(code, settings) {
-        Ok(items) => items,
-        Err(error) => {
-            eprintln!("[i18n] SWC AST extraction fallback: {error}");
-            extract_ast_items_heuristic(code, settings)
-        }
     }
 }
 
@@ -2291,116 +1175,6 @@ fn replace_ast_items_swc(code: &str, translations: &[Value]) -> Result<String> {
     Ok(String::from_utf8(output)?)
 }
 
-fn is_default_regex_patterns(patterns: &[String]) -> bool {
-    patterns.len() == 2
-        && patterns[0] == "(Notice|log|error|setText|setButtonText|setName|setDesc|setPlaceholder|setTooltip|appendText|setTitle|addHeading|renderMarkdown)\\(\\s*(['\"`])((?:[^\\\\2\\\\\\\\]|\\\\\\\\.)*?)\\2\\s*\\)"
-        && patterns[1] == "(textContent|innerText|name|description|selection|annotation|link|text|search|speech|page|settings)\\s*[:=]\\s*(['\"`])((?:[^\\\\2\\\\\\\\]|\\\\\\\\.)*?)\\2"
-}
-
-fn extract_regex_items(code: &str, settings: &ExtractionSettings) -> Vec<Value> {
-    if !settings.re_extraction_enabled {
-        return Vec::new();
-    }
-    let patterns = if settings.re_datas.is_empty() {
-        DEFAULT_REGEX_PATTERNS
-            .iter()
-            .map(|item| item.to_string())
-            .collect::<Vec<_>>()
-    } else {
-        settings.re_datas.clone()
-    };
-    let flags = settings.re_flags.to_lowercase();
-    let reject = regex_list(&settings.re_reject_re, DEFAULT_REJECT_PATTERNS);
-    let valid = regex_list(&settings.re_valid_re, DEFAULT_VALID_PATTERNS);
-    let mut seen = HashSet::new();
-    let mut items = Vec::new();
-
-    if settings.re_datas.is_empty() || is_default_regex_patterns(&settings.re_datas) {
-        return builtin_regex_extract(code, settings, &reject, &valid);
-    }
-
-    for pattern in patterns {
-        let mut compiled = String::new();
-        if flags.contains('i') {
-            compiled.push_str("(?i)");
-        }
-        compiled.push_str(&pattern);
-        let Ok(regex) = Regex::new(&compiled) else {
-            continue;
-        };
-        for captures in regex.captures_iter(code) {
-            let Some(source) = captures
-                .iter()
-                .skip(1)
-                .flatten()
-                .last()
-                .or_else(|| captures.get(0))
-                .map(|matched| matched.as_str())
-            else {
-                continue;
-            };
-            let source = unescape_simple_js_string(source);
-            if !is_valid_regex_text(&source, settings.re_length, &reject, &valid)
-                || seen.contains(&source)
-            {
-                continue;
-            }
-            seen.insert(source.clone());
-            items.push(json!({ "source": source, "target": source }));
-        }
-    }
-    items
-}
-
-fn extract_theme_items(theme_css: &str) -> Vec<Value> {
-    let block_re = Regex::new(r"(?s)/\* @settings(.*?)\*/").unwrap();
-    let field_re = Regex::new(r#"(?m)^[ \t]*(name|title|description|label|markdown):\s*(?:['"]([^'"\r\n]*)['"]|([^\r\n]*?))[ \t]*(?:\r?\n|$)"#).unwrap();
-    let mut seen = HashSet::new();
-    let mut items = Vec::new();
-    for block in block_re.captures_iter(theme_css) {
-        let Some(content) = block.get(1).map(|m| m.as_str()) else {
-            continue;
-        };
-        for field in field_re.captures_iter(content) {
-            let field_type = field.get(1).map(|m| m.as_str()).unwrap_or_default();
-            let source = field
-                .get(2)
-                .or_else(|| field.get(3))
-                .map(|m| m.as_str())
-                .unwrap_or_default();
-            if source.trim().is_empty() || !seen.insert(source.to_string()) {
-                continue;
-            }
-            items.push(json!({ "type": field_type, "source": source, "target": source }));
-        }
-    }
-    items
-}
-
-const DEFAULT_REJECT_PATTERNS: &[&str] = &[
-    r"^\s*$",
-    r"^\d+$",
-    r"^[\w-]+\.[\w-]+\.\w+$",
-    r"^https?://",
-    r"^data:image/",
-    r"^#([0-9a-f]{3}|[0-9a-f]{6})$",
-    r"^[a-z0-9]+-[a-z0-9-]+$",
-    r"^[a-z]+[A-Z][a-zA-Z0-9]*$",
-    r"^[A-Z_][A-Z0-9_]{3,}$",
-    r"^(px|em|rem|vh|vw|auto)$",
-    r"^rgba?\(",
-    r"^\.",
-    r"\.(png|jpg|gif|svg|css|js|ts|md|json)$",
-    r"^[\w./\\-]+/[\w./\\-]+$",
-];
-
-const DEFAULT_VALID_PATTERNS: &[&str] = &[r"\s", r"[^\x00-\x7F]", r"[!?,;:。！？，；：]\s*$"];
-
-const DEFAULT_REGEX_PATTERNS: &[&str] = &[
-    r#"(Notice|log|error|setText|setButtonText|setName|setDesc|setPlaceholder|setTooltip|appendText|setTitle|addHeading|renderMarkdown)\(\s*(['"`])((?:[^\\]|\\.)*?)\2\s*\)"#,
-    r#"(textContent|innerText|name|description|selection|annotation|link|text|search|speech|page|settings)\s*[:=]\s*(['"`])((?:[^\\]|\\.)*?)\2"#,
-];
-
 async fn proxy_route(
     State(state): State<AppState>,
     body: Body,
@@ -2534,6 +1308,9 @@ async fn start_async_task(
     task_type: String,
     payload: Value,
 ) -> Result<Arc<TaskRuntime>> {
+    if is_cjs_owned_async_task(&task_type) {
+        return Err(anyhow!("CJS companion worker owns task: {task_type}"));
+    }
     let task_id = nanoid!(16);
     let progress = create_initial_progress(&task_type, &payload, task_id.clone());
     let task = Arc::new(TaskRuntime {
@@ -2641,12 +1418,6 @@ async fn run_async_task(
     )
     .await;
     let result = match task_type.as_str() {
-        "plugin-batch-extract" => {
-            handle_extract_batch(&state, task.clone(), payload, "plugin", "extract").await
-        }
-        "theme-batch-extract" => {
-            handle_extract_batch(&state, task.clone(), payload, "theme", "extract").await
-        }
         "plugin-batch-translate" => {
             handle_plugin_batch_translate(&state, task.clone(), payload).await
         }
@@ -2677,6 +1448,24 @@ async fn run_async_task(
             .await;
         }
     }
+}
+
+fn is_cjs_owned_sync_task(task_type: &str) -> bool {
+    matches!(
+        task_type,
+        "plugin-extract"
+            | "theme-extract"
+            | "code-extract"
+            | "ast-replace"
+            | "plugin-render-translation"
+            | "plugin-diagnose-render-probe"
+            | "plugin-apply-translation"
+            | "theme-apply-translation"
+    )
+}
+
+fn is_cjs_owned_async_task(task_type: &str) -> bool {
+    matches!(task_type, "plugin-batch-extract" | "theme-batch-extract")
 }
 
 async fn is_task_active(task: &TaskRuntime) -> bool {
@@ -4698,31 +3487,6 @@ fn source_from_entry(
     Ok(source)
 }
 
-fn has_existing_extracted_source(
-    paths: &PersistencePaths,
-    plugin_id: &str,
-    source_type: &str,
-    translation_version: &str,
-) -> bool {
-    load_meta(paths)
-        .get("sources")
-        .and_then(Value::as_object)
-        .is_some_and(|sources| {
-            sources.values().any(|source| {
-                source.get("plugin").and_then(Value::as_str) == Some(plugin_id)
-                    && source.get("type").and_then(Value::as_str) == Some(source_type)
-                    && source.get("translationVersion").and_then(Value::as_str)
-                        == Some(translation_version)
-                    && source
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|source_id| {
-                            paths.sources_dir.join(format!("{source_id}.json")).exists()
-                        })
-            })
-        })
-}
-
 fn has_any_sources_for_plugin(paths: &PersistencePaths, plugin_id: &str) -> bool {
     load_meta(paths)
         .get("sources")
@@ -4765,9 +3529,10 @@ fn simple_hash(text: &str) -> String {
 }
 
 async fn handle_sync_task(state: &AppState, task_type: &str, payload: Value) -> Result<Value> {
+    if is_cjs_owned_sync_task(task_type) {
+        return Err(anyhow!("CJS companion worker owns task: {task_type}"));
+    }
     match task_type {
-        "ast-replace" => handle_ast_replace(payload).await,
-        "code-extract" => handle_code_extract(payload).await,
         "plugin-diagnose-cleanup-start" => {
             handle_plugin_diagnose_cleanup_start(state, payload).await
         }
@@ -4787,8 +3552,6 @@ async fn handle_sync_task(state: &AppState, task_type: &str, payload: Value) -> 
         | "source-clear-batch-records" => {
             handle_source_manager_task(state, task_type, payload).await
         }
-        "plugin-extract" => Ok(serde_json::to_value(handle_plugin_extract(payload).await?)?),
-        "theme-extract" => Ok(serde_json::to_value(handle_theme_extract(payload).await?)?),
         "plugin-translate" => {
             let result = handle_plugin_translate(payload, None).await?;
             Ok(serde_json::to_value(result)?)
@@ -4812,29 +3575,6 @@ async fn handle_sync_task(state: &AppState, task_type: &str, payload: Value) -> 
         "cloud-restore-all" => handle_cloud_restore_all(state, payload).await,
         _ => Err(anyhow!("未知任务类型: {task_type}")),
     }
-}
-
-async fn handle_plugin_extract(payload: Value) -> Result<CompanionExtractResult> {
-    tokio::task::spawn_blocking(move || handle_plugin_extract_blocking(payload)).await?
-}
-
-async fn handle_ast_replace(payload: Value) -> Result<Value> {
-    tokio::task::spawn_blocking(move || {
-        let payload: AstReplacePayload = serde_json::from_value(payload)?;
-        let code = replace_ast_items_swc(&payload.code, &payload.translations)?;
-        Ok(json!({ "state": true, "code": code }))
-    })
-    .await?
-}
-
-async fn handle_code_extract(payload: Value) -> Result<Value> {
-    tokio::task::spawn_blocking(move || {
-        let payload: CodeExtractPayload = serde_json::from_value(payload)?;
-        let ast = extract_ast_items(&payload.code, &payload.settings);
-        let regex = extract_regex_items(&payload.code, &payload.settings);
-        Ok(json!({ "state": true, "ast": ast, "regex": regex }))
-    })
-    .await?
 }
 
 async fn handle_source_manager_task(
@@ -6829,251 +5569,6 @@ async fn handle_plugin_diagnose_cleanup_apply(state: &AppState, payload: Value) 
     Ok(serde_json::to_value(response)?)
 }
 
-fn handle_plugin_extract_blocking(payload: Value) -> Result<CompanionExtractResult> {
-    let payload: PluginExtractPayload = serde_json::from_value(payload)?;
-    let result = (|| -> Result<CompanionExtractResult> {
-        let main_doc = PathBuf::from(&payload.main_doc);
-        if !main_doc.exists() {
-            bail!("main.js 不存在");
-        }
-        let manifest_doc = PathBuf::from(&payload.manifest_doc);
-        let main_str = fs::read_to_string(&main_doc)
-            .with_context(|| format!("failed to read {}", main_doc.display()))?;
-        let manifest = read_json_file(&manifest_doc).context("manifest.json 不存在或格式错误")?;
-        let plugin_name = manifest
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or(&payload.plugin_name);
-        let manifest_description = manifest
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let metadata_text = format!("{}\n{}", plugin_name, manifest_description);
-        if is_chinese_skip_mode(&payload.settings, "source")
-            && should_skip_chinese_by_source(&metadata_text, &main_str)
-        {
-            return Ok(CompanionExtractResult {
-                status: "skipped".to_string(),
-                resource_id: payload.resource_id.clone(),
-                label: payload.label.clone(),
-                plugin_id: None,
-                content: None,
-                options: None,
-                reason: Some("chinese".to_string()),
-                error: None,
-            });
-        }
-
-        let plugin_id = manifest
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or(&payload.resource_id);
-        let ast = extract_ast_items(&main_str, &payload.settings);
-        let regex = extract_regex_items(&main_str, &payload.settings);
-        let sources = ast
-            .iter()
-            .chain(regex.iter())
-            .filter_map(|item| {
-                item.get("source")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .collect::<Vec<_>>();
-        if is_chinese_skip_mode(&payload.settings, "extracted")
-            && should_skip_chinese_by_extracted_items(&metadata_text, &sources)
-        {
-            return Ok(CompanionExtractResult {
-                status: "skipped".to_string(),
-                resource_id: payload.resource_id.clone(),
-                label: payload.label.clone(),
-                plugin_id: None,
-                content: None,
-                options: None,
-                reason: Some("chinese".to_string()),
-                error: None,
-            });
-        }
-        let extraction_enabled =
-            payload.settings.ast_extraction_enabled || payload.settings.re_extraction_enabled;
-        if extraction_enabled && !has_extracted_translation_content(&sources) {
-            return Ok(CompanionExtractResult {
-                status: "skipped".to_string(),
-                resource_id: payload.resource_id.clone(),
-                label: payload.label.clone(),
-                plugin_id: None,
-                content: None,
-                options: None,
-                reason: Some("empty".to_string()),
-                error: None,
-            });
-        }
-
-        let content = json!({
-            "schemaVersion": 1,
-            "metadata": {
-                "plugin": plugin_id,
-                "version": payload.settings.translation_version.clone(),
-                "title": plugin_name,
-                "description": format!("{} Localization & Tweaks", plugin_name),
-                "language": payload.language.clone(),
-                "supportedVersions": payload.plugin_version.clone(),
-                "author": payload.settings.author.clone(),
-            },
-            "dict": {
-                "main.js": {
-                    "ast": ast,
-                    "regex": regex,
-                }
-            }
-        });
-
-        Ok(CompanionExtractResult {
-            status: "success".to_string(),
-            resource_id: payload.resource_id.clone(),
-            label: payload.label.clone(),
-            plugin_id: Some(payload.resource_id.clone()),
-            content: Some(content),
-            options: Some(json!({ "title": payload.plugin_name.clone() })),
-            reason: None,
-            error: None,
-        })
-    })();
-
-    Ok(match result {
-        Ok(result) => result,
-        Err(error) => CompanionExtractResult {
-            status: "failed".to_string(),
-            resource_id: payload.resource_id,
-            label: payload.label,
-            plugin_id: None,
-            content: None,
-            options: None,
-            reason: None,
-            error: Some(error.to_string()),
-        },
-    })
-}
-
-async fn handle_theme_extract(payload: Value) -> Result<CompanionExtractResult> {
-    tokio::task::spawn_blocking(move || handle_theme_extract_blocking(payload)).await?
-}
-
-fn handle_theme_extract_blocking(payload: Value) -> Result<CompanionExtractResult> {
-    let payload: ThemeExtractPayload = serde_json::from_value(payload)?;
-    let result = (|| -> Result<CompanionExtractResult> {
-        let theme_css_path = PathBuf::from(&payload.theme_css_path);
-        if !theme_css_path.exists() {
-            bail!("theme.css 不存在");
-        }
-        let css_str = fs::read_to_string(&theme_css_path)
-            .with_context(|| format!("failed to read {}", theme_css_path.display()))?;
-        let manifest_path = PathBuf::from(&payload.theme_dir).join("manifest.json");
-        let manifest = read_json_file(&manifest_path).unwrap_or_else(|| {
-            json!({
-                "name": payload.theme_name.clone(),
-                "version": "0.0.0",
-                "minAppVersion": "",
-                "author": "",
-                "authorUrl": "",
-            })
-        });
-        let theme_name = manifest
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or(&payload.theme_name);
-        if is_chinese_skip_mode(&payload.settings, "source")
-            && should_skip_chinese_by_source(theme_name, &css_str)
-        {
-            return Ok(CompanionExtractResult {
-                status: "skipped".to_string(),
-                resource_id: payload.resource_id.clone(),
-                label: payload.label.clone(),
-                plugin_id: None,
-                content: None,
-                options: None,
-                reason: Some("chinese".to_string()),
-                error: None,
-            });
-        }
-        let dict = extract_theme_items(&css_str);
-        let sources = dict
-            .iter()
-            .filter_map(|item| {
-                item.get("source")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .collect::<Vec<_>>();
-        if is_chinese_skip_mode(&payload.settings, "extracted")
-            && should_skip_chinese_by_extracted_items(theme_name, &sources)
-        {
-            return Ok(CompanionExtractResult {
-                status: "skipped".to_string(),
-                resource_id: payload.resource_id.clone(),
-                label: payload.label.clone(),
-                plugin_id: None,
-                content: None,
-                options: None,
-                reason: Some("chinese".to_string()),
-                error: None,
-            });
-        }
-        if !has_extracted_translation_content(&sources) {
-            return Ok(CompanionExtractResult {
-                status: "skipped".to_string(),
-                resource_id: payload.resource_id.clone(),
-                label: payload.label.clone(),
-                plugin_id: None,
-                content: None,
-                options: None,
-                reason: Some("empty".to_string()),
-                error: None,
-            });
-        }
-        let version = manifest
-            .get("version")
-            .and_then(Value::as_str)
-            .unwrap_or("0.0.0");
-        let content = json!({
-            "schemaVersion": 1,
-            "metadata": {
-                "theme": theme_name,
-                "language": "zh-cn",
-                "version": payload.settings.translation_version.clone(),
-                "supportedVersions": version,
-                "title": theme_name,
-                "description": format!("{} Localization & Tweaks", theme_name),
-                "author": payload.settings.author.clone(),
-            },
-            "dict": dict,
-        });
-        Ok(CompanionExtractResult {
-            status: "success".to_string(),
-            resource_id: payload.resource_id.clone(),
-            label: payload.label.clone(),
-            plugin_id: Some(payload.theme_name.clone()),
-            content: Some(content),
-            options: Some(json!({ "title": payload.theme_name.clone(), "type": "theme" })),
-            reason: None,
-            error: None,
-        })
-    })();
-
-    Ok(match result {
-        Ok(result) => result,
-        Err(error) => CompanionExtractResult {
-            status: "failed".to_string(),
-            resource_id: payload.resource_id,
-            label: payload.label,
-            plugin_id: None,
-            content: None,
-            options: None,
-            reason: None,
-            error: Some(error.to_string()),
-        },
-    })
-}
-
 fn paths(base_path: &str) -> PersistencePaths {
     let base_path = PathBuf::from(base_path);
     PersistencePaths {
@@ -7905,64 +6400,6 @@ async fn save_translated_source_with_processing_preservation(
     Ok(saved_index)
 }
 
-async fn save_extracted_source(
-    state: &AppState,
-    paths: &PersistencePaths,
-    plugin_id: &str,
-    content: &Value,
-    title: &str,
-    source_type: &str,
-) -> Result<bool> {
-    let _guard = state.persistence_lock.lock().await;
-    let mut meta = load_meta(paths);
-    let source_id = nanoid!(32);
-    let translation_version = content
-        .pointer("/metadata/version")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if let Some(sources) = meta.get_mut("sources").and_then(Value::as_object_mut) {
-        if sources.values().any(|source| {
-            source.get("plugin").and_then(Value::as_str) == Some(plugin_id)
-                && source.get("type").and_then(Value::as_str) == Some(source_type)
-                && source.get("translationVersion").and_then(Value::as_str)
-                    == Some(translation_version)
-                && source
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|existing_source_id| {
-                        paths
-                            .sources_dir
-                            .join(format!("{existing_source_id}.json"))
-                            .exists()
-                    })
-        }) {
-            return Ok(false);
-        }
-        for source in sources.values_mut() {
-            if source.get("plugin").and_then(Value::as_str) == Some(plugin_id) {
-                source["isActive"] = json!(false);
-            }
-        }
-        let mut source = json!({
-            "id": source_id,
-            "plugin": plugin_id,
-            "title": title,
-            "type": source_type,
-            "origin": "local",
-            "isActive": true,
-            "checksum": calculate_checksum(content)?,
-            "createdAt": now_ms(),
-            "updatedAt": now_ms(),
-        });
-        save_translation(paths, &source_id, content)?;
-        merge_metadata_index(&mut source, content, false);
-        merge_source_file_mtime(&mut source, paths, &source_id);
-        sources.insert(source_id.clone(), source);
-    }
-    write_json_pretty(&paths.meta_path, &meta)?;
-    Ok(true)
-}
-
 async fn update_record<F>(state: &AppState, paths: &PersistencePaths, updater: F) -> Result<()>
 where
     F: FnOnce(&mut Value),
@@ -8423,203 +6860,6 @@ fn build_failure_record(scope: &str, failure: CompanionBatchFailure) -> BatchTas
         items: failure.items,
         failed_at: now_ms(),
     }
-}
-
-async fn handle_extract_batch(
-    state: &AppState,
-    task: Arc<TaskRuntime>,
-    payload: Value,
-    scope: &str,
-    mode: &str,
-) -> Result<()> {
-    let batch: ExtractBatchPayload = serde_json::from_value(payload.clone())?;
-    let paths = paths(&batch.persistence.base_path);
-    let batch_language = batch.language.clone();
-    let batch_settings = serde_json::to_value(&batch.settings)?;
-    let batch_translation_version = if batch.translation_version.is_empty() {
-        batch.settings.translation_version.clone()
-    } else {
-        batch.translation_version.clone()
-    };
-    let completed = Arc::new(Mutex::new(HashSet::<usize>::new()));
-    let semaphore = Arc::new(Semaphore::new(
-        batch.concurrency.max(1).min(MAX_EXTRACT_CPU_CONCURRENCY),
-    ));
-    let resources = Arc::new(batch.resources.clone());
-    let last_checkpoint_at = Arc::new(Mutex::new(now_ms()));
-    let mut handles = Vec::new();
-
-    for (index, resource) in batch.resources.into_iter().enumerate() {
-        ensure_not_cancelled(&task).await?;
-        let permit = semaphore.clone().acquire_owned().await?;
-        let state = state.clone();
-        let task = task.clone();
-        let paths = paths.clone();
-        let completed = completed.clone();
-        let resources = resources.clone();
-        let last_checkpoint_at = last_checkpoint_at.clone();
-        let checkpoint_key = batch.checkpoint_key.clone();
-        let batch_language = batch_language.clone();
-        let batch_settings = batch_settings.clone();
-        let batch_translation_version = batch_translation_version.clone();
-        let scope = scope.to_string();
-        let mode = mode.to_string();
-        handles.push(tokio::spawn(async move {
-            let _permit = permit;
-            if !is_task_active(&task).await {
-                return Ok::<(), anyhow::Error>(());
-            }
-            let mut resource = resource;
-            let resource_id = resource
-                .get("resourceId")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            if has_existing_extracted_source(
-                &paths,
-                &resource_id,
-                if scope == "theme" { "theme" } else { "plugin" },
-                &batch_translation_version,
-            ) {
-                completed.lock().await.insert(index);
-                increment_progress(&task, "processedResources", 1).await;
-                increment_progress(&task, "skippedCount", 1).await;
-                let progress = task.progress.lock().await.clone();
-                let completed_set = completed.lock().await.clone();
-                save_checkpoint(
-                    &state,
-                    &paths,
-                    &checkpoint_key,
-                    create_checkpoint(&scope, &mode, &resources, &completed_set, &progress),
-                )
-                .await?;
-                bump_record_revision(&task).await;
-                return Ok::<(), anyhow::Error>(());
-            }
-            if let Some(object) = resource.as_object_mut() {
-                if !object.contains_key("settings") {
-                    object.insert("settings".to_string(), batch_settings.clone());
-                }
-                if scope == "plugin"
-                    && !object.contains_key("language")
-                    && !batch_language.is_empty()
-                {
-                    object.insert(
-                        "language".to_string(),
-                        Value::String(batch_language.clone()),
-                    );
-                }
-            }
-            let label = resource
-                .get("label")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            touch_progress(&task, json!({ "currentLabel": label })).await;
-            let result = if scope == "plugin" {
-                handle_plugin_extract(resource).await
-            } else {
-                handle_theme_extract(resource).await
-            };
-            match result {
-                Ok(result) if result.status == "success" => {
-                    let plugin_id = result.plugin_id.as_deref().unwrap_or_default();
-                    let title = result
-                        .options
-                        .as_ref()
-                        .and_then(|options| options.get("title"))
-                        .and_then(Value::as_str)
-                        .unwrap_or(plugin_id);
-                    let source_type = result
-                        .options
-                        .as_ref()
-                        .and_then(|options| options.get("type"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("plugin");
-                    let content = result.content.unwrap_or(Value::Null);
-                    if save_extracted_source(
-                        &state,
-                        &paths,
-                        plugin_id,
-                        &content,
-                        title,
-                        source_type,
-                    )
-                    .await?
-                    {
-                        bump_source_revision(&task).await;
-                        increment_progress(&task, "successCount", 1).await;
-                    } else {
-                        increment_progress(&task, "skippedCount", 1).await;
-                    }
-                }
-                Ok(result) if result.status == "skipped" => {
-                    increment_progress(&task, "skippedCount", 1).await;
-                }
-                Ok(result) => {
-                    eprintln!(
-                        "[i18n] Failed to batch extract: {}",
-                        result.error.as_deref().unwrap_or("unknown")
-                    );
-                    increment_progress(&task, "failedCount", 1).await;
-                }
-                Err(error) => {
-                    eprintln!("[i18n] Failed to batch extract: {error}");
-                    increment_progress(&task, "failedCount", 1).await;
-                }
-            }
-            completed.lock().await.insert(index);
-            increment_progress(&task, "processedResources", 1).await;
-            let progress = task.progress.lock().await.clone();
-            let should_save_checkpoint = progress.processed_resources == progress.total_resources
-                || progress.processed_resources % EXTRACT_CHECKPOINT_EVERY_RESOURCES == 0
-                || {
-                    let mut last_checkpoint_at = last_checkpoint_at.lock().await;
-                    let now = now_ms();
-                    if now.saturating_sub(*last_checkpoint_at) >= EXTRACT_CHECKPOINT_EVERY_MS {
-                        *last_checkpoint_at = now;
-                        true
-                    } else {
-                        false
-                    }
-                };
-            if should_save_checkpoint {
-                let completed_set = completed.lock().await.clone();
-                save_checkpoint(
-                    &state,
-                    &paths,
-                    &checkpoint_key,
-                    create_checkpoint(&scope, &mode, &resources, &completed_set, &progress),
-                )
-                .await?;
-                bump_record_revision(&task).await;
-            }
-            Ok(())
-        }));
-    }
-
-    for handle in handles {
-        if *task.cancel_requested.lock().await {
-            break;
-        }
-        handle.await??;
-    }
-    if *task.cancel_requested.lock().await {
-        let progress = task.progress.lock().await.clone();
-        let completed_set = completed.lock().await.clone();
-        save_checkpoint(
-            state,
-            &paths,
-            &batch.checkpoint_key,
-            create_checkpoint(scope, mode, &resources, &completed_set, &progress),
-        )
-        .await?;
-        bump_record_revision(&task).await;
-        return Ok(());
-    }
-    clear_checkpoint(state, &paths, &batch.checkpoint_key).await?;
-    bump_record_revision(&task).await;
-    Ok(())
 }
 
 async fn increment_progress(task: &TaskRuntime, field: &str, amount: usize) {
@@ -12517,6 +10757,55 @@ mod tests {
             .contains("未知任务类型"));
 
         server.abort();
+        let _ = fs::remove_dir_all(base_path);
+    }
+
+    #[tokio::test]
+    async fn rust_worker_rejects_sync_extraction_and_replacement_tasks_owned_by_cjs() {
+        let base_path = env::temp_dir().join(format!("i18n-rust-boundary-sync-{}", nanoid!(8)));
+        fs::create_dir_all(&base_path).unwrap();
+        let state = test_app_state(base_path.clone());
+
+        for task_type in [
+            "plugin-extract",
+            "theme-extract",
+            "code-extract",
+            "ast-replace",
+            "plugin-render-translation",
+            "plugin-diagnose-render-probe",
+            "plugin-apply-translation",
+            "theme-apply-translation",
+        ] {
+            let error = handle_sync_task(&state, task_type, json!({}))
+                .await
+                .expect_err("CJS-owned sync tasks should be rejected by Rust");
+            assert!(
+                error.to_string().contains("CJS companion worker owns task"),
+                "{task_type}: {error}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(base_path);
+    }
+
+    #[tokio::test]
+    async fn rust_worker_rejects_async_extraction_tasks_owned_by_cjs() {
+        let base_path = env::temp_dir().join(format!("i18n-rust-boundary-async-{}", nanoid!(8)));
+        fs::create_dir_all(&base_path).unwrap();
+        let state = test_app_state(base_path.clone());
+
+        for task_type in ["plugin-batch-extract", "theme-batch-extract"] {
+            let error = match start_async_task(state.clone(), task_type.to_string(), json!({})).await {
+                Ok(_) => panic!("CJS-owned async tasks should be rejected by Rust"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("CJS companion worker owns task"),
+                "{task_type}: {error}"
+            );
+        }
+
+        assert!(state.tasks.lock().await.is_empty());
         let _ = fs::remove_dir_all(base_path);
     }
 
