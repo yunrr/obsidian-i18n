@@ -264,6 +264,59 @@ test('CJS worker renders plugin translation code without owning apply file write
     }
 });
 
+test('CJS worker renders diagnose probes through the HTTP task API', async () => {
+    const port = await getFreePort();
+    const worker = spawn(process.execPath, [workerPath, String(port)], {
+        cwd: path.resolve('.'),
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    try {
+        await waitForReady(worker, port);
+        const body = JSON.stringify({
+            type: 'plugin-diagnose-render-probe',
+            payload: {
+                files: [
+                    {
+                        file: 'main.js',
+                        code: 'const title = "Hello"; console.log("World");',
+                    },
+                ],
+                candidates: [
+                    {
+                        file: 'main.js',
+                        kind: 'ast',
+                        index: 0,
+                        item: { type: 'VariableDeclarator', name: 'title', source: 'Hello', target: '你好' },
+                    },
+                    {
+                        file: 'main.js',
+                        kind: 'regex',
+                        index: 0,
+                        item: { source: 'World', target: '世界' },
+                    },
+                ],
+            },
+        });
+        const response = await postJson(port, body);
+
+        assert.equal(response.status, 200);
+        const payload = JSON.parse(response.text);
+        assert.equal(payload.ok, true);
+        assert.equal(payload.result.state, true);
+        assert.equal(payload.result.files.length, 1);
+        assert.match(payload.result.files[0].code, /你好/);
+        assert.match(payload.result.files[0].code, /世界/);
+        assert.equal(payload.result.files[0].file, 'main.js');
+    } finally {
+        worker.kill();
+        await Promise.race([
+            once(worker, 'exit'),
+            new Promise(resolve => setTimeout(resolve, 1_000)),
+        ]);
+    }
+});
+
 test('CJS worker applies plugin translation with the legacy file write flow', async () => {
     const port = await getFreePort();
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'i18n-cjs-apply-'));

@@ -4,6 +4,7 @@ import * as zlib from 'zlib';
 import * as fs from 'fs-extra';
 import * as path from 'path';
 import * as os from 'os';
+import { spawn } from 'child_process';
 import { Worker } from 'worker_threads';
 import { nanoid } from 'nanoid';
 import { calculateChecksum } from '../utils/translator/translation';
@@ -76,6 +77,10 @@ const cjsSyncTaskTypes = new Set<string>([
     'theme-apply-translation',
 ] satisfies CompanionBatchTaskType[]);
 
+const isolatedSyncTaskTypes = new Set<string>([
+    'plugin-diagnose-render-probe',
+] satisfies CompanionBatchTaskType[]);
+
 const cjsAsyncTaskTypes = new Set<string>([
     'plugin-batch-extract',
     'theme-batch-extract',
@@ -118,6 +123,13 @@ class BodyLimitError extends Error {
     }
 }
 
+class IsolatedTaskError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'IsolatedTaskError';
+    }
+}
+
 function send(res: http.ServerResponse, status: number, payload: unknown) {
     const body = JSON.stringify(payload);
     res.writeHead(status, {
@@ -150,6 +162,63 @@ function readBody(req: http.IncomingMessage): Promise<string> {
         });
         req.on('error', reject);
     });
+}
+
+function writeRawJson(res: http.ServerResponse, status: number, body: string) {
+    res.writeHead(status, {
+        'content-type': 'application/json; charset=utf-8',
+        'content-length': Buffer.byteLength(body),
+    });
+    res.end(body);
+}
+
+function runIsolatedStdioTaskRaw(body: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const workerScript = process.argv[1] || __filename;
+        const child = spawn(process.execPath, [workerScript, 'stdio-task'], {
+            cwd: process.cwd(),
+            env: process.env,
+            stdio: ['pipe', 'pipe', 'pipe'],
+            windowsHide: true,
+        });
+        const stdoutChunks: Buffer[] = [];
+        const stderrChunks: Buffer[] = [];
+        let settled = false;
+        const timeoutMs = Math.max(1_000, Number(process.env.I18N_COMPANION_ISOLATED_TASK_TIMEOUT_MS || 120_000));
+        const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            child.kill();
+            reject(new IsolatedTaskError(`隔离 CJS 任务超时：${timeoutMs}ms`));
+        }, timeoutMs);
+
+        child.stdout.on('data', chunk => stdoutChunks.push(Buffer.from(chunk)));
+        child.stderr.on('data', chunk => stderrChunks.push(Buffer.from(chunk)));
+        child.on('error', error => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            reject(error);
+        });
+        child.on('exit', code => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            const stdout = Buffer.concat(stdoutChunks).toString('utf8');
+            if (code === 0 && stdout.trim()) {
+                resolve(stdout);
+                return;
+            }
+            const stderr = Buffer.concat(stderrChunks).toString('utf8').trim();
+            reject(new IsolatedTaskError(stderr || `隔离 CJS 任务退出码：${code}`));
+        });
+        child.stdin.end(body);
+    });
+}
+
+function readTaskTypeFromRawBody(body: string): string {
+    const match = body.match(/"type"\s*:\s*"([^"]+)"/);
+    return match?.[1] || '';
 }
 
 function sanitizeHeaders(headers: Record<string, string> | undefined): Record<string, string> {
@@ -2183,12 +2252,20 @@ function getTask(taskId: string): CompanionTaskRuntime {
     return task;
 }
 
-async function handleTask(type: string, payload: any) {
+async function handleTask(type: string, payload: any, options: { allowIsolation?: boolean } = {}) {
     if (rustOwnedTaskTypes.has(type)) {
         throw new Error(`Rust companion worker owns task: ${type}`);
     }
     if (!cjsSyncTaskTypes.has(type)) {
         throw new Error(`未知任务类型: ${type}`);
+    }
+    if (options.allowIsolation !== false && isolatedSyncTaskTypes.has(type)) {
+        const raw = await runIsolatedStdioTaskRaw(JSON.stringify({ type, payload }));
+        const envelope = JSON.parse(raw || '{}');
+        if (!envelope?.ok) {
+            throw new Error(envelope?.error || '隔离 CJS 任务失败');
+        }
+        return envelope.result;
     }
     if (type === 'plugin-extract') return handlePluginExtract(payload);
     if (type === 'theme-extract') return handleThemeExtract(payload);
@@ -2219,7 +2296,7 @@ async function runStdioTask() {
     try {
         const body = await readStdin();
         const payload = JSON.parse(body || '{}');
-        const result = await handleTask(payload.type, payload.payload);
+        const result = await handleTask(payload.type, payload.payload, { allowIsolation: false });
         process.stdout.write(JSON.stringify({ ok: true, result }));
     } catch (error) {
         process.stdout.write(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));
@@ -2287,6 +2364,12 @@ if (process.argv[2] === 'stdio-task') {
 
             if (req.method === 'POST' && req.url === '/task') {
                 const body = await readBody(req);
+                const rawTaskType = readTaskTypeFromRawBody(body);
+                if (isolatedSyncTaskTypes.has(rawTaskType)) {
+                    const raw = await runIsolatedStdioTaskRaw(body);
+                    writeRawJson(res, 200, raw);
+                    return;
+                }
                 const payload = JSON.parse(body || '{}');
                 const result = await handleTask(payload.type, payload.payload);
                 send(res, 200, { ok: true, result });

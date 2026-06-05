@@ -347,3 +347,312 @@ export const forceUnloadPluginRuntime = async (
 
     return getPluginLoadState(pluginsApi, pluginId);
 };
+
+export type PreflightPluginSwitchApi = RuntimePluginApi & {
+    disablePlugin(id: string): Promise<void>;
+    enablePlugin(id: string): Promise<void>;
+    enablePluginAndSave?(id: string): Promise<void>;
+};
+
+export type PreflightPluginSwitchTestResult = {
+    success: boolean;
+    message: string;
+    error: string;
+    initialState: PluginLoadState;
+    loadedState: PluginLoadState;
+    finalState: PluginLoadState;
+    loadDurationMs?: number;
+    stopDurationMs?: number;
+    usedForcedUnload: boolean;
+    forcedUnloadReason: string;
+};
+
+export type PreflightPluginSwitchTestOptions = {
+    pluginsApi: PreflightPluginSwitchApi;
+    pluginId: string;
+    pluginName?: string;
+    commandsApi?: RuntimeCommandsApi;
+    switchCooldownMs?: number;
+    timeoutGraceMs?: number;
+    loadTimeoutMs?: number;
+    stopTimeoutMs?: number;
+    signal?: AbortSignal;
+    waitMs?: (ms: number, signal?: AbortSignal) => Promise<void>;
+    readNoticeTexts?: () => string[];
+};
+
+export class PreflightPluginSwitchStoppedError extends Error {
+    constructor() {
+        super('运行前检查已停止');
+        this.name = 'PreflightPluginSwitchStoppedError';
+    }
+}
+
+const PREFLIGHT_PLUGIN_POLL_INTERVAL_MS = 100;
+const PREFLIGHT_PLUGIN_STOP_TIMEOUT_MS = 10000;
+
+const throwIfPreflightSwitchStopped = (signal?: AbortSignal) => {
+    if (signal?.aborted) {
+        throw new PreflightPluginSwitchStoppedError();
+    }
+};
+
+const waitPreflightSwitchMs = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+        reject(new PreflightPluginSwitchStoppedError());
+        return;
+    }
+    const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', abort);
+        resolve();
+    }, Math.max(0, ms));
+    const abort = () => {
+        clearTimeout(timer);
+        reject(new PreflightPluginSwitchStoppedError());
+    };
+    signal?.addEventListener('abort', abort, { once: true });
+});
+
+const defaultReadNoticeTexts = (): string[] => {
+    if (typeof document === 'undefined') return [];
+    const texts = new Set<string>();
+    document.querySelectorAll('.notice, .notice-message').forEach((element) => {
+        const text = element.textContent?.trim();
+        if (text) texts.add(text);
+    });
+    return Array.from(texts);
+};
+
+const readNewNoticeTexts = (
+    readNoticeTexts: () => string[],
+    snapshot: Set<string>,
+): string[] => readNoticeTexts().filter(text => !snapshot.has(text));
+
+const errorLikeToSwitchMessage = (error: unknown): string => {
+    if (error instanceof Error) return error.message || error.name;
+    return String(error);
+};
+
+const waitForPluginLoadedForSwitchTest = async (
+    pluginsApi: PreflightPluginSwitchApi,
+    pluginId: string,
+    options: {
+        timeoutMs: number;
+        signal?: AbortSignal;
+        waitMs: (ms: number, signal?: AbortSignal) => Promise<void>;
+        readNoticeTexts: () => string[];
+        noticeSnapshot: Set<string>;
+        pluginName?: string;
+        ignoredRuntimeFailure?: string;
+    },
+) => {
+    const deadline = Date.now() + options.timeoutMs;
+    while (Date.now() < deadline) {
+        throwIfPreflightSwitchStopped(options.signal);
+        const state = getPluginLoadState(pluginsApi, pluginId);
+        if (state.loaded) return state;
+
+        const noticeFailure = getPluginFailureMessage(
+            {},
+            pluginId,
+            readNewNoticeTexts(options.readNoticeTexts, options.noticeSnapshot),
+            options.pluginName,
+        );
+        if (noticeFailure) throw new Error(noticeFailure);
+
+        const runtimeFailure = getPluginFailureMessage(pluginsApi, pluginId, [], options.pluginName);
+        if (runtimeFailure && runtimeFailure !== options.ignoredRuntimeFailure) {
+            throw new Error(runtimeFailure);
+        }
+
+        await options.waitMs(PREFLIGHT_PLUGIN_POLL_INTERVAL_MS, options.signal);
+    }
+    return getPluginLoadState(pluginsApi, pluginId);
+};
+
+const enablePluginForSwitchTest = async (
+    options: PreflightPluginSwitchTestOptions & {
+        waitMs: (ms: number, signal?: AbortSignal) => Promise<void>;
+        readNoticeTexts: () => string[];
+        loadTimeoutMs: number;
+    },
+) => {
+    const startedAt = Date.now();
+    const noticeSnapshot = new Set(options.readNoticeTexts());
+    const ignoredRuntimeFailure = getPluginFailureMessage(
+        options.pluginsApi,
+        options.pluginId,
+        [],
+        options.pluginName,
+    );
+    let enableError: unknown = null;
+    try {
+        await options.pluginsApi.enablePlugin(options.pluginId);
+    } catch (error) {
+        enableError = error;
+    }
+
+    const state = await waitForPluginLoadedForSwitchTest(options.pluginsApi, options.pluginId, {
+        timeoutMs: options.loadTimeoutMs,
+        signal: options.signal,
+        waitMs: options.waitMs,
+        readNoticeTexts: options.readNoticeTexts,
+        noticeSnapshot,
+        pluginName: options.pluginName,
+        ignoredRuntimeFailure,
+    });
+    if (!state.loaded) {
+        const suffix = enableError ? `，enablePlugin 错误：${errorLikeToSwitchMessage(enableError)}` : '';
+        throw new Error(`插件启用后状态异常：enabled=${state.enabled}, loaded=${state.loaded}${suffix}`);
+    }
+    return {
+        state,
+        durationMs: Date.now() - startedAt,
+    };
+};
+
+const disablePluginForSwitchTest = async (
+    options: PreflightPluginSwitchTestOptions & {
+        waitMs: (ms: number, signal?: AbortSignal) => Promise<void>;
+        stopTimeoutMs: number;
+    },
+) => {
+    const startedAt = Date.now();
+    let disableError: unknown = null;
+    try {
+        await waitWithTimeout(
+            options.pluginsApi.disablePlugin(options.pluginId).then(async () => {
+                const deadline = Date.now() + options.stopTimeoutMs;
+                while (Date.now() < deadline) {
+                    throwIfPreflightSwitchStopped(options.signal);
+                    const state = getPluginLoadState(options.pluginsApi, options.pluginId);
+                    if (!state.loaded) return state;
+                    await options.waitMs(PREFLIGHT_PLUGIN_POLL_INTERVAL_MS, options.signal);
+                }
+                return getPluginLoadState(options.pluginsApi, options.pluginId);
+            }),
+            options.stopTimeoutMs,
+            `插件关闭超时：${options.pluginId}`,
+        );
+    } catch (error) {
+        if (error instanceof PreflightPluginSwitchStoppedError) throw error;
+        disableError = error;
+    }
+
+    let state = getPluginLoadState(options.pluginsApi, options.pluginId);
+    let usedForcedUnload = false;
+    let forcedUnloadReason = '';
+    if (state.loaded || state.enabled) {
+        usedForcedUnload = true;
+        forcedUnloadReason = disableError
+            ? errorLikeToSwitchMessage(disableError)
+            : `插件关闭后状态异常：enabled=${state.enabled}, loaded=${state.loaded}`;
+        state = await forceUnloadPluginRuntime(options.pluginsApi, options.pluginId, {
+            commandsApi: options.commandsApi,
+        });
+    }
+
+    return {
+        state,
+        durationMs: Date.now() - startedAt,
+        usedForcedUnload,
+        forcedUnloadReason,
+    };
+};
+
+export const runPreflightPluginSwitchTest = async (
+    options: PreflightPluginSwitchTestOptions,
+): Promise<PreflightPluginSwitchTestResult> => {
+    const waitMs = options.waitMs ?? waitPreflightSwitchMs;
+    const readNoticeTexts = options.readNoticeTexts ?? defaultReadNoticeTexts;
+    const switchCooldownMs = normalizePluginSwitchCooldownMs(options.switchCooldownMs);
+    const loadTimeoutMs = options.loadTimeoutMs ?? PLUGIN_LOAD_TIMEOUT_DEFAULT_MS;
+    const stopTimeoutMs = options.stopTimeoutMs ?? PREFLIGHT_PLUGIN_STOP_TIMEOUT_MS;
+    const initialState = getPluginLoadState(options.pluginsApi, options.pluginId);
+    let loadedState = initialState;
+    let finalState = initialState;
+    let loadDurationMs: number | undefined;
+    let stopDurationMs: number | undefined;
+    let usedForcedUnload = false;
+    let forcedUnloadReason = '';
+
+    try {
+        throwIfPreflightSwitchStopped(options.signal);
+        if (initialState.loaded || initialState.enabled) {
+            const stopped = await disablePluginForSwitchTest({
+                ...options,
+                waitMs,
+                stopTimeoutMs,
+            });
+            usedForcedUnload ||= stopped.usedForcedUnload;
+            forcedUnloadReason ||= stopped.forcedUnloadReason;
+            finalState = stopped.state;
+            await waitMs(switchCooldownMs, options.signal);
+        }
+
+        const enabled = await enablePluginForSwitchTest({
+            ...options,
+            waitMs,
+            readNoticeTexts,
+            loadTimeoutMs,
+        });
+        loadedState = enabled.state;
+        loadDurationMs = enabled.durationMs;
+        await waitMs(switchCooldownMs, options.signal);
+
+        const stopped = await disablePluginForSwitchTest({
+            ...options,
+            waitMs,
+            stopTimeoutMs: pluginSwitchTimeoutFromBaseline(
+                stopTimeoutMs,
+                options.timeoutGraceMs,
+                PREFLIGHT_PLUGIN_STOP_TIMEOUT_MS,
+            ),
+        });
+        stopDurationMs = stopped.durationMs;
+        usedForcedUnload ||= stopped.usedForcedUnload;
+        forcedUnloadReason ||= stopped.forcedUnloadReason;
+        finalState = stopped.state;
+
+        const success = !finalState.loaded && !finalState.enabled;
+        const message = success
+            ? usedForcedUnload
+                ? `插件开关测试通过，普通关闭未完全生效，已强制关闭成功：${options.pluginId}`
+                : `插件开关测试通过，插件已正常关闭：${options.pluginId}`
+            : `插件开关测试失败，插件仍未关闭：enabled=${finalState.enabled}, loaded=${finalState.loaded}`;
+        return {
+            success,
+            message,
+            error: success ? '' : message,
+            initialState,
+            loadedState,
+            finalState,
+            loadDurationMs,
+            stopDurationMs,
+            usedForcedUnload,
+            forcedUnloadReason,
+        };
+    } catch (error) {
+        if (error instanceof PreflightPluginSwitchStoppedError) {
+            await forceUnloadPluginRuntime(options.pluginsApi, options.pluginId, {
+                commandsApi: options.commandsApi,
+            });
+            throw error;
+        }
+
+        finalState = getPluginLoadState(options.pluginsApi, options.pluginId);
+        const message = `插件开关测试失败：${errorLikeToSwitchMessage(error)}`;
+        return {
+            success: false,
+            message,
+            error: message,
+            initialState,
+            loadedState,
+            finalState,
+            loadDurationMs,
+            stopDurationMs,
+            usedForcedUnload,
+            forcedUnloadReason,
+        };
+    }
+};

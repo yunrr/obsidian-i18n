@@ -138,15 +138,6 @@ struct TranslationIssueItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct TranslationCleanupReport {
-    state: bool,
-    issue_items: Vec<TranslationIssueItem>,
-    cleared_items: Vec<TranslationIssueItem>,
-    processed_files: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct RuntimeProbeFile {
     file: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3762,50 +3753,6 @@ fn collect_translation_candidates(
     candidates
 }
 
-fn validate_translation_candidates(
-    source_by_file: &HashMap<String, String>,
-    candidates: &[TranslationCandidate],
-) -> Result<()> {
-    let mut grouped: HashMap<&str, (Vec<Value>, Vec<Value>)> = HashMap::new();
-    for candidate in candidates {
-        let entry = grouped.entry(candidate.file.as_str()).or_default();
-        if candidate.kind == "ast" {
-            entry.0.push(candidate.item.clone());
-        } else if candidate.kind == "regex" {
-            entry.1.push(candidate.item.clone());
-        }
-    }
-
-    for (file, (ast_items, regex_items)) in grouped {
-        if !is_javascript_file(file) {
-            continue;
-        }
-        let Some(original_code) = source_by_file.get(file) else {
-            continue;
-        };
-        let mut code = original_code.clone();
-        if !ast_items.is_empty() {
-            code = replace_ast_items_swc(&code, &ast_items)
-                .with_context(|| format!("{file} AST 替换失败"))?;
-        }
-        if !regex_items.is_empty() {
-            code = apply_regex_translations(&code, &regex_items);
-        }
-        parse_swc_module(&code).with_context(|| format!("{file} 语法校验失败"))?;
-    }
-
-    Ok(())
-}
-
-fn translation_candidates_fail(
-    source_by_file: &HashMap<String, String>,
-    candidates: &[TranslationCandidate],
-) -> Option<String> {
-    validate_translation_candidates(source_by_file, candidates)
-        .err()
-        .map(|error| error.to_string())
-}
-
 fn partition_candidates(
     candidates: &[TranslationCandidate],
     parts: usize,
@@ -3818,111 +3765,6 @@ fn partition_candidates(
         .chunks(chunk_size.max(1))
         .map(|chunk| chunk.to_vec())
         .collect()
-}
-
-fn complement_candidates(
-    candidates: &[TranslationCandidate],
-    remove_start: usize,
-    remove_len: usize,
-) -> Vec<TranslationCandidate> {
-    candidates
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| *index < remove_start || *index >= remove_start + remove_len)
-        .map(|(_, item)| item.clone())
-        .collect()
-}
-
-fn minimize_failing_translation_set(
-    source_by_file: &HashMap<String, String>,
-    candidates: &[TranslationCandidate],
-) -> Vec<TranslationCandidate> {
-    if candidates.len() <= 1 {
-        return candidates.to_vec();
-    }
-
-    let mut current = candidates.to_vec();
-    let mut granularity = 2usize;
-    while current.len() >= 2 {
-        let chunks = partition_candidates(&current, granularity.min(current.len()));
-        let mut reduced = false;
-
-        for chunk in &chunks {
-            if translation_candidates_fail(source_by_file, chunk).is_some() {
-                current = chunk.clone();
-                granularity = 2;
-                reduced = true;
-                break;
-            }
-        }
-        if reduced {
-            continue;
-        }
-
-        let mut offset = 0usize;
-        for chunk in chunks {
-            let complement = complement_candidates(&current, offset, chunk.len());
-            offset += chunk.len();
-            if complement.is_empty() {
-                continue;
-            }
-            if translation_candidates_fail(source_by_file, &complement).is_some() {
-                current = complement;
-                granularity = granularity.saturating_sub(1).max(2);
-                reduced = true;
-                break;
-            }
-        }
-        if reduced {
-            continue;
-        }
-
-        if granularity >= current.len() {
-            break;
-        }
-        granularity = (granularity * 2).min(current.len());
-    }
-
-    current
-}
-
-fn remove_translation_candidates(
-    translation_json: &mut Value,
-    candidates: &[TranslationCandidate],
-) -> usize {
-    let mut grouped: HashMap<(String, String), Vec<usize>> = HashMap::new();
-    for candidate in candidates {
-        grouped
-            .entry((candidate.file.clone(), candidate.kind.clone()))
-            .or_default()
-            .push(candidate.index);
-    }
-
-    let Some(dict) = translation_json
-        .get_mut("dict")
-        .and_then(Value::as_object_mut)
-    else {
-        return 0;
-    };
-    let mut removed = 0usize;
-    for ((file, kind), mut indexes) in grouped {
-        indexes.sort_unstable();
-        indexes.dedup();
-        let Some(items) = dict
-            .get_mut(&file)
-            .and_then(|file_dict| file_dict.get_mut(&kind))
-            .and_then(Value::as_array_mut)
-        else {
-            continue;
-        };
-        for index in indexes.into_iter().rev() {
-            if index < items.len() {
-                items.remove(index);
-                removed += 1;
-            }
-        }
-    }
-    removed
 }
 
 fn remove_translation_issues(
@@ -3975,72 +3817,6 @@ fn remove_translation_issues(
         }
     }
     removed
-}
-
-fn validate_original_sources(source_by_file: &HashMap<String, String>) -> Result<()> {
-    for (file, code) in source_by_file {
-        if !is_javascript_file(file) {
-            continue;
-        }
-        parse_swc_module(code).with_context(|| format!("{file} 原始脚本语法错误，无法诊断"))?;
-    }
-    Ok(())
-}
-
-fn diagnose_translation_json(
-    translation_json: &Value,
-    source_by_file: &HashMap<String, String>,
-    apply_ast: bool,
-    apply_regex: bool,
-) -> Result<TranslationCleanupReport> {
-    validate_original_sources(source_by_file)?;
-    let mut working_translation_json = translation_json.clone();
-    let mut issue_items = Vec::new();
-    let cleared_items = Vec::new();
-
-    loop {
-        let candidates =
-            collect_translation_candidates(&working_translation_json, apply_ast, apply_regex);
-        if candidates.is_empty() {
-            break;
-        }
-        let Some(batch_reason) = translation_candidates_fail(source_by_file, &candidates) else {
-            break;
-        };
-
-        let mut failing = Vec::new();
-        for candidate in &candidates {
-            if let Some(reason) =
-                translation_candidates_fail(source_by_file, std::slice::from_ref(candidate))
-            {
-                issue_items.push(candidate.issue(&reason));
-                failing.push(candidate.clone());
-            }
-        }
-
-        if failing.is_empty() {
-            failing = minimize_failing_translation_set(source_by_file, &candidates);
-            let reason = if failing.len() > 1 {
-                format!("组合导致脚本验证失败: {batch_reason}")
-            } else {
-                batch_reason
-            };
-            for candidate in &failing {
-                issue_items.push(candidate.issue(&reason));
-            }
-        }
-
-        if remove_translation_candidates(&mut working_translation_json, &failing) == 0 {
-            bail!("诊断发现问题条目但临时排除失败");
-        }
-    }
-
-    Ok(TranslationCleanupReport {
-        state: true,
-        processed_files: source_by_file.len(),
-        issue_items,
-        cleared_items,
-    })
 }
 
 fn source_by_file_for_plugin(
@@ -4499,11 +4275,6 @@ fn issue_identity(issue: &TranslationIssueItem) -> String {
     )
 }
 
-fn candidate_issue_identity(candidate: &TranslationCandidate) -> String {
-    let (file, kind, index, source, target) = candidate_identity(candidate);
-    format!("{file}\u{1f}{kind}\u{1f}{index}\u{1f}{source}\u{1f}{target}")
-}
-
 fn candidate_group_signature(candidates: &[TranslationCandidate]) -> String {
     let mut parts = candidates
         .iter()
@@ -4514,17 +4285,6 @@ fn candidate_group_signature(candidates: &[TranslationCandidate]) -> String {
         .collect::<Vec<_>>();
     parts.sort();
     parts.join("\u{1e}")
-}
-
-fn remove_issue_items_from_candidates(
-    source: &mut Vec<TranslationCandidate>,
-    issues: &[TranslationIssueItem],
-) {
-    if issues.is_empty() {
-        return;
-    }
-    let issue_set = issues.iter().map(issue_identity).collect::<HashSet<_>>();
-    source.retain(|candidate| !issue_set.contains(&candidate_issue_identity(candidate)));
 }
 
 fn remove_candidates_from_list(
@@ -5409,20 +5169,10 @@ async fn handle_plugin_diagnose_cleanup_start(state: &AppState, payload: Value) 
         &translation_json,
         payload.is_applied.unwrap_or(false),
     )?;
-    let static_report =
-        diagnose_translation_json(&translation_json, &source_by_file, apply_ast, apply_regex)?;
-    update_diagnose_issue_record(
-        &paths,
-        &payload.translation_source_id,
-        &payload.plugin_id,
-        &static_report.issue_items,
-        "open",
-    )?;
-
-    let mut pending_candidates =
+    let pending_candidates =
         collect_translation_candidates(&translation_json, apply_ast, apply_regex);
-    remove_issue_items_from_candidates(&mut pending_candidates, &static_report.issue_items);
     let original_files = capture_plugin_files(&payload.plugin_dir, source_by_file.keys().cloned())?;
+    let processed_files = source_by_file.len();
     let mut session = DiagnoseCleanupSession {
         paths,
         plugin_id: payload.plugin_id,
@@ -5432,7 +5182,7 @@ async fn handle_plugin_diagnose_cleanup_start(state: &AppState, payload: Value) 
         translation_json,
         source_by_file,
         original_files,
-        issue_items: static_report.issue_items,
+        issue_items: Vec::new(),
         cleared_runtime_candidates: Vec::new(),
         pending_candidates,
         probe_map: HashMap::new(),
@@ -5449,7 +5199,7 @@ async fn handle_plugin_diagnose_cleanup_start(state: &AppState, payload: Value) 
         },
         active_phase_index: 0,
         phase_queues: HashMap::new(),
-        processed_files: static_report.processed_files,
+        processed_files,
     };
     initialize_phase_queues(&mut session);
     let restored_queues = restore_diagnose_checkpoint(&mut session)?;
@@ -9512,60 +9262,8 @@ mod tests {
         assert_eq!(items[0].t, r#"line\nraw"broken"#);
     }
 
-    #[test]
-    fn diagnose_records_multiple_syntax_breaking_items_without_touching_source_file() {
-        let original_code = r#"const label = "Hello"; const tip = "Tip"; const ok = "Okay";"#;
-        let translation_json = json!({
-            "schemaVersion": 1,
-            "metadata": {
-                "plugin": "demo-plugin",
-                "language": "zh-CN",
-                "version": "1.0.0",
-                "supportedVersions": "*",
-                "title": "Demo",
-                "description": "",
-                "author": ""
-            },
-            "dict": {
-                "main.js": {
-                    "ast": [],
-                    "regex": [
-                        { "source": "Hello", "target": "\"; const broken = ; //" },
-                        { "source": "Tip", "target": "提示" },
-                        { "source": "Okay", "target": "\"; if ( ; //" }
-                    ]
-                }
-            }
-        });
-
-        let report = diagnose_translation_json(
-            &translation_json,
-            &HashMap::from([("main.js".to_string(), original_code.to_string())]),
-            true,
-            true,
-        )
-        .unwrap();
-
-        assert_eq!(report.issue_items.len(), 2);
-        assert!(report.issue_items.iter().any(|item| item.source == "Hello"));
-        assert!(report.issue_items.iter().any(|item| item.source == "Okay"));
-        assert_eq!(
-            translation_json
-                .pointer("/dict/main.js/regex")
-                .and_then(Value::as_array)
-                .unwrap()
-                .iter()
-                .map(|item| item
-                    .get("source")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default())
-                .collect::<Vec<_>>(),
-            vec!["Hello", "Tip", "Okay"]
-        );
-    }
-
     #[tokio::test]
-    async fn plugin_diagnose_start_records_static_issues_without_rewriting_translation_source() {
+    async fn plugin_diagnose_start_skips_static_issues_and_returns_baseline_probe() {
         let base_path = env::temp_dir().join(format!("i18n-static-diagnose-{}", nanoid!()));
         let _ = fs::remove_dir_all(&base_path);
         let plugin_dir = base_path.join("demo-plugin");
@@ -9621,15 +9319,19 @@ mod tests {
                 "translationSourceId": source_id,
                 "applyAst": true,
                 "applyRegex": true,
-                "runtimeProbe": false,
+                "runtimeProbe": true,
                 "isApplied": false
             }),
         )
         .await
         .unwrap();
         let response: PluginDiagnoseCleanupResponse = serde_json::from_value(start_value).unwrap();
-        assert_eq!(response.status, "completed");
-        assert_eq!(response.issue_items.len(), 2);
+        assert_eq!(response.status, "probe");
+        assert!(response.issue_items.is_empty());
+        let probe = response.probe.unwrap();
+        assert_eq!(probe.label, "原始运行验证");
+        assert_eq!(probe.files.len(), 1);
+        assert!(probe.files[0].code.is_none());
 
         let saved_translation = read_translation(&paths, source_id).unwrap();
         assert_eq!(

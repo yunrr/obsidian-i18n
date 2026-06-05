@@ -255,7 +255,6 @@ export class CompanionWorkerManager {
 
         return new Promise<TResult>((resolve, reject) => {
             const abortHandler = () => {
-                void this.stopBackend(backend);
                 const abortError = new Error('AbortError');
                 abortError.name = 'AbortError';
                 reject(abortError);
