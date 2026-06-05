@@ -3,6 +3,7 @@ import type { PluginTranslationV1Regex } from '~/types';
 import type { I18nSettings } from 'src/settings/data';
 
 import { REGEX_DEFAULT_CONFIG } from './config';
+import { extractRegexTranslations } from './regex-extractor';
 import { replaceLiteralTranslations } from './literal-replacer';
 
 // Regex 翻译器
@@ -208,32 +209,7 @@ export class RegexTranslator {
 
     public extractTranslationsByRegex(code: string): PluginTranslationV1Regex[] {
         if (this.settings?.reExtractionEnabled === false) return [];
-
-        const translations: PluginTranslationV1Regex[] = [];
-        // 用Set存储已添加的source，优化去重效率（O(1)查找）
-        const seenSources = new Set<string>();
-
-        // 遍历所有模式提取翻译条目
-        for (const regex of this.patterns) {
-            // regex 是预编译的 stateful RegExp ('g' flag)，循环前需重置 lastIndex
-            regex.lastIndex = 0;
-
-            const matches = code.match(regex);
-            if (!matches) continue; // 无匹配结果则跳过
-
-            // 遍历匹配结果，过滤并去重
-            for (const item of matches) {
-                // 使用统一的过滤校验逻辑
-                if (!this.isValidText(item)) continue;
-                // 利用Set快速判断是否重复
-                if (seenSources.has(item)) continue;
-                // 不重复则添加到结果集
-                seenSources.add(item);
-                translations.push({ source: item, target: item });
-            }
-        }
-
-        return translations;
+        return extractRegexTranslations(code, this.patterns, text => this.isValidText(text));
     }
 
     public translate(code: string, translations: PluginTranslationV1Regex[]): string {

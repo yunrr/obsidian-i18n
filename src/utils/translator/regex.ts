@@ -3,6 +3,7 @@ import { PluginTranslationV1Regex } from '~/types';
 import { I18nSettings } from 'src/settings/data';
 
 import { REGEX_DEFAULT_CONFIG } from './config';
+import { extractRegexTranslations } from './regex-extractor';
 import { replaceLiteralTranslations } from './literal-replacer';
 
 export interface RegexValidationResult {
@@ -82,22 +83,7 @@ export class RegexTranslator {
     }
 
     public extractTranslationsByRegex(code: string): PluginTranslationV1Regex[] {
-        const translations: PluginTranslationV1Regex[] = [];
-        const seenSources = new Set<string>();
-
-        for (const regex of this.patterns) {
-            regex.lastIndex = 0;
-            const matches = code.match(regex);
-            if (!matches) continue;
-
-            for (const item of matches) {
-                if (!this.isValidText(item)) continue;
-                if (seenSources.has(item)) continue;
-                seenSources.add(item);
-                translations.push({ source: item, target: item });
-            }
-        }
-        return translations;
+        return extractRegexTranslations(code, this.patterns, text => this.isValidText(text));
     }
 
     public translate(code: string, translations: PluginTranslationV1Regex[]): string {

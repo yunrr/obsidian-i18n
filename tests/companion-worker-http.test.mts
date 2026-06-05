@@ -163,6 +163,43 @@ test('CJS worker rejects async workflow tasks owned by Rust', async () => {
     }
 });
 
+test('CJS worker skips disabled code extractors before constructing them', async () => {
+    const port = await getFreePort();
+    const worker = spawn(process.execPath, [workerPath, String(port)], {
+        cwd: path.resolve('.'),
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    try {
+        await waitForReady(worker, port);
+        const response = await postJson(port, JSON.stringify({
+            type: 'code-extract',
+            payload: {
+                code: 'const title = "Hello";',
+                settings: {
+                    astExtractionEnabled: false,
+                    reExtractionEnabled: false,
+                    reDatas: ['('],
+                    reFlags: 'g',
+                },
+            },
+        }));
+
+        assert.equal(response.status, 200);
+        const payload = JSON.parse(response.text);
+        assert.equal(payload.ok, true);
+        assert.equal(payload.result.state, true);
+        assert.deepEqual(payload.result.ast, []);
+        assert.deepEqual(payload.result.regex, []);
+    } finally {
+        worker.kill();
+        await Promise.race([
+            once(worker, 'exit'),
+            new Promise(resolve => setTimeout(resolve, 1_000)),
+        ]);
+    }
+});
+
 test('CJS worker renders plugin translation code without owning apply file writes', async () => {
     const port = await getFreePort();
     const worker = spawn(process.execPath, [workerPath, String(port)], {

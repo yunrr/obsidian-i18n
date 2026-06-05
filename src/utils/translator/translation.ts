@@ -68,13 +68,17 @@ export function generatePlugin(pluginVersion: string, manifestJSON: PluginManife
             }
         }
     };
-    const astTranslator = new AstTranslator(effectiveSettings as any);
-    const ast = astTranslator.loadCode(mainStr);
-    if (ast) translationJson.dict['main.js'].ast = astTranslator.extract(ast);
+    if (effectiveSettings.astExtractionEnabled !== false) {
+        const astTranslator = new AstTranslator(effectiveSettings as any);
+        const ast = astTranslator.loadCode(mainStr);
+        if (ast) translationJson.dict['main.js'].ast = astTranslator.extract(ast);
+    }
 
-    const regexTranslator = new RegexTranslator(effectiveSettings as any);
-    const regex = regexTranslator.loadCode(mainStr);
-    if (regex) translationJson.dict['main.js'].regex = regex;
+    if (effectiveSettings.reExtractionEnabled !== false) {
+        const regexTranslator = new RegexTranslator(effectiveSettings as any);
+        const regex = regexTranslator.loadCode(mainStr);
+        if (regex) translationJson.dict['main.js'].regex = regex;
+    }
 
     return translationJson;
 }

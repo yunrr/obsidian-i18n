@@ -455,14 +455,18 @@ const handleThemeExtract = handleThemeExtractCore;
 
 async function handleCodeExtract(payload: CompanionCodeExtractRequest): Promise<CompanionCodeExtractResponse> {
     try {
-        const astTranslator = new AstTranslator(payload.settings as any);
-        const ast = astTranslator.loadCode(payload.code);
-        const regexTranslator = new RegexTranslator(payload.settings as any);
+        const astTranslator = payload.settings?.astExtractionEnabled !== false
+            ? new AstTranslator(payload.settings as any)
+            : null;
+        const ast = astTranslator ? astTranslator.loadCode(payload.code) : null;
+        const regexTranslator = payload.settings?.reExtractionEnabled !== false
+            ? new RegexTranslator(payload.settings as any)
+            : null;
 
         return {
             state: true,
-            ast: ast ? astTranslator.extract(ast) : [],
-            regex: regexTranslator.loadCode(payload.code) || [],
+            ast: astTranslator && ast ? astTranslator.extract(ast) : [],
+            regex: regexTranslator ? regexTranslator.loadCode(payload.code) || [] : [],
         };
     } catch (error) {
         return {
