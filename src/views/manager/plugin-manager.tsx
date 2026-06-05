@@ -11,6 +11,7 @@ import { formatTimestamp } from '../../utils/data/format';
 import { useGlobalStoreInstance } from '~/utils/store/global';
 import { normalizeOpenAIUrl } from '~/utils/ai/url-helper';
 import { LLM_PROVIDERS } from '~/ai/constants';
+import { getBatchTranslationVersionOptions } from './batch-version-options';
 import {
     DEFAULT_AST_PROMPT_TEMPLATE,
     DEFAULT_REGEX_PROMPT_TEMPLATE,
@@ -203,6 +204,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
     const lastSourceSyncAtRef = useRef(0);
     const sourceSyncTimerRef = useRef<number | null>(null);
     const metadataIndexAttemptedRef = useRef<Set<string>>(new Set());
+    const previousExtractionVersionRef = useRef(settings.translationVersion || '1.0.1');
 
     const setViewMode = useCallback((mode: 'list' | 'grid') => {
         setViewModeState(mode);
@@ -244,6 +246,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
     }, [i18n, settings, searchTerm]);
 
     const sourceTick = useGlobalStoreInstance((state) => state.sourceUpdateTick);
+    const settingsUpdateTick = useGlobalStoreInstance((state) => state.settingsUpdateTick);
     const currentExtractionVersion = settings.translationVersion || '1.0.1';
 
     useEffect(() => {
@@ -264,20 +267,24 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
     }, [batchTask.isRunning, i18n.sourceManager, sourceTick]);
 
     const translationVersionOptions = useMemo(() => {
-        return i18n.sourceManager.getIndexedTranslationVersions('plugin');
-    }, [i18n.sourceManager, sourceTick]);
+        return getBatchTranslationVersionOptions(
+            i18n.sourceManager.getIndexedTranslationVersions('plugin'),
+            currentExtractionVersion,
+        );
+    }, [currentExtractionVersion, i18n.sourceManager, sourceTick, settingsUpdateTick]);
 
     useEffect(() => {
-        if (translationVersionOptions.includes(batchTranslationVersion)) return;
         const defaultVersion = settings.translationVersion || '1.0.1';
-        if (translationVersionOptions.includes(defaultVersion)) {
+        const defaultVersionChanged = previousExtractionVersionRef.current !== defaultVersion;
+        if (defaultVersionChanged) {
+            previousExtractionVersionRef.current = defaultVersion;
             setBatchTranslationVersion(defaultVersion);
-        } else if (translationVersionOptions.length > 0) {
-            setBatchTranslationVersion(translationVersionOptions[0]);
-        } else {
+            return;
+        }
+        if (!translationVersionOptions.includes(batchTranslationVersion)) {
             setBatchTranslationVersion(defaultVersion);
         }
-    }, [batchTranslationVersion, settings.translationVersion, translationVersionOptions]);
+    }, [batchTranslationVersion, settings.translationVersion, settingsUpdateTick, translationVersionOptions]);
 
     const sortOptions = useMemo(() => [
         { key: '0', label: t('Common.Data.SortAsc') },

@@ -10,8 +10,7 @@ export const normalizeCompanionWorkerBasePort = (value: unknown): number => {
             ? Number.parseInt(value, 10)
             : Number.NaN;
     if (!Number.isFinite(port)) return DEFAULT_WORKER_PORT;
-    const clamped = Math.min(MAX_PORT - 2, Math.max(1, Math.floor(port)));
-    return clamped % 2 === 0 ? clamped + 1 : clamped;
+    return Math.min(MAX_PORT - 1, Math.max(1, Math.floor(port)));
 };
 
 export const getCompanionWorkerPort = (

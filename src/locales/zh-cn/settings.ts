@@ -257,7 +257,7 @@ export default {
         CompanionEnabledTitle: "启用伴生进程",
         CompanionEnabledDesc: "OpenAI 兼容请求优先交给独立 Node 进程转发，降低 Obsidian 主进程批量翻译卡顿；失败时自动回退原请求方式。",
         CompanionPortTitle: "伴生进程端口",
-        CompanionPortDesc: "本地监听端口，仅绑定 127.0.0.1。请输入奇数基础端口；Rust 使用该端口，CJS 使用该端口 + 1。修改后会重启伴生进程。",
+        CompanionPortDesc: "本地监听端口，仅绑定 127.0.0.1。每个实例会占用基础端口和基础端口 + 1；默认会占用 18743 和 18744，多个仓库请让基础端口至少隔一个，例如 18743、18745、18747。修改后会重启伴生进程。",
         CompanionNodePathTitle: "Node 路径",
         CompanionNodePathDesc: "Node 可执行文件路径。留空使用系统 PATH 中的 node。",
         BatchExtractConcurrencyTitle: "批量提取并发数",

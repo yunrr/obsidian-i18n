@@ -288,8 +288,8 @@ export default class I18nLLMGeneric extends BaseSetting {
                     });
                 text.inputEl.type = 'number';
                 text.inputEl.min = '1';
-                text.inputEl.max = '65533';
-                text.inputEl.step = '2';
+                text.inputEl.max = '65534';
+                text.inputEl.step = '1';
             });
 
         new Setting(this.containerEl)
