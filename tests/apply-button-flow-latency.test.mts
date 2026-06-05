@@ -129,7 +129,6 @@ test('apply button flow records per-stage timings and restores loading after suc
         refreshParent: 3,
     });
     const loadingStates: boolean[] = [];
-    const logs: Array<{ stage: string; status: string; durationMs?: number }> = [];
 
     loadingStates.push(true);
     const result = await runPluginApplyTranslationFlow({
@@ -141,11 +140,6 @@ test('apply button flow records per-stage timings and restores loading after suc
         i18n: harness.i18n,
         refreshParent: harness.refreshParent,
         now: harness.now,
-        onLog: event => logs.push({
-            stage: event.stage,
-            status: event.status,
-            durationMs: event.durationMs,
-        }),
         messages: {
             genericError: 'generic-error',
             noApplyTranslationKinds: 'no-kinds',
@@ -172,26 +166,6 @@ test('apply button flow records per-stage timings and restores loading after suc
             ['refreshParent', 3],
         ],
     );
-    assert.deepEqual(
-        logs.map(item => [item.stage, item.status, item.durationMs]),
-        [
-            ['flow', 'start', undefined],
-            ['applyPluginTranslation', 'start', undefined],
-            ['applyPluginTranslation', 'success', 8420],
-            ['backendDiagnostics', 'success', 8400],
-            ['backendDiagnostics', 'success', 8300],
-            ['backendDiagnostics', 'success', 8200],
-            ['backendDiagnostics', 'success', 120],
-            ['backendDiagnostics', 'success', 8000],
-            ['disablePlugin', 'start', undefined],
-            ['disablePlugin', 'success', 35],
-            ['enablePlugin', 'start', undefined],
-            ['enablePlugin', 'success', 41],
-            ['refreshParent', 'start', undefined],
-            ['refreshParent', 'success', 3],
-            ['flow', 'success', 8499],
-        ],
-    );
     assert.equal(getSlowestApplyPluginStage(result.timings)?.stage, 'applyPluginTranslation');
     assert.deepEqual(harness.states, [{
         id: 'sample-plugin',
@@ -213,7 +187,6 @@ test('apply button flow records the failing stage and still lets loading clear',
         throw new Error('apply timeout');
     };
     let replacing = false;
-    const logs: Array<{ stage: string; status: string; durationMs?: number; error?: string }> = [];
 
     replacing = true;
     const result = await runPluginApplyTranslationFlow({
@@ -224,12 +197,6 @@ test('apply button flow records the failing stage and still lets loading clear',
         i18n: harness.i18n,
         refreshParent: harness.refreshParent,
         now: harness.now,
-        onLog: event => logs.push({
-            stage: event.stage,
-            status: event.status,
-            durationMs: event.durationMs,
-            error: event.error,
-        }),
         messages: {
             genericError: 'generic-error',
             noApplyTranslationKinds: 'no-kinds',
@@ -246,15 +213,6 @@ test('apply button flow records the failing stage and still lets loading clear',
         result.timings.map(item => [item.stage, item.durationMs]),
         [
             ['applyPluginTranslation', 3000],
-        ],
-    );
-    assert.deepEqual(
-        logs.map(item => [item.stage, item.status, item.durationMs, item.error]),
-        [
-            ['flow', 'start', undefined, undefined],
-            ['applyPluginTranslation', 'start', undefined, undefined],
-            ['applyPluginTranslation', 'failure', 3000, 'Error: apply timeout'],
-            ['flow', 'failure', 3000, 'Error: apply timeout'],
         ],
     );
     assert.equal(getSlowestApplyPluginStage(result.timings)?.stage, 'applyPluginTranslation');

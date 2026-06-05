@@ -1,6 +1,5 @@
 import * as path from 'path';
 import type I18N from 'src/main';
-import type { CompanionApplyDiagnostics } from 'src/manager/companion-worker-types';
 
 export type ApplyPluginTimingStage =
     | 'applyPluginTranslation'
@@ -8,20 +7,9 @@ export type ApplyPluginTimingStage =
     | 'enablePlugin'
     | 'refreshParent';
 
-export type ApplyPluginLogStage = 'flow' | 'backendDiagnostics' | ApplyPluginTimingStage;
-export type ApplyPluginLogStatus = 'start' | 'success' | 'failure' | 'skipped';
-
 export interface ApplyPluginStageTiming {
     stage: ApplyPluginTimingStage;
     durationMs: number;
-}
-
-export interface ApplyPluginLogEvent {
-    stage: ApplyPluginLogStage;
-    status: ApplyPluginLogStatus;
-    message: string;
-    durationMs?: number;
-    error?: string;
 }
 
 interface ApplyPluginFlowMessages {
@@ -48,7 +36,6 @@ interface ApplyPluginFlowOptions {
     messages: ApplyPluginFlowMessages;
     now?: () => number;
     warn?: (...args: any[]) => void;
-    onLog?: (event: ApplyPluginLogEvent) => void;
 }
 
 export interface ApplyPluginFlowResult {
@@ -64,37 +51,6 @@ export function getSlowestApplyPluginStage(timings: ApplyPluginStageTiming[]): A
     }, null);
 }
 
-const applyPluginStageLabels: Record<ApplyPluginLogStage, string> = {
-    flow: '应用译文',
-    applyPluginTranslation: '后端应用译文',
-    backendDiagnostics: '后端诊断',
-    disablePlugin: '禁用插件',
-    enablePlugin: '启用插件',
-    refreshParent: '刷新插件列表',
-};
-
-function formatApplyPluginDuration(durationMs?: number): string {
-    if (typeof durationMs !== 'number') return '';
-    if (durationMs < 1000) return `${durationMs}ms`;
-    return `${(durationMs / 1000).toFixed(2)}s`;
-}
-
-function formatApplyPluginLogMessage(event: Omit<ApplyPluginLogEvent, 'message'>, pluginId: string): string {
-    const label = applyPluginStageLabels[event.stage];
-    if (event.status === 'start') {
-        return event.stage === 'flow' ? `${label}开始：${pluginId}` : `${label}开始`;
-    }
-    const duration = formatApplyPluginDuration(event.durationMs);
-    const durationText = duration ? `（${duration}）` : '';
-    if (event.status === 'success') return `${label}完成${durationText}`;
-    if (event.status === 'skipped') return `${label}跳过${durationText}`;
-    return `${label}失败${durationText}${event.error ? `：${event.error}` : ''}`;
-}
-
-function formatCandidateCounts(diagnostics: CompanionApplyDiagnostics): string {
-    return `files=${diagnostics.fileCount} candidates=${diagnostics.totalCandidates} ast=${diagnostics.astCandidates} regex=${diagnostics.regexCandidates}`;
-}
-
 export async function runPluginApplyTranslationFlow(options: ApplyPluginFlowOptions): Promise<ApplyPluginFlowResult> {
     const {
         plugin,
@@ -107,99 +63,29 @@ export async function runPluginApplyTranslationFlow(options: ApplyPluginFlowOpti
         messages,
         now = () => Date.now(),
         warn = console.warn,
-        onLog,
     } = options;
     const timings: ApplyPluginStageTiming[] = [];
-    const flowStartedAt = now();
-
-    const emitLog = (event: Omit<ApplyPluginLogEvent, 'message'> & { message?: string }) => {
-        if (!onLog) return;
-        const logEvent: ApplyPluginLogEvent = {
-            ...event,
-            message: event.message || formatApplyPluginLogMessage(event, plugin.id),
-        };
-        try {
-            onLog(logEvent);
-        } catch (error) {
-            warn('[i18n] Apply translation log handler failed:', error);
-        }
-    };
 
     const timeStage = async <T>(stage: ApplyPluginTimingStage, action: () => Promise<T> | T): Promise<T> => {
         const startedAt = now();
-        emitLog({ stage, status: 'start' });
         try {
             const result = await action();
             const durationMs = Math.max(0, now() - startedAt);
             timings.push({ stage, durationMs });
-            emitLog({ stage, status: 'success', durationMs });
             return result;
         } catch (error) {
             const durationMs = Math.max(0, now() - startedAt);
-            const errorMessage = String(error);
             timings.push({ stage, durationMs });
-            emitLog({ stage, status: 'failure', durationMs, error: errorMessage });
             throw error;
         }
     };
 
-    const emitBackendDiagnostics = (diagnostics?: CompanionApplyDiagnostics) => {
-        if (!diagnostics) return;
-        emitLog({
-            stage: 'backendDiagnostics',
-            status: 'success',
-            durationMs: diagnostics.totalMs,
-            message: `后端应用总览完成（${formatApplyPluginDuration(diagnostics.totalMs)}）：${formatCandidateCounts(diagnostics)}`,
-        });
-        for (const stage of diagnostics.stages || []) {
-            emitLog({
-                stage: 'backendDiagnostics',
-                status: 'success',
-                durationMs: stage.durationMs,
-                message: `后端阶段 ${stage.name} 完成（${formatApplyPluginDuration(stage.durationMs)}）${stage.detail ? `：${stage.detail}` : ''}`,
-            });
-        }
-        if (diagnostics.cjs) {
-            emitLog({
-                stage: 'backendDiagnostics',
-                status: 'success',
-                durationMs: diagnostics.cjs.totalMs,
-                message: `CJS 渲染总览完成（${formatApplyPluginDuration(diagnostics.cjs.totalMs)}）：files=${diagnostics.cjs.fileCount} candidates=${diagnostics.cjs.totalCandidates} ast=${diagnostics.cjs.astCandidates} regex=${diagnostics.cjs.regexCandidates}`,
-            });
-            for (const file of diagnostics.cjs.files || []) {
-                if (typeof file.astReplaceMs === 'number') {
-                    emitLog({
-                        stage: 'backendDiagnostics',
-                        status: 'success',
-                        durationMs: file.astReplaceMs,
-                        message: `CJS AST 替换完成（${formatApplyPluginDuration(file.astReplaceMs)}）：${file.file} ast=${file.astCandidates}`,
-                    });
-                }
-                if (typeof file.regexReplaceMs === 'number') {
-                    emitLog({
-                        stage: 'backendDiagnostics',
-                        status: 'success',
-                        durationMs: file.regexReplaceMs,
-                        message: `CJS Regex 替换完成（${formatApplyPluginDuration(file.regexReplaceMs)}）：${file.file} regex=${file.regexCandidates}`,
-                    });
-                }
-            }
-        }
-    };
-
     try {
-        emitLog({ stage: 'flow', status: 'start' });
         if (!activeSourceId) throw new Error(messages.genericError);
         const applyAst = i18n.settings.applyAstTranslations !== false;
         const applyRegex = i18n.settings.applyRegexTranslations !== false;
         if (!applyAst && !applyRegex) {
             i18n.notice.warning(messages.noApplyTranslationKinds);
-            emitLog({
-                stage: 'flow',
-                status: 'skipped',
-                durationMs: Math.max(0, now() - flowStartedAt),
-                message: messages.noApplyTranslationKinds,
-            });
             return { applied: false, timings };
         }
 
@@ -215,7 +101,6 @@ export async function runPluginApplyTranslationFlow(options: ApplyPluginFlowOpti
             applyRegex,
         }));
         if (!result.state) throw new Error(result.error || messages.genericError);
-        emitBackendDiagnostics(result.diagnostics);
         i18n.stateManager.setPluginState(plugin.id, {
             id: plugin.id,
             isApplied: true,
@@ -238,20 +123,9 @@ export async function runPluginApplyTranslationFlow(options: ApplyPluginFlowOpti
             }
         }
         await timeStage('refreshParent', () => refreshParent());
-        emitLog({
-            stage: 'flow',
-            status: 'success',
-            durationMs: Math.max(0, now() - flowStartedAt),
-        });
         return { applied: true, timings };
     } catch (error) {
         const message = String(error);
-        emitLog({
-            stage: 'flow',
-            status: 'failure',
-            durationMs: Math.max(0, now() - flowStartedAt),
-            error: message,
-        });
         i18n.notice.result(false, message);
         return { applied: false, timings, error: message };
     }

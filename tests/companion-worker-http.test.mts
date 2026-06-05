@@ -178,7 +178,7 @@ test('CJS worker renders plugin translation code without owning apply file write
                 files: [
                     {
                         file: 'main.js',
-                        code: 'const title = "Hello"; console.log("World");',
+                        code: 'const title = "Hello"; // keep this comment\nconsole.log("World");',
                     },
                 ],
                 candidates: [
@@ -206,6 +206,8 @@ test('CJS worker renders plugin translation code without owning apply file write
         assert.equal(payload.result.files.length, 1);
         assert.match(payload.result.files[0].code, /你好/);
         assert.match(payload.result.files[0].code, /世界/);
+        assert.match(payload.result.files[0].code, /keep this comment/);
+        assert.match(payload.result.files[0].code, /\nconsole\.log/);
         assert.equal(payload.result.files[0].file, 'main.js');
         assert.equal(payload.result.processedFiles, undefined);
         assert.equal(payload.result.diagnostics.totalCandidates, 2);

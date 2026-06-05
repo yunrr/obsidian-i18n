@@ -8,7 +8,7 @@ import { i18nOpen } from '../../../utils/common/general';
 import { getPluginTranslationSources, hasExtractedTranslationContent, calculateChecksum } from '../../../utils/translator/light';
 import { openPluginSourceEditor } from '../utils/source-editor';
 import { getEffectiveExtractionSettings } from '../../../utils/translator/config';
-import { getSlowestApplyPluginStage, runPluginApplyTranslationFlow, type ApplyPluginLogEvent } from './plugin-apply-flow';
+import { runPluginApplyTranslationFlow } from './plugin-apply-flow';
 import {
     Button,
     Select,
@@ -71,30 +71,6 @@ interface PluginItemProps {
     reloadPlugin: (id: string) => Promise<boolean>;
     close: () => void;
     viewMode: 'list' | 'grid';
-}
-
-function notifyApplyLog(i18n: I18N, event: ApplyPluginLogEvent) {
-    const prefix = '应用译文日志';
-    const consolePayload = {
-        stage: event.stage,
-        status: event.status,
-        durationMs: event.durationMs,
-        error: event.error,
-        message: event.message,
-    };
-
-    if (event.status === 'failure') {
-        console.warn('[i18n] Apply translation step failed', consolePayload);
-        i18n.notice.errorPrefix(prefix, event.message, 10000);
-        return;
-    }
-
-    console.info('[i18n] Apply translation step', consolePayload);
-    if (event.status === 'success') {
-        i18n.notice.successPrefix(prefix, event.message, 5000);
-        return;
-    }
-    i18n.notice.infoPrefix(prefix, event.message, 5000);
 }
 
 export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n, settings, isEnabled, data, reloadPlugin, refreshParent, close, viewMode }) => {
@@ -267,7 +243,7 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
         }
         setReplacing(true);
         try {
-            const result = await runPluginApplyTranslationFlow({
+            await runPluginApplyTranslationFlow({
                 plugin,
                 pluginDir,
                 activeSourceId,
@@ -275,7 +251,6 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
                 translationVersion,
                 i18n,
                 refreshParent,
-                onLog: event => notifyApplyLog(i18n, event),
                 messages: {
                     genericError: t('Manager.Common.Errors.ErrorDesc'),
                     noApplyTranslationKinds: t('Common.Notices.NoApplyTranslationKinds'),
@@ -283,11 +258,6 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
                     loadFailedAfterApply: t('Manager.Plugins.Errors.LoadFailedAfterApply') || '插件重载失败，译文已写入，请手动检查插件状态。',
                 },
             });
-            const slowest = getSlowestApplyPluginStage(result.timings);
-            if (slowest) {
-                i18n.notice.infoPrefix('应用译文日志', `最慢步骤：${slowest.stage}（${slowest.durationMs}ms）`, 8000);
-                console.info('[i18n] Apply translation slowest step', slowest);
-            }
         } finally {
             setReplacing(false);
         }

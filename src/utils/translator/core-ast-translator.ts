@@ -5,6 +5,7 @@ import { generate } from "@babel/generator";
 import * as t from '@babel/types';
 import type { PluginTranslationV1Ast } from '~/types';
 import type { I18nSettings } from '../../settings/data';
+import { applySourceEdits, type SourceEdit } from './source-edits';
 
 // ====================================================================================================
 //                                      Configuration (白名单配置)
@@ -20,6 +21,7 @@ export class AstTranslator {
     private settings: I18nSettings;
     private config: any;
     private contentRules: any;
+    private sourceByAst = new WeakMap<t.Node, string>();
 
     constructor(settings: I18nSettings) {
         this.settings = settings;
@@ -86,39 +88,62 @@ export class AstTranslator {
      * 支持严格匹配 (type:name:source) 和宽松匹配 (source only)
      */
     public translate(ast: t.Node, translations: PluginTranslationV1Ast[]): string {
-        // 1. 构建查找表
-        const strictMap = new Map<string, string>(); // type:name:source -> target
-        const looseMap = new Map<string, string>();  // source -> target (fallback)
+        const maps = this.buildTranslationMaps(translations);
+        const sourceCode = this.sourceByAst.get(ast);
+        if (sourceCode) {
+            const patched = this.translateBySourceEdits(ast, sourceCode, maps);
+            if (patched !== null) return patched;
+        }
+        return this.translateByGenerator(ast, maps);
+    }
 
-        translations.forEach(item => {
-            if (item.type && item.name) {
-                strictMap.set(this.getFingerprint(item), item.target);
-            }
-            looseMap.set(item.source, item.target);
-        });
-
-        // 2. 遍历所有字符串节点 (不限于白名单，以支持手动添加的条目)
+    private translateByGenerator(ast: t.Node, maps: TranslationMaps): string {
         this.traverseAllStrings(ast, (type, name, valueNode) => {
             const source = this.extractSource(valueNode);
             if (!source) return;
-
-            // 尝试匹配
-            let target = strictMap.get(this.getFingerprint({ type, name, source } as any));
-            if (!target) {
-                target = looseMap.get(source);
-            }
-
-            if (target && target !== source) {
-                this.replaceSource(valueNode, target);
-            }
+            const target = this.findTarget(maps, type, name, source);
+            if (target && target !== source) this.replaceSource(valueNode, target);
         });
 
-        // 3. 生成代码
         return generate(ast, {
             minified: true,
             comments: false,
             jsescOption: { minimal: true }
         }).code;
+    }
+
+    private translateBySourceEdits(ast: t.Node, sourceCode: string, maps: TranslationMaps): string | null {
+        const edits: SourceEdit[] = [];
+        let canPatch = true;
+
+        this.traverseAllStrings(ast, (type, name, valueNode) => {
+            if (!canPatch) return;
+            const source = this.extractSource(valueNode);
+            if (!source) return;
+            const target = this.findTarget(maps, type, name, source);
+            if (!target || target === source) return;
+            const replacement = this.buildReplacementLiteral(valueNode, target);
+            if (
+                replacement === null ||
+                typeof valueNode.start !== 'number' ||
+                typeof valueNode.end !== 'number'
+            ) {
+                canPatch = false;
+                return;
+            }
+            edits.push({
+                start: valueNode.start,
+                end: valueNode.end,
+                replacement,
+            });
+        });
+
+        if (!canPatch) return null;
+        try {
+            return applySourceEdits(sourceCode, edits);
+        } catch {
+            return null;
+        }
     }
 
     /**
@@ -430,7 +455,7 @@ export class AstTranslator {
 
     private parseAst(code: string, isModule: boolean) {
         try {
-            return parse(code, {
+            const ast = parse(code, {
                 sourceType: isModule ? 'module' : 'script',
                 attachComment: false,
                 plugins: [
@@ -439,6 +464,8 @@ export class AstTranslator {
                 ],
                 errorRecovery: true
             });
+            this.sourceByAst.set(ast, code);
+            return ast;
         } catch (e) {
             console.warn("AST Parse Error:", (e as Error).message?.split('\n')[0]);
             return null;
@@ -473,6 +500,53 @@ export class AstTranslator {
                 Object.assign(node, { type: 'TemplateLiteral', quasis: ast.quasis, expressions: ast.expressions });
             }
         } catch (e) { /* ignore */ }
+    }
+
+    private buildReplacementLiteral(node: t.StringLiteral | t.TemplateLiteral, target: string): string | null {
+        if (!target.includes('${')) {
+            if (t.isTemplateLiteral(node)) return '`' + this.escapeTemplateRaw(target) + '`';
+            return JSON.stringify(target);
+        }
+        try {
+            const safeTarget = target.replace(/`/g, '\\`');
+            const ast = parseExpression('`' + safeTarget + '`');
+            if (t.isTemplateLiteral(ast)) {
+                return generate(ast, {
+                    minified: true,
+                    comments: false,
+                    jsescOption: { minimal: true }
+                }).code;
+            }
+        } catch {
+            return null;
+        }
+        return null;
+    }
+
+    private escapeTemplateRaw(target: string): string {
+        return target
+            .replace(/\\/g, '\\\\')
+            .replace(/`/g, '\\`');
+    }
+
+    private buildTranslationMaps(translations: PluginTranslationV1Ast[]): TranslationMaps {
+        const strictMap = new Map<string, string>();
+        const looseMap = new Map<string, string>();
+
+        translations.forEach(item => {
+            if (item.type && item.name) {
+                strictMap.set(this.getFingerprint(item), item.target);
+            }
+            looseMap.set(item.source, item.target);
+        });
+
+        return { strictMap, looseMap };
+    }
+
+    private findTarget(maps: TranslationMaps, type: string, name: string, source: string): string | undefined {
+        let target = maps.strictMap.get(this.getFingerprint({ type, name, source } as any));
+        if (!target) target = maps.looseMap.get(source);
+        return target;
     }
 
     private getAssignName(node: t.Node): string | null {
@@ -531,4 +605,9 @@ export class AstTranslator {
         results.forEach(r => map.set(this.getFingerprint(r), r));
         return Array.from(map.values()).sort((a, b) => a.type.localeCompare(b.type) || a.name.localeCompare(b.name));
     }
+}
+
+interface TranslationMaps {
+    strictMap: Map<string, string>;
+    looseMap: Map<string, string>;
 }
