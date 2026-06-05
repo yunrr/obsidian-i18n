@@ -48,14 +48,14 @@ function createApplyFlowHarness(delays: DelayMap = {}) {
         companionWorkerManager: {
             async getCjsEndpoint() {
                 advance('getCjsEndpoint');
-                return 'http://127.0.0.1:18744';
+                throw new Error('getCjsEndpoint should not be called when CJS owns plugin apply');
             },
             async applyPluginTranslation(request: any) {
                 advance('applyPluginTranslation');
                 assert.equal(request.pluginId, 'sample-plugin');
                 assert.equal(request.pluginDir, 'vault-root/.obsidian/plugins/sample-plugin');
                 assert.equal(request.translationSourceId, 'source-1');
-                assert.equal(request.cjsEndpoint, 'http://127.0.0.1:18744');
+                assert.equal(request.cjsEndpoint, undefined);
                 assert.equal(request.applyAst, true);
                 assert.equal(request.applyRegex, true);
                 return {
@@ -69,8 +69,7 @@ function createApplyFlowHarness(delays: DelayMap = {}) {
                         astCandidates: 1,
                         regexCandidates: 1,
                         stages: [
-                            { name: 'rust.collectCandidates', durationMs: 25, detail: 'total=2 ast=1 regex=1 files=1' },
-                            { name: 'rust.requestCjsRender', durationMs: 8300, detail: 'files=1 candidates=2' },
+                            { name: 'cjs.applyTranslation', durationMs: 8300, detail: 'files=1 candidates=2' },
                         ],
                         cjs: {
                             totalMs: 8200,
@@ -124,7 +123,6 @@ function createApplyFlowHarness(delays: DelayMap = {}) {
 
 test('apply button flow records per-stage timings and restores loading after success', async () => {
     const harness = createApplyFlowHarness({
-        getCjsEndpoint: 120,
         applyPluginTranslation: 8420,
         disablePlugin: 35,
         enablePlugin: 41,
@@ -160,7 +158,6 @@ test('apply button flow records per-stage timings and restores loading after suc
     assert.equal(result.applied, true);
     assert.deepEqual(loadingStates, [true, false]);
     assert.deepEqual(harness.calls, [
-        'getCjsEndpoint',
         'applyPluginTranslation',
         'disablePlugin',
         'enablePlugin',
@@ -169,7 +166,6 @@ test('apply button flow records per-stage timings and restores loading after suc
     assert.deepEqual(
         result.timings.map(item => [item.stage, item.durationMs]),
         [
-            ['getCjsEndpoint', 120],
             ['applyPluginTranslation', 8420],
             ['disablePlugin', 35],
             ['enablePlugin', 41],
@@ -180,12 +176,9 @@ test('apply button flow records per-stage timings and restores loading after suc
         logs.map(item => [item.stage, item.status, item.durationMs]),
         [
             ['flow', 'start', undefined],
-            ['getCjsEndpoint', 'start', undefined],
-            ['getCjsEndpoint', 'success', 120],
             ['applyPluginTranslation', 'start', undefined],
             ['applyPluginTranslation', 'success', 8420],
             ['backendDiagnostics', 'success', 8400],
-            ['backendDiagnostics', 'success', 25],
             ['backendDiagnostics', 'success', 8300],
             ['backendDiagnostics', 'success', 8200],
             ['backendDiagnostics', 'success', 120],
@@ -196,7 +189,7 @@ test('apply button flow records per-stage timings and restores loading after suc
             ['enablePlugin', 'success', 41],
             ['refreshParent', 'start', undefined],
             ['refreshParent', 'success', 3],
-            ['flow', 'success', 8619],
+            ['flow', 'success', 8499],
         ],
     );
     assert.equal(getSlowestApplyPluginStage(result.timings)?.stage, 'applyPluginTranslation');
@@ -213,7 +206,6 @@ test('apply button flow records per-stage timings and restores loading after suc
 
 test('apply button flow records the failing stage and still lets loading clear', async () => {
     const harness = createApplyFlowHarness({
-        getCjsEndpoint: 10,
         applyPluginTranslation: 3000,
     });
     harness.i18n.companionWorkerManager.applyPluginTranslation = async () => {
@@ -253,7 +245,6 @@ test('apply button flow records the failing stage and still lets loading clear',
     assert.deepEqual(
         result.timings.map(item => [item.stage, item.durationMs]),
         [
-            ['getCjsEndpoint', 10],
             ['applyPluginTranslation', 3000],
         ],
     );
@@ -261,11 +252,9 @@ test('apply button flow records the failing stage and still lets loading clear',
         logs.map(item => [item.stage, item.status, item.durationMs, item.error]),
         [
             ['flow', 'start', undefined, undefined],
-            ['getCjsEndpoint', 'start', undefined, undefined],
-            ['getCjsEndpoint', 'success', 10, undefined],
             ['applyPluginTranslation', 'start', undefined, undefined],
             ['applyPluginTranslation', 'failure', 3000, 'Error: apply timeout'],
-            ['flow', 'failure', 3010, 'Error: apply timeout'],
+            ['flow', 'failure', 3000, 'Error: apply timeout'],
         ],
     );
     assert.equal(getSlowestApplyPluginStage(result.timings)?.stage, 'applyPluginTranslation');

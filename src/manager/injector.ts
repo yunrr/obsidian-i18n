@@ -94,10 +94,9 @@ export class InjectorManager {
                 return false;
             }
 
-            // Rust 负责读取译文、备份和写回；CJS 负责生成脚本替换结果。
+            // CJS owns the plugin apply flow so replacement stays compatible with the editor translators.
             // @ts-ignore
             const backupBasePath = path.join(path.normalize(this.i18n.app.vault.adapter.getBasePath()), this.i18n.manifest.dir || '');
-            const cjsEndpoint = await this.i18n.companionWorkerManager.getCjsEndpoint();
             const result = await this.i18n.companionWorkerManager.applyPluginTranslation({
                 pluginId: plugin.id,
                 pluginDir,
@@ -106,7 +105,6 @@ export class InjectorManager {
                 translationSourceId: sourceId,
                 applyAst,
                 applyRegex,
-                cjsEndpoint,
             });
             if (!result.state) return false;
 

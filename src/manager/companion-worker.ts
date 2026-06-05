@@ -22,6 +22,7 @@ import type {
     CompanionCodeExtractResponse,
     CompanionPluginDiagnoseRenderProbeRequest,
     CompanionPluginDiagnoseRenderProbeResponse,
+    CompanionPluginApplyTranslationRequest,
     CompanionPluginExtractPayload,
     CompanionPluginExtractResult,
     CompanionThemeExtractPayload,
@@ -554,6 +555,110 @@ async function handlePluginRenderTranslation(payload: CompanionPluginDiagnoseRen
         return {
             state: false,
             files: [],
+            error: error instanceof Error ? error.message : String(error),
+        };
+    }
+}
+
+async function handlePluginApplyTranslation(payload: CompanionPluginApplyTranslationRequest) {
+    try {
+        const startedAt = Date.now();
+        const translationJson = payload.translationJson || (
+            payload.persistence && payload.translationSourceId
+                ? await readTranslationFile<PluginTranslationV1>(getPersistencePaths(payload.persistence.basePath), payload.translationSourceId)
+                : null
+        );
+        if (!translationJson) throw new Error('翻译文件不存在');
+        const dict = translationJson.dict || {};
+        const files = Object.keys(dict);
+        await createWorkerBackup(payload.backupBasePath, payload.pluginId, payload.pluginDir, files);
+        const applyAst = payload.applyAst !== false;
+        const applyRegex = payload.applyRegex !== false;
+
+        let processedFiles = 0;
+        let astCandidates = 0;
+        let regexCandidates = 0;
+        const fileDiagnostics: NonNullable<CompanionPluginDiagnoseRenderProbeResponse['diagnostics']>['files'] = [];
+        for (const file of files) {
+            const fileStartedAt = Date.now();
+            const targetFilePath = safeJoin(payload.pluginDir, file);
+            if (!await fs.pathExists(targetFilePath)) continue;
+
+            let fileString = await readWorkerBackupContent(payload.backupBasePath, payload.pluginId, file)
+                || await fs.readFile(targetFilePath, 'utf8');
+            const fileDict = dict[file];
+            const astItems = applyAst ? (fileDict?.ast || []) : [];
+            const regexItems = applyRegex ? (fileDict?.regex || []) : [];
+            astCandidates += astItems.length;
+            regexCandidates += regexItems.length;
+            const fileLog = {
+                file,
+                astCandidates: astItems.length,
+                regexCandidates: regexItems.length,
+                astParseMs: undefined as number | undefined,
+                astReplaceMs: undefined as number | undefined,
+                regexReplaceMs: undefined as number | undefined,
+                totalMs: 0,
+            };
+
+            if (astItems.length) {
+                const astTranslator = new AstTranslator({} as any);
+                const astParseStartedAt = Date.now();
+                const ast = astTranslator.loadCode(fileString);
+                fileLog.astParseMs = Date.now() - astParseStartedAt;
+                if (ast) {
+                    const astReplaceStartedAt = Date.now();
+                    fileString = astTranslator.translate(ast, astItems as any);
+                    fileLog.astReplaceMs = Date.now() - astReplaceStartedAt;
+                }
+            }
+            if (regexItems.length) {
+                const regexTranslator = new RegexTranslator({} as any);
+                const regexStartedAt = Date.now();
+                fileString = regexTranslator.translate(fileString, regexItems as any);
+                fileLog.regexReplaceMs = Date.now() - regexStartedAt;
+            }
+
+            await fs.writeFile(targetFilePath, fileString);
+            processedFiles++;
+            fileLog.totalMs = Date.now() - fileStartedAt;
+            fileDiagnostics.push(fileLog);
+        }
+
+        const totalCandidates = astCandidates + regexCandidates;
+        return {
+            state: true,
+            processedFiles,
+            translationVersion: translationJson.metadata?.version || '0.0.0',
+            diagnostics: {
+                totalMs: Date.now() - startedAt,
+                fileCount: processedFiles,
+                totalCandidates,
+                astCandidates,
+                regexCandidates,
+                stages: [
+                    {
+                        name: 'cjs.applyTranslation',
+                        durationMs: Date.now() - startedAt,
+                        detail: `files=${processedFiles} candidates=${totalCandidates}`,
+                    },
+                ],
+                cjs: {
+                    totalMs: Date.now() - startedAt,
+                    fileCount: processedFiles,
+                    totalCandidates,
+                    astCandidates,
+                    regexCandidates,
+                    groupMs: 0,
+                    files: fileDiagnostics,
+                },
+            },
+        };
+    } catch (error) {
+        return {
+            state: false,
+            processedFiles: 0,
+            translationVersion: payload.translationJson?.metadata?.version || '0.0.0',
             error: error instanceof Error ? error.message : String(error),
         };
     }
@@ -2033,6 +2138,7 @@ async function handleTask(type: string, payload: any) {
     if (type === 'code-extract') return handleCodeExtract(payload);
     if (type === 'ast-replace') return handleAstReplace(payload);
     if (type === 'plugin-render-translation' || type === 'plugin-diagnose-render-probe') return handlePluginRenderTranslation(payload);
+    if (type === 'plugin-apply-translation') return handlePluginApplyTranslation(payload);
     if (type === 'theme-apply-translation') return handleThemeApplyTranslation(payload);
     if (type === 'source-read') return handleSourceRead(payload);
     if (type === 'plugin-translate') return handlePluginTranslate(payload);

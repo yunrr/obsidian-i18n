@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import fs from 'node:fs/promises';
 import http from 'node:http';
+import os from 'node:os';
 import net from 'node:net';
 import path from 'node:path';
 import test from 'node:test';
@@ -157,5 +159,129 @@ test('CJS worker renders plugin translation code without owning apply file write
             once(worker, 'exit'),
             new Promise(resolve => setTimeout(resolve, 1_000)),
         ]);
+    }
+});
+
+test('CJS worker applies plugin translation with the legacy file write flow', async () => {
+    const port = await getFreePort();
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'i18n-cjs-apply-'));
+    const pluginDir = path.join(tempDir, 'plugin');
+    const backupBasePath = path.join(tempDir, 'plugin-data');
+    await fs.mkdir(pluginDir, { recursive: true });
+    await fs.writeFile(path.join(pluginDir, 'main.js'), 'const title = "Hello"; console.log("World");');
+
+    const worker = spawn(process.execPath, [workerPath, String(port)], {
+        cwd: path.resolve('.'),
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    try {
+        await waitForReady(worker, port);
+        const body = JSON.stringify({
+            type: 'plugin-apply-translation',
+            payload: {
+                pluginId: 'plugin-a',
+                pluginDir,
+                backupBasePath,
+                translationJson: {
+                    schemaVersion: 1,
+                    metadata: {
+                        plugin: 'plugin-a',
+                        title: 'Plugin A',
+                        version: '2.0.0',
+                    },
+                    dict: {
+                        'main.js': {
+                            ast: [
+                                { type: 'VariableDeclarator', name: 'title', source: 'Hello', target: '你好' },
+                            ],
+                            regex: [
+                                { source: 'World', target: '世界' },
+                            ],
+                        },
+                    },
+                },
+                applyAst: true,
+                applyRegex: true,
+            },
+        });
+        const response = await postJson(port, body);
+
+        assert.equal(response.status, 200);
+        const payload = JSON.parse(response.text);
+        assert.equal(payload.ok, true);
+        assert.equal(payload.result.state, true);
+        assert.equal(payload.result.processedFiles, 1);
+        assert.equal(payload.result.translationVersion, '2.0.0');
+        const translated = await fs.readFile(path.join(pluginDir, 'main.js'), 'utf8');
+        assert.match(translated, /你好/);
+        assert.match(translated, /世界/);
+        await fs.access(path.join(backupBasePath, 'backups', 'plugin-a', 'main.js.gz'));
+    } finally {
+        worker.kill();
+        await Promise.race([
+            once(worker, 'exit'),
+            new Promise(resolve => setTimeout(resolve, 1_000)),
+        ]);
+        await fs.rm(tempDir, { recursive: true, force: true });
+    }
+});
+
+test('CJS worker applies theme translation with the legacy file write flow', async () => {
+    const port = await getFreePort();
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'i18n-cjs-theme-apply-'));
+    const themeDir = path.join(tempDir, 'theme');
+    const backupBasePath = path.join(tempDir, 'plugin-data');
+    const themeCssPath = path.join(themeDir, 'theme.css');
+    await fs.mkdir(themeDir, { recursive: true });
+    await fs.writeFile(themeCssPath, '/* @settings\nname: Accent\nlabel: Accent color\n*/\nbody { color: red; }');
+
+    const worker = spawn(process.execPath, [workerPath, String(port)], {
+        cwd: path.resolve('.'),
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    try {
+        await waitForReady(worker, port);
+        const body = JSON.stringify({
+            type: 'theme-apply-translation',
+            payload: {
+                themeId: 'theme-a',
+                themeDir,
+                themeCssPath,
+                themeCssRelativePath: 'theme.css',
+                backupBasePath,
+                translationJson: {
+                    schemaVersion: 1,
+                    metadata: {
+                        plugin: 'theme-a',
+                        title: 'Theme A',
+                        version: '3.0.0',
+                    },
+                    dict: [
+                        { source: 'Accent color', target: '强调色' },
+                    ],
+                },
+            },
+        });
+        const response = await postJson(port, body);
+
+        assert.equal(response.status, 200);
+        const payload = JSON.parse(response.text);
+        assert.equal(payload.ok, true);
+        assert.equal(payload.result.state, true);
+        assert.equal(payload.result.processedFiles, 1);
+        assert.equal(payload.result.translationVersion, '3.0.0');
+        const translated = await fs.readFile(themeCssPath, 'utf8');
+        assert.match(translated, /强调色/);
+        assert.match(translated, /body \{ color: red; \}/);
+        await fs.access(path.join(backupBasePath, 'backups', 'theme-a', 'theme.css.gz'));
+    } finally {
+        worker.kill();
+        await Promise.race([
+            once(worker, 'exit'),
+            new Promise(resolve => setTimeout(resolve, 1_000)),
+        ]);
+        await fs.rm(tempDir, { recursive: true, force: true });
     }
 });

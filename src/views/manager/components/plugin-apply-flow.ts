@@ -3,7 +3,6 @@ import type I18N from 'src/main';
 import type { CompanionApplyDiagnostics } from 'src/manager/companion-worker-types';
 
 export type ApplyPluginTimingStage =
-    | 'getCjsEndpoint'
     | 'applyPluginTranslation'
     | 'disablePlugin'
     | 'enablePlugin'
@@ -67,7 +66,6 @@ export function getSlowestApplyPluginStage(timings: ApplyPluginStageTiming[]): A
 
 const applyPluginStageLabels: Record<ApplyPluginLogStage, string> = {
     flow: '应用译文',
-    getCjsEndpoint: '获取 CJS 后端',
     applyPluginTranslation: '后端应用译文',
     backendDiagnostics: '后端诊断',
     disablePlugin: '禁用插件',
@@ -158,7 +156,7 @@ export async function runPluginApplyTranslationFlow(options: ApplyPluginFlowOpti
                 stage: 'backendDiagnostics',
                 status: 'success',
                 durationMs: stage.durationMs,
-                message: `Rust 阶段 ${stage.name} 完成（${formatApplyPluginDuration(stage.durationMs)}）${stage.detail ? `：${stage.detail}` : ''}`,
+                message: `后端阶段 ${stage.name} 完成（${formatApplyPluginDuration(stage.durationMs)}）${stage.detail ? `：${stage.detail}` : ''}`,
             });
         }
         if (diagnostics.cjs) {
@@ -207,7 +205,6 @@ export async function runPluginApplyTranslationFlow(options: ApplyPluginFlowOpti
 
         // @ts-ignore Obsidian desktop adapters expose getBasePath at runtime.
         const backupBasePath = path.join(path.normalize(i18n.app.vault.adapter.getBasePath()), i18n.manifest.dir || '');
-        const cjsEndpoint = await timeStage('getCjsEndpoint', () => i18n.companionWorkerManager.getCjsEndpoint());
         const result = await timeStage('applyPluginTranslation', () => i18n.companionWorkerManager.applyPluginTranslation({
             pluginId: plugin.id,
             pluginDir,
@@ -216,7 +213,6 @@ export async function runPluginApplyTranslationFlow(options: ApplyPluginFlowOpti
             translationSourceId: activeSourceId,
             applyAst,
             applyRegex,
-            cjsEndpoint,
         }));
         if (!result.state) throw new Error(result.error || messages.genericError);
         emitBackendDiagnostics(result.diagnostics);

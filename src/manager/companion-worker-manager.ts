@@ -15,6 +15,7 @@ import {
 import {
     waitForWorkerReadyOrExit,
 } from './companion-worker-lifecycle';
+import { getCompanionWorkerTaskBackend } from './companion-worker-routing';
 import type {
     CompanionAsyncTaskType,
     CompanionApplyTranslationResponse,
@@ -328,19 +329,7 @@ export class CompanionWorkerManager {
     }
 
     private getTaskBackend(type: CompanionBatchTaskType | CompanionAsyncTaskType): WorkerBackend {
-        if (
-            type === 'plugin-extract' ||
-            type === 'theme-extract' ||
-            type === 'plugin-batch-extract' ||
-            type === 'theme-batch-extract' ||
-            type === 'code-extract' ||
-            type === 'ast-replace' ||
-            type === 'plugin-render-translation' ||
-            type === 'plugin-diagnose-render-probe'
-        ) {
-            return 'cjs';
-        }
-        return 'rust';
+        return getCompanionWorkerTaskBackend(type);
     }
 
     private async getEndpoint(backend: WorkerBackend): Promise<string> {

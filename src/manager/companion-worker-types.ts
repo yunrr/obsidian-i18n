@@ -167,7 +167,6 @@ export interface CompanionPluginApplyTranslationRequest {
     translationSourceId?: string;
     applyAst?: boolean;
     applyRegex?: boolean;
-    cjsEndpoint?: string;
 }
 
 export interface CompanionThemeApplyTranslationRequest {
