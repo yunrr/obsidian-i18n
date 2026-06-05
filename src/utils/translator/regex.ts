@@ -3,6 +3,7 @@ import { PluginTranslationV1Regex } from '~/types';
 import { I18nSettings } from 'src/settings/data';
 
 import { REGEX_DEFAULT_CONFIG } from './config';
+import { replaceLiteralTranslations } from './literal-replacer';
 
 export interface RegexValidationResult {
     success: boolean;
@@ -100,13 +101,7 @@ export class RegexTranslator {
     }
 
     public translate(code: string, translations: PluginTranslationV1Regex[]): string {
-        let translatedCode = code;
-        for (const item of translations) {
-            if (item.source && item.target && item.source !== item.target) {
-                translatedCode = translatedCode.split(item.source).join(item.target);
-            }
-        }
-        return translatedCode;
+        return replaceLiteralTranslations(code, translations);
     }
 }
 
