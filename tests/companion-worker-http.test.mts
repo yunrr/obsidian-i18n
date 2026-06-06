@@ -71,6 +71,41 @@ const postJson = async (port: number, body: string): Promise<{ status: number; t
     return request(port, '/task', 'POST', body);
 };
 
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+const extractionSettings = {
+    author: '',
+    translationVersion: '1.0.1',
+    reFlags: 'g',
+    reLength: 100,
+    reDatas: [],
+    reRejectRe: [],
+    reValidRe: [],
+    reExtractionEnabled: false,
+    chineseSkipMode: 'none',
+    astAssignments: [],
+    astFunctions: [],
+    astKeys: [],
+    astMaxLength: 100,
+    astRejectRe: [],
+    astValidRe: [],
+    astExtractionEnabled: false,
+};
+
+const pollTaskUntilTerminal = async (port: number, taskId: string, timeoutMs = 1_000): Promise<any> => {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+        const response = await request(port, `/task/status?id=${encodeURIComponent(taskId)}`, 'GET');
+        assert.equal(response.status, 200);
+        const payload = JSON.parse(response.text);
+        assert.equal(payload.ok, true);
+        const progress = payload.progress;
+        if (!['queued', 'running'].includes(progress.status)) return progress;
+        await delay(25);
+    }
+    throw new Error(`task ${taskId} did not reach a terminal status`);
+};
+
 test('CJS worker returns a JSON 413 response when request body exceeds the configured limit', async () => {
     const port = await getFreePort();
     const worker = spawn(process.execPath, [workerPath, String(port)], {
@@ -97,6 +132,124 @@ test('CJS worker returns a JSON 413 response when request body exceeds the confi
             once(worker, 'exit'),
             new Promise(resolve => setTimeout(resolve, 1_000)),
         ]);
+    }
+});
+
+test('CJS batch extraction records a crashed extract thread as a failed resource', async () => {
+    const port = await getFreePort();
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'i18n-cjs-crashed-extract-'));
+    const copiedWorkerPath = path.join(tempDir, 'i18n-companion-worker.cjs');
+    const extractThreadPath = path.join(tempDir, 'i18n-companion-extract-thread.cjs');
+    await fs.copyFile(workerPath, copiedWorkerPath);
+    await fs.writeFile(
+        extractThreadPath,
+        "const { parentPort } = require('worker_threads'); parentPort.on('message', () => process.exit(1));",
+    );
+
+    const worker = spawn(process.execPath, [copiedWorkerPath, String(port)], {
+        cwd: tempDir,
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    try {
+        await waitForReady(worker, port);
+        const response = await request(port, '/task/start', 'POST', JSON.stringify({
+            type: 'plugin-batch-extract',
+            payload: {
+                persistence: { basePath: path.join(tempDir, 'plugin-data') },
+                resources: [{
+                    resourceId: 'plugin-a',
+                    label: 'Plugin A',
+                    pluginName: 'Plugin A',
+                    pluginVersion: '1.0.0',
+                    mainDoc: path.join(tempDir, 'plugin-a', 'main.js'),
+                    manifestDoc: path.join(tempDir, 'plugin-a', 'manifest.json'),
+                }],
+                language: 'zh-cn',
+                settings: extractionSettings,
+                translationVersion: '1.0.1',
+                concurrency: 1,
+                checkpointKey: 'test-plugin-extract',
+            },
+        }));
+
+        assert.equal(response.status, 200);
+        const started = JSON.parse(response.text);
+        assert.equal(started.ok, true);
+
+        const progress = await pollTaskUntilTerminal(port, started.taskId);
+        assert.equal(progress.status, 'completed');
+        assert.equal(progress.processedResources, 1);
+        assert.equal(progress.failedCount, 1);
+        assert.equal(progress.successCount, 0);
+    } finally {
+        worker.kill();
+        await Promise.race([
+            once(worker, 'exit'),
+            delay(1_000),
+        ]);
+        await fs.rm(tempDir, { recursive: true, force: true });
+    }
+});
+
+test('CJS batch extraction times out a stalled extract thread and advances progress', async () => {
+    const port = await getFreePort();
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'i18n-cjs-stalled-extract-'));
+    const copiedWorkerPath = path.join(tempDir, 'i18n-companion-worker.cjs');
+    const extractThreadPath = path.join(tempDir, 'i18n-companion-extract-thread.cjs');
+    await fs.copyFile(workerPath, copiedWorkerPath);
+    await fs.writeFile(
+        extractThreadPath,
+        "const { parentPort } = require('worker_threads'); parentPort.on('message', () => undefined);",
+    );
+
+    const worker = spawn(process.execPath, [copiedWorkerPath, String(port)], {
+        cwd: tempDir,
+        env: {
+            ...process.env,
+            I18N_COMPANION_EXTRACT_THREAD_TIMEOUT_MS: '50',
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    try {
+        await waitForReady(worker, port);
+        const response = await request(port, '/task/start', 'POST', JSON.stringify({
+            type: 'plugin-batch-extract',
+            payload: {
+                persistence: { basePath: path.join(tempDir, 'plugin-data') },
+                resources: [{
+                    resourceId: 'plugin-a',
+                    label: 'Plugin A',
+                    pluginName: 'Plugin A',
+                    pluginVersion: '1.0.0',
+                    mainDoc: path.join(tempDir, 'plugin-a', 'main.js'),
+                    manifestDoc: path.join(tempDir, 'plugin-a', 'manifest.json'),
+                }],
+                language: 'zh-cn',
+                settings: extractionSettings,
+                translationVersion: '1.0.1',
+                concurrency: 1,
+                checkpointKey: 'test-plugin-extract',
+            },
+        }));
+
+        assert.equal(response.status, 200);
+        const started = JSON.parse(response.text);
+        assert.equal(started.ok, true);
+
+        const progress = await pollTaskUntilTerminal(port, started.taskId);
+        assert.equal(progress.status, 'completed');
+        assert.equal(progress.processedResources, 1);
+        assert.equal(progress.failedCount, 1);
+        assert.equal(progress.successCount, 0);
+    } finally {
+        worker.kill();
+        await Promise.race([
+            once(worker, 'exit'),
+            delay(1_000),
+        ]);
+        await fs.rm(tempDir, { recursive: true, force: true });
     }
 });
 

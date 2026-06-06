@@ -211,6 +211,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
     const [showFailureDetails, setShowFailureDetails] = useState(false);
     const [batchTranslationVersion, setBatchTranslationVersion] = useState(i18n.settings.translationVersion || '1.0.1');
     const taskIdRef = useRef<string | null>(null);
+    const taskTypeRef = useRef<'theme-batch-extract' | 'theme-batch-translate' | 'theme-failure-retry' | null>(null);
     const syncRevisionRef = useRef({ sourceRevision: 0, recordRevision: 0 });
     const lastSourceSyncAtRef = useRef(0);
     const sourceSyncTimerRef = useRef<number | null>(null);
@@ -689,6 +690,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
     const runWorkerTask = useCallback(async (type: 'theme-batch-extract' | 'theme-batch-translate' | 'theme-failure-retry', payload: unknown) => {
         const started = await i18n.companionWorkerManager.startTask(type, payload);
         taskIdRef.current = started.taskId;
+        taskTypeRef.current = type;
         syncRevisionRef.current = { sourceRevision: 0, recordRevision: 0 };
         lastSourceSyncAtRef.current = 0;
         syncWorkerProgress(started.progress);
@@ -696,12 +698,13 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
         let progress = started.progress;
         while (progress.status === 'queued' || progress.status === 'running') {
             await new Promise(resolve => window.setTimeout(resolve, BATCH_PROGRESS_POLL_MS));
-            const status = await i18n.companionWorkerManager.getTaskStatus(started.taskId);
+            const status = await i18n.companionWorkerManager.getTaskStatus(started.taskId, type);
             progress = status.progress;
             syncWorkerProgress(progress);
         }
 
         taskIdRef.current = null;
+        taskTypeRef.current = null;
         syncSourceStateFromDisk();
 
         if (progress.status === 'failed') throw new Error(progress.error || '本地伴生任务失败');
@@ -778,6 +781,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             new Notice(t('Common.Notices.TranslateFail', { message: String(error) }));
         } finally {
             taskIdRef.current = null;
+            taskTypeRef.current = null;
             setBatchTask(prev => ({ ...prev, isRunning: false, currentLabel: '' }));
         }
     }, [allThemeStates, batchExtractThemes, batchTask.isRunning, currentExtractionVersion, i18n, resumableThemeExtractResources, runWorkerTask, t, themeExtractCheckpoint, themes]);
@@ -853,6 +857,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             new Notice(t('Common.Notices.TranslateFail', { message: String(error) }));
         } finally {
             taskIdRef.current = null;
+            taskTypeRef.current = null;
             setBatchTask(prev => ({ ...prev, isRunning: false, currentLabel: '' }));
         }
     }, [batchTask.isRunning, i18n, resumableThemeTranslateResources, runWorkerTask, t, themeTranslateCheckpoint, themeTranslateResourcesById, translatableThemes]);
@@ -863,7 +868,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
     const handleStopBatchTask = useCallback(() => {
         const taskId = taskIdRef.current;
         if (taskId) {
-            i18n.companionWorkerManager.cancelTask(taskId)
+            i18n.companionWorkerManager.cancelTask(taskId, taskTypeRef.current || undefined)
                 .then(({ progress }) => syncWorkerProgress(progress))
                 .catch(error => console.warn('[i18n] Failed to cancel companion task:', error));
         }
@@ -905,6 +910,7 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
             new Notice(t('Common.Notices.TranslateFail', { message: String(error) }));
         } finally {
             taskIdRef.current = null;
+            taskTypeRef.current = null;
             setBatchTask(prev => ({ ...prev, isRunning: false, currentLabel: '' }));
         }
     }, [batchTask.isRunning, i18n, runWorkerTask, t, themeFailureRecords]);

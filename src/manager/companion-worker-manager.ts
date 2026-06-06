@@ -16,6 +16,7 @@ import {
     waitForWorkerReadyOrExit,
 } from './companion-worker-lifecycle';
 import { getCompanionWorkerTaskBackend } from './companion-worker-routing';
+import { resolveCompanionTaskBackend } from './companion-task-backend';
 import type {
     CompanionAsyncTaskType,
     CompanionApplyTranslationResponse,
@@ -290,8 +291,9 @@ export class CompanionWorkerManager {
         return response;
     }
 
-    public async getTaskStatus(taskId: string): Promise<CompanionTaskStatusResponse> {
-        const backend = this.taskBackends.get(taskId) || 'rust';
+    public async getTaskStatus(taskId: string, taskType?: CompanionAsyncTaskType): Promise<CompanionTaskStatusResponse> {
+        const fallbackBackend = taskType ? this.getTaskBackend(taskType) : 'rust';
+        const backend = resolveCompanionTaskBackend(this.taskBackends, taskId, fallbackBackend);
         const endpoint = await this.getEndpoint(backend);
         const query = encodeURIComponent(taskId);
 
@@ -312,8 +314,9 @@ export class CompanionWorkerManager {
         return { progress: payload.progress as CompanionTaskProgress };
     }
 
-    public async cancelTask(taskId: string): Promise<CompanionTaskCancelResponse> {
-        const backend = this.taskBackends.get(taskId) || 'rust';
+    public async cancelTask(taskId: string, taskType?: CompanionAsyncTaskType): Promise<CompanionTaskCancelResponse> {
+        const fallbackBackend = taskType ? this.getTaskBackend(taskType) : 'rust';
+        const backend = resolveCompanionTaskBackend(this.taskBackends, taskId, fallbackBackend);
         return this.postWorker<CompanionTaskCancelResponse>(backend, '/task/cancel', { taskId });
     }
 

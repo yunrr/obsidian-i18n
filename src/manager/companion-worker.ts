@@ -65,6 +65,11 @@ const maxBodyBytes = Number.isFinite(configuredMaxBodyBytes) && configuredMaxBod
 const extractCheckpointEveryResources = 100;
 const extractCheckpointEveryMs = 10_000;
 const extractThreadScript = path.join(__dirname, 'i18n-companion-extract-thread.cjs');
+const defaultExtractThreadTimeoutMs = 5 * 60 * 1000;
+const configuredExtractThreadTimeoutMs = Number(process.env.I18N_COMPANION_EXTRACT_THREAD_TIMEOUT_MS || '');
+const extractThreadTimeoutMs = Number.isFinite(configuredExtractThreadTimeoutMs) && configuredExtractThreadTimeoutMs > 0
+    ? Math.floor(configuredExtractThreadTimeoutMs)
+    : defaultExtractThreadTimeoutMs;
 
 const cjsSyncTaskTypes = new Set<string>([
     'plugin-extract',
@@ -1553,6 +1558,19 @@ type WeightedExtractThreadRequest = ExtractThreadRequest & {
     weight: number;
 };
 
+function getErrorMessage(error: unknown) {
+    return error instanceof Error ? error.message : String(error);
+}
+
+function createFailedExtractThreadResult(request: ExtractThreadRequest, error: unknown): ExtractThreadResult {
+    return {
+        status: 'failed',
+        resourceId: request.payload.resourceId,
+        label: request.payload.label,
+        error: getErrorMessage(error),
+    };
+}
+
 type ExtractCheckpointState<T extends CompanionBatchResource> = {
     scope: BatchTaskScope;
     mode: 'extract';
@@ -1659,14 +1677,37 @@ async function runExtractThreadPool(
 
         const runRequest = (request: ExtractThreadRequest) => new Promise<ExtractThreadResult>((resolve, reject) => {
             const id = nextMessageId++;
-            pending.set(id, { resolve, reject });
-            worker.postMessage({ id, ...request });
+            const timer = setTimeout(() => {
+                pending.delete(id);
+                reject(new Error(`CJS extract thread timeout after ${extractThreadTimeoutMs}ms`));
+                void worker.terminate().catch(() => undefined);
+            }, extractThreadTimeoutMs);
+            const settleResolve = (result: ExtractThreadResult) => {
+                clearTimeout(timer);
+                resolve(result);
+            };
+            const settleReject = (error: Error) => {
+                clearTimeout(timer);
+                reject(error);
+            };
+            pending.set(id, { resolve: settleResolve, reject: settleReject });
+            try {
+                worker.postMessage({ id, ...request });
+            } catch (error) {
+                pending.delete(id);
+                settleReject(error instanceof Error ? error : new Error(String(error)));
+            }
         });
 
         try {
             if (!isTaskActive(task)) return;
             touchProgress(task, { currentLabel: request.payload.label });
-            const result = await runRequest(request);
+            let result: ExtractThreadResult;
+            try {
+                result = await runRequest(request);
+            } catch (error) {
+                result = createFailedExtractThreadResult(request, error);
+            }
             await onComplete(result, request.index);
         } finally {
             cleanup();
