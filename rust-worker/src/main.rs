@@ -10881,6 +10881,228 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn theme_batch_translate_records_partial_success_and_failed_items() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let request = read_test_http_request(&mut stream).await;
+                    let id = request_item_id(&request);
+                    let content = if id == 0 {
+                        "{\"items\":[{\"i\":0,\"t\":\"你好\"}]}"
+                    } else {
+                        "{\"items\":[{\"i\":1,\"t\":\"\"}]}"
+                    };
+                    let body = json!({
+                        "choices": [{
+                            "message": { "content": content },
+                            "finish_reason": "stop"
+                        }]
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let base_path = env::temp_dir().join(format!(
+            "i18n-theme-batch-translate-threshold-{}",
+            nanoid!()
+        ));
+        let paths = paths(base_path.to_str().unwrap());
+        let source_id = "source-a";
+        let translation_json = json!({
+            "schemaVersion": 1,
+            "metadata": {
+                "theme": "theme-a",
+                "title": "Theme A",
+                "version": "1.0.0",
+                "supportedVersions": "1.0.0",
+                "language": "zh-cn",
+                "description": "",
+                "author": ""
+            },
+            "dict": [
+                { "type": "settings", "source": "Hello", "target": "Hello" },
+                { "type": "settings", "source": "World", "target": "World" }
+            ]
+        });
+        write_json_pretty(
+            &paths.meta_path,
+            &json!({
+                "schemaVersion": 2,
+                "sources": {
+                    source_id: {
+                        "id": source_id,
+                        "plugin": "theme-a",
+                        "title": "Theme A",
+                        "type": "theme",
+                        "origin": "local",
+                        "isActive": true,
+                        "checksum": "",
+                        "translationVersion": "1.0.0",
+                        "translationFormatValid": true,
+                        "totalTranslationCount": 2,
+                        "pendingTranslationCount": 2,
+                        "translatedEntryCount": 0,
+                        "processedTranslationCount": 0,
+                        "unprocessedTranslationCount": 2,
+                        "translationProcessingComplete": false,
+                        "createdAt": 1,
+                        "updatedAt": 1
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        save_translation(&paths, source_id, &translation_json).unwrap();
+
+        let state = AppState {
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            diagnose_sessions: Arc::new(Mutex::new(HashMap::new())),
+            persistence_lock: Arc::new(Mutex::new(())),
+            plugin_dir: base_path.clone(),
+            http: reqwest::Client::new(),
+            shutdown: Arc::new(Mutex::new(None)),
+        };
+        let task = Arc::new(TaskRuntime {
+            progress: Mutex::new(CompanionTaskProgress {
+                task_id: "task".to_string(),
+                scope: "theme".to_string(),
+                mode: "translate".to_string(),
+                status: "running".to_string(),
+                current_label: String::new(),
+                processed_resources: 0,
+                total_resources: 1,
+                processed_items: 0,
+                total_items: 2,
+                success_count: 0,
+                failed_count: 0,
+                skipped_count: 0,
+                source_revision: 0,
+                record_revision: 0,
+                updated_at: 0,
+                error: None,
+            }),
+            cancel_requested: Mutex::new(false),
+        });
+        let batch = ThemeBatchTranslatePayload {
+            persistence: PersistenceConfig {
+                base_path: base_path.to_string_lossy().to_string(),
+            },
+            resources: vec![CompanionBatchResource {
+                resource_id: "theme-a".to_string(),
+                label: "Theme A".to_string(),
+                source_id: Some(source_id.to_string()),
+            }],
+            config: CompanionTranslationConfig {
+                chat_completions_url: format!("http://{addr}/v1/chat/completions"),
+                api_key: "test-key".to_string(),
+                model: "test-model".to_string(),
+                timeout_ms: 5_000,
+                response_format: "json_object".to_string(),
+                batch_size: 1,
+                batch_char_limit: 0,
+                batch_window_multiplier: 4,
+                overwrite_existing_translations: false,
+                concurrency: 1,
+                prompts: PromptConfig {
+                    ast: String::new(),
+                    regex: String::new(),
+                    theme: String::new(),
+                },
+            },
+            checkpoint_key: "theme:translate".to_string(),
+            concurrency: 1,
+            completed_resources: None,
+            processed_items: None,
+            total_items: Some(2),
+        };
+
+        let result = handle_batch_translate(&state, task.clone(), batch, false).await;
+
+        assert!(result.is_err());
+        let saved = read_translation(&paths, source_id).unwrap();
+        assert_eq!(
+            saved.pointer("/dict/0/target").and_then(Value::as_str),
+            Some("你好")
+        );
+        assert_eq!(
+            saved.pointer("/dict/1/target").and_then(Value::as_str),
+            Some("World")
+        );
+        let record = load_record(&paths);
+        let failures = record.get("failures").and_then(Value::as_array).unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].get("scope").and_then(Value::as_str),
+            Some("theme")
+        );
+        assert_eq!(
+            failures[0].get("batchType").and_then(Value::as_str),
+            Some("theme")
+        );
+        let failure_items = failures[0].get("items").and_then(Value::as_array).unwrap();
+        assert_eq!(failure_items.len(), 1);
+        assert_eq!(
+            failure_items[0].get("dictIndex").and_then(Value::as_i64),
+            Some(1)
+        );
+        let success_batches = record
+            .get("successBatches")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(success_batches.len(), 1);
+        assert_eq!(
+            success_batches[0].get("scope").and_then(Value::as_str),
+            Some("theme")
+        );
+        assert_eq!(
+            success_batches[0].get("sourceId").and_then(Value::as_str),
+            Some(source_id)
+        );
+        assert_eq!(
+            success_batches[0]
+                .get("itemKeys")
+                .and_then(Value::as_array)
+                .map(|items| { items.iter().filter_map(Value::as_str).collect::<Vec<_>>() }),
+            Some(vec!["0"])
+        );
+        let meta = load_meta(&paths);
+        let source = meta.pointer("/sources/source-a").unwrap();
+        assert_eq!(
+            source.get("translatedEntryCount").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            source
+                .get("processedTranslationCount")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            source
+                .get("unprocessedTranslationCount")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            source
+                .get("translationProcessingComplete")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        let _ = fs::remove_dir_all(base_path);
+    }
+
+    #[tokio::test]
     async fn batch_translate_records_request_failures_when_threshold_stops_task() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -12095,6 +12317,335 @@ mod tests {
         assert_eq!(progress.skipped_count, 1);
         let _ = fs::remove_dir_all(base_path);
     }
+
+    #[tokio::test]
+    async fn theme_failure_retry_only_marks_failed_request_batch_and_keeps_successes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let request = read_test_http_request(&mut stream).await;
+                    let id = request_item_id(&request);
+                    if id == 0 {
+                        write_test_http_json_response(
+                            &mut stream,
+                            "500 Internal Server Error",
+                            &json!({ "error": { "message": "bad batch" } }),
+                        )
+                        .await;
+                    } else {
+                        write_test_http_json_response(
+                            &mut stream,
+                            "200 OK",
+                            &json!({
+                                "choices": [{
+                                    "message": { "content": "{\"items\":[{\"i\":1,\"t\":\"乙\"}]}" },
+                                    "finish_reason": "stop"
+                                }]
+                            }),
+                        )
+                        .await;
+                    }
+                });
+            }
+        });
+
+        let base_path =
+            env::temp_dir().join(format!("i18n-theme-retry-precise-request-{}", nanoid!()));
+        let paths = paths(base_path.to_str().unwrap());
+        let source_id = "source-a";
+        save_translation(
+            &paths,
+            source_id,
+            &json!({
+                "schemaVersion": 1,
+                "metadata": {
+                    "theme": "theme-a",
+                    "language": "zh-CN",
+                    "version": "1.0.0",
+                    "supportedVersions": "*",
+                    "title": "Theme A",
+                    "description": "",
+                    "author": ""
+                },
+                "dict": [
+                    { "type": "settings", "source": "A", "target": "" },
+                    { "type": "settings", "source": "B", "target": "" }
+                ]
+            }),
+        )
+        .unwrap();
+        write_json_pretty(
+            &paths.meta_path,
+            &json!({
+                "schemaVersion": 2,
+                "sources": {
+                    source_id: {
+                        "id": source_id,
+                        "plugin": "theme-a",
+                        "type": "theme",
+                        "totalTranslationCount": 2,
+                        "processedTranslationCount": 0,
+                        "unprocessedTranslationCount": 2,
+                        "translationProcessingComplete": false
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        write_json_pretty(
+            &paths.batch_task_record_path,
+            &json!({
+                "schemaVersion": 1,
+                "checkpoints": {},
+                "failures": [
+                    {
+                        "id": "failure-a",
+                        "scope": "theme",
+                        "resourceId": "theme-a",
+                        "resourceLabel": "Theme A",
+                        "sourceId": source_id,
+                        "batchType": "theme",
+                        "errorMessage": "failed",
+                        "items": [{ "source": "A", "target": "", "dictIndex": 0, "type": "settings" }],
+                        "failedAt": 1
+                    },
+                    {
+                        "id": "failure-b",
+                        "scope": "theme",
+                        "resourceId": "theme-a",
+                        "resourceLabel": "Theme A",
+                        "sourceId": source_id,
+                        "batchType": "theme",
+                        "errorMessage": "failed",
+                        "items": [{ "source": "B", "target": "", "dictIndex": 1, "type": "settings" }],
+                        "failedAt": 2
+                    }
+                ],
+                "successBatches": [],
+                "updatedAt": 0
+            }),
+        )
+        .unwrap();
+        let state = test_app_state(base_path.clone());
+        let task = test_task(2, 2);
+        let payload = json!({
+            "persistence": { "basePath": base_path.to_string_lossy() },
+            "config": {
+                "chatCompletionsUrl": format!("http://{addr}/v1/chat/completions"),
+                "apiKey": "test",
+                "model": "test",
+                "timeoutMs": 5000,
+                "responseFormat": "json_object",
+                "batchSize": 1,
+                "batchCharLimit": 0,
+                "batchWindowMultiplier": 4,
+                "overwriteExistingTranslations": false,
+                "concurrency": 2,
+                "prompts": { "ast": "", "regex": "", "theme": "" }
+            },
+            "concurrency": 1,
+            "totalResources": 2,
+            "totalItems": 2
+        });
+
+        handle_failure_retry(&state, task, payload, false)
+            .await
+            .unwrap();
+
+        let saved = read_translation(&paths, source_id).unwrap();
+        assert_eq!(
+            saved.pointer("/dict/0/target").and_then(Value::as_str),
+            Some("")
+        );
+        assert_eq!(
+            saved.pointer("/dict/1/target").and_then(Value::as_str),
+            Some("乙")
+        );
+        let record = load_record(&paths);
+        let failures = record.get("failures").and_then(Value::as_array).unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].get("id").and_then(Value::as_str),
+            Some("failure-a")
+        );
+        let meta = load_meta(&paths);
+        let source = meta.pointer("/sources/source-a").unwrap();
+        assert_eq!(
+            source
+                .get("processedTranslationCount")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            source
+                .get("unprocessedTranslationCount")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        let _ = fs::remove_dir_all(base_path);
+    }
+
+    #[tokio::test]
+    async fn theme_failure_retry_keeps_only_missing_or_empty_translation_items_failed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = read_test_http_request(&mut stream).await;
+            write_test_http_json_response(
+                &mut stream,
+                "200 OK",
+                &json!({
+                    "choices": [{
+                        "message": { "content": "{\"items\":[{\"i\":0,\"t\":\"甲\"},{\"i\":1,\"t\":\"\"}]}" },
+                        "finish_reason": "stop"
+                    }]
+                }),
+            )
+            .await;
+        });
+
+        let base_path =
+            env::temp_dir().join(format!("i18n-theme-retry-precise-items-{}", nanoid!()));
+        let paths = paths(base_path.to_str().unwrap());
+        let source_id = "source-a";
+        save_translation(
+            &paths,
+            source_id,
+            &json!({
+                "schemaVersion": 1,
+                "metadata": {
+                    "theme": "theme-a",
+                    "language": "zh-CN",
+                    "version": "1.0.0",
+                    "supportedVersions": "*",
+                    "title": "Theme A",
+                    "description": "",
+                    "author": ""
+                },
+                "dict": [
+                    { "type": "settings", "source": "A", "target": "" },
+                    { "type": "settings", "source": "B", "target": "" },
+                    { "type": "settings", "source": "C", "target": "" }
+                ]
+            }),
+        )
+        .unwrap();
+        write_json_pretty(
+            &paths.meta_path,
+            &json!({
+                "schemaVersion": 2,
+                "sources": {
+                    source_id: {
+                        "id": source_id,
+                        "plugin": "theme-a",
+                        "type": "theme",
+                        "totalTranslationCount": 3,
+                        "processedTranslationCount": 0,
+                        "unprocessedTranslationCount": 3,
+                        "translationProcessingComplete": false
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        write_json_pretty(
+            &paths.batch_task_record_path,
+            &json!({
+                "schemaVersion": 1,
+                "checkpoints": {},
+                "failures": [{
+                    "id": "failure-a",
+                    "scope": "theme",
+                    "resourceId": "theme-a",
+                    "resourceLabel": "Theme A",
+                    "sourceId": source_id,
+                    "batchType": "theme",
+                    "errorMessage": "failed",
+                    "items": [
+                        { "source": "A", "target": "", "dictIndex": 0, "type": "settings" },
+                        { "source": "B", "target": "", "dictIndex": 1, "type": "settings" },
+                        { "source": "C", "target": "", "dictIndex": 2, "type": "settings" }
+                    ],
+                    "failedAt": 1
+                }],
+                "successBatches": [],
+                "updatedAt": 0
+            }),
+        )
+        .unwrap();
+        let state = test_app_state(base_path.clone());
+        let task = test_task(1, 3);
+        let payload = json!({
+            "persistence": { "basePath": base_path.to_string_lossy() },
+            "config": {
+                "chatCompletionsUrl": format!("http://{addr}/v1/chat/completions"),
+                "apiKey": "test",
+                "model": "test",
+                "timeoutMs": 5000,
+                "responseFormat": "json_object",
+                "batchSize": 3,
+                "batchCharLimit": 0,
+                "batchWindowMultiplier": 4,
+                "overwriteExistingTranslations": false,
+                "concurrency": 1,
+                "prompts": { "ast": "", "regex": "", "theme": "" }
+            },
+            "concurrency": 1,
+            "totalResources": 1,
+            "totalItems": 3
+        });
+
+        handle_failure_retry(&state, task, payload, false)
+            .await
+            .unwrap();
+
+        let saved = read_translation(&paths, source_id).unwrap();
+        assert_eq!(
+            saved.pointer("/dict/0/target").and_then(Value::as_str),
+            Some("甲")
+        );
+        assert_eq!(
+            saved.pointer("/dict/1/target").and_then(Value::as_str),
+            Some("")
+        );
+        assert_eq!(
+            saved.pointer("/dict/2/target").and_then(Value::as_str),
+            Some("")
+        );
+        let record = load_record(&paths);
+        let failures = record.get("failures").and_then(Value::as_array).unwrap();
+        assert_eq!(failures.len(), 1);
+        let items = failures[0].get("items").and_then(Value::as_array).unwrap();
+        let remaining_indexes = items
+            .iter()
+            .filter_map(|item| item.get("dictIndex").and_then(Value::as_i64))
+            .collect::<Vec<_>>();
+        assert_eq!(remaining_indexes, vec![1, 2]);
+        let meta = load_meta(&paths);
+        let source = meta.pointer("/sources/source-a").unwrap();
+        assert_eq!(
+            source
+                .get("processedTranslationCount")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            source
+                .get("unprocessedTranslationCount")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+        let _ = fs::remove_dir_all(base_path);
+    }
+
     #[tokio::test]
     async fn requesting_cancel_keeps_task_running_until_worker_exits() {
         let task = Arc::new(TaskRuntime {
