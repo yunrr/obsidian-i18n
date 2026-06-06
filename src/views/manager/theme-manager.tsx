@@ -59,7 +59,7 @@ interface ThemeInfo {
 
 import { ThemeItem, ThemeItemData } from './components/theme-item';
 
-type BatchMode = 'extract' | 'translate' | null;
+type BatchMode = CompanionTaskProgress['mode'] | null;
 
 interface BatchTaskState {
     mode: BatchMode;
@@ -949,11 +949,21 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
 
     const batchProgressValue = useMemo(() => {
         if (!batchTask.totalResources) return 0;
-        if (batchTask.mode === 'translate' && batchTask.totalItems > 0) {
+        if ((batchTask.mode === 'translate' || batchTask.mode === 'retry') && batchTask.totalItems > 0) {
             return (batchTask.processedItems / batchTask.totalItems) * 100;
         }
         return (batchTask.processedResources / batchTask.totalResources) * 100;
     }, [batchTask]);
+
+    const batchStatusLabel = useMemo(() => {
+        if (batchTask.mode === 'extract') {
+            return t('Manager.Common.Status.BatchExtracting', '正在批量提取');
+        }
+        if (batchTask.mode === 'retry') {
+            return t('Manager.Common.Status.RetryingFailures', '正在重试失败批次');
+        }
+        return t('Manager.Common.Status.BatchTranslating', '正在批量翻译');
+    }, [batchTask.mode, t]);
 
     return (
         <div className="flex flex-col h-full bg-background text-foreground overflow-hidden">
@@ -1130,14 +1140,12 @@ export const ThemeManager: React.FC<ThemeManagerProps> = ({ i18n }) => {
                     <div className="border border-muted-foreground/20 bg-muted/10 rounded-none px-3 py-2 space-y-2">
                         <div className="flex items-center justify-between gap-3 text-[12px]">
                             <span className="font-medium text-foreground/90 truncate">
-                                {batchTask.mode === 'extract'
-                                    ? t('Manager.Common.Status.BatchExtracting', '正在批量提取')
-                                    : t('Manager.Common.Status.BatchTranslating', '正在批量翻译')}
+                                {batchStatusLabel}
                                 {batchTask.currentLabel ? ` · ${batchTask.currentLabel}` : ''}
                             </span>
                             <span className="text-muted-foreground shrink-0">
                                 {batchTask.processedResources}/{batchTask.totalResources}
-                                {batchTask.mode === 'translate' && batchTask.totalItems > 0 ? ` · ${batchTask.processedItems}/${batchTask.totalItems}` : ''}
+                                {(batchTask.mode === 'translate' || batchTask.mode === 'retry') && batchTask.totalItems > 0 ? ` · ${batchTask.processedItems}/${batchTask.totalItems}` : ''}
                             </span>
                         </div>
                         <Progress value={batchProgressValue} className="h-2 rounded-none" />

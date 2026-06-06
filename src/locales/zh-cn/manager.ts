@@ -41,6 +41,7 @@ export default {
         Status: {
             BatchExtracting: "正在批量提取",
             BatchTranslating: "正在批量翻译",
+            RetryingFailures: "正在重试失败批次",
             Stopping: "正在停止",
             Labels: {
                 pending: '等待中',

@@ -519,6 +519,14 @@ struct RetryCompletedItemKey {
     batch_type: String,
 }
 
+#[derive(Debug, Default)]
+struct AggregatedRetryItems {
+    ast: Vec<Value>,
+    regex: Vec<Value>,
+    theme: Vec<Value>,
+    skipped_failures: Vec<BatchTaskFailureRecord>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CompanionBatchFailure {
@@ -671,10 +679,7 @@ async fn discover_themes_route(State(state): State<AppState>) -> impl IntoRespon
     }
 }
 
-async fn github_read_route(
-    State(state): State<AppState>,
-    body: Body,
-) -> impl IntoResponse {
+async fn github_read_route(State(state): State<AppState>, body: Body) -> impl IntoResponse {
     let payload = match read_json_body::<GithubReadRequest>(body).await {
         Ok(payload) => payload,
         Err(response) => return response,
@@ -685,10 +690,7 @@ async fn github_read_route(
     }
 }
 
-async fn github_write_route(
-    State(state): State<AppState>,
-    body: Body,
-) -> impl IntoResponse {
+async fn github_write_route(State(state): State<AppState>, body: Body) -> impl IntoResponse {
     let payload = match read_json_body::<GithubWriteRequest>(body).await {
         Ok(payload) => payload,
         Err(response) => return response,
@@ -1166,10 +1168,7 @@ fn replace_ast_items_swc(code: &str, translations: &[Value]) -> Result<String> {
     Ok(String::from_utf8(output)?)
 }
 
-async fn proxy_route(
-    State(state): State<AppState>,
-    body: Body,
-) -> impl IntoResponse {
+async fn proxy_route(State(state): State<AppState>, body: Body) -> impl IntoResponse {
     let payload = match read_json_body::<CompanionProxyRequest>(body).await {
         Ok(payload) => payload,
         Err(response) => return response,
@@ -1180,10 +1179,7 @@ async fn proxy_route(
     }
 }
 
-async fn task_route(
-    State(state): State<AppState>,
-    body: Body,
-) -> impl IntoResponse {
+async fn task_route(State(state): State<AppState>, body: Body) -> impl IntoResponse {
     let payload = match read_json_body::<Value>(body).await {
         Ok(payload) => payload,
         Err(response) => return response,
@@ -1199,10 +1195,7 @@ async fn task_route(
     }
 }
 
-async fn task_start_route(
-    State(state): State<AppState>,
-    body: Body,
-) -> impl IntoResponse {
+async fn task_start_route(State(state): State<AppState>, body: Body) -> impl IntoResponse {
     let payload = match read_json_body::<Value>(body).await {
         Ok(payload) => payload,
         Err(response) => return response,
@@ -1239,10 +1232,7 @@ async fn task_status_route(
     }
 }
 
-async fn task_cancel_route(
-    State(state): State<AppState>,
-    body: Body,
-) -> impl IntoResponse {
+async fn task_cancel_route(State(state): State<AppState>, body: Body) -> impl IntoResponse {
     let payload = match read_json_body::<Value>(body).await {
         Ok(payload) => payload,
         Err(response) => return response,
@@ -1273,19 +1263,17 @@ async fn read_json_body<T>(body: Body) -> std::result::Result<T, axum::response:
 where
     T: for<'de> Deserialize<'de>,
 {
-    let bytes = to_bytes(body, MAX_JSON_BODY_BYTES)
-        .await
-        .map_err(|error| {
-            let message = if error.to_string().contains("length limit") {
-                format!(
-                    "请求体过大，请求上限为 {} MB",
-                    MAX_JSON_BODY_BYTES / 1024 / 1024
-                )
-            } else {
-                format!("读取请求体失败: {error}")
-            };
-            error_response(StatusCode::PAYLOAD_TOO_LARGE, message)
-        })?;
+    let bytes = to_bytes(body, MAX_JSON_BODY_BYTES).await.map_err(|error| {
+        let message = if error.to_string().contains("length limit") {
+            format!(
+                "请求体过大，请求上限为 {} MB",
+                MAX_JSON_BODY_BYTES / 1024 / 1024
+            )
+        } else {
+            format!("读取请求体失败: {error}")
+        };
+        error_response(StatusCode::PAYLOAD_TOO_LARGE, message)
+    })?;
     serde_json::from_slice(&bytes)
         .map_err(|error| error_response(StatusCode::BAD_REQUEST, format!("JSON 解析失败: {error}")))
 }
@@ -1360,6 +1348,8 @@ fn create_initial_progress(
             "backup"
         } else if is_extract {
             "extract"
+        } else if is_retry {
+            "retry"
         } else {
             "translate"
         }
@@ -8439,7 +8429,7 @@ fn parse_translation_response(content: &str) -> Result<Vec<TranslationPair>> {
         return Err(anyhow!("AI 返回内容为空"));
     }
     let mut text = content.trim().to_string();
-    let code_re = Regex::new(r"(?s)```(?:json)?\s*(.*?)\s*```").unwrap();
+    let code_re = Regex::new(r"(?s)^```(?:json)?\s*(.*?)\s*```\s*$").unwrap();
     if let Some(captures) = code_re.captures(&text) {
         text = captures
             .get(1)
@@ -8458,6 +8448,11 @@ fn parse_translation_response(content: &str) -> Result<Vec<TranslationPair>> {
         }
     }
 
+    let raw_items = extract_raw_translation_items(&text)?;
+    if !raw_items.is_empty() {
+        return Ok(raw_items);
+    }
+
     if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
         if let Ok(items) = extract_translation_array(&parsed) {
             if !items.is_empty() {
@@ -8465,39 +8460,130 @@ fn parse_translation_response(content: &str) -> Result<Vec<TranslationPair>> {
             }
         }
     }
-    let fallback_re = Regex::new(r#""i"\s*:\s*(\d+)\s*,\s*"t"\s*:\s*""#)?;
-    let mut output = Vec::new();
-    for captures in fallback_re.captures_iter(&text) {
-        let i = captures.get(1).unwrap().as_str().parse::<u64>()?;
-        let Some(marker) = captures.get(0) else {
-            continue;
-        };
-        if let Some(t) = raw_t_field_until_object_end(&text, marker.end()) {
-            output.push(TranslationPair { i, t });
-        }
-    }
-    if output.is_empty() {
-        Err(anyhow!(
-            "AI 返回数据格式严重损坏，原样提取也未能提取到业务结构 ({{i, t}})。"
-        ))
-    } else {
-        Ok(output)
-    }
+
+    Err(anyhow!(
+        "AI 返回数据格式严重损坏，原样提取也未能提取到业务结构 ({{i, t}})。"
+    ))
 }
 
-fn raw_t_field_until_object_end(text: &str, start: usize) -> Option<String> {
-    let tail = text.get(start..)?;
-    for (offset, ch) in tail.char_indices() {
-        if ch != '"' {
+#[derive(Debug, Clone, Copy)]
+struct RawTranslationMarker {
+    i: u64,
+    object_start: usize,
+    t_start: usize,
+}
+
+fn extract_raw_translation_items(text: &str) -> Result<Vec<TranslationPair>> {
+    let markers = collect_raw_translation_markers(text)?;
+    let mut output = Vec::new();
+    let mut index = 0usize;
+    while index < markers.len() {
+        let marker = markers[index];
+        let mut selected_next_index: Option<usize> = None;
+        let mut raw_text = None;
+
+        for candidate_index in index + 1..markers.len() {
+            let candidate = markers[candidate_index];
+            if candidate.i <= marker.i {
+                continue;
+            }
+            let Some(segment) = text.get(marker.t_start..candidate.object_start) else {
+                continue;
+            };
+            let Some(t) = strip_entry_terminator(segment, true) else {
+                continue;
+            };
+            if selected_next_index
+                .map(|selected| candidate.i >= markers[selected].i)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            selected_next_index = Some(candidate_index);
+            raw_text = Some(t);
+        }
+
+        if let Some(t) = raw_text {
+            output.push(TranslationPair { i: marker.i, t });
+            index = selected_next_index.unwrap_or(index + 1);
             continue;
         }
-        let quote_end = start + offset + ch.len_utf8();
-        if text.get(quote_end..)?.trim_start().starts_with('}') {
-            return text.get(start..start + offset).map(str::to_string);
+
+        if let Some(segment) = text.get(marker.t_start..) {
+            if let Some(t) = strip_entry_terminator(segment, false) {
+                output.push(TranslationPair { i: marker.i, t });
+                break;
+            }
         }
+
+        index += 1;
     }
-    tail.find('}')
-        .and_then(|end| text.get(start..start + end).map(str::to_string))
+    Ok(output)
+}
+
+fn collect_raw_translation_markers(text: &str) -> Result<Vec<RawTranslationMarker>> {
+    let marker_re = Regex::new(r#"\{\s*"?i"?\s*:\s*(\d+)\s*,\s*"?t"?\s*:\s*""#)?;
+    let mut markers = Vec::new();
+    for captures in marker_re.captures_iter(text) {
+        let Some(full) = captures.get(0) else {
+            continue;
+        };
+        let Some(i_match) = captures.get(1) else {
+            continue;
+        };
+        let Ok(i) = i_match.as_str().parse::<u64>() else {
+            continue;
+        };
+        if !is_likely_entry_start(text, full.start()) {
+            continue;
+        }
+        markers.push(RawTranslationMarker {
+            i,
+            object_start: full.start(),
+            t_start: full.end(),
+        });
+    }
+    Ok(markers)
+}
+
+fn strip_entry_terminator(segment: &str, has_next_entry: bool) -> Option<String> {
+    let pattern = if has_next_entry {
+        r#""\s*}\s*,?\s*$"#
+    } else {
+        r#""\s*}\s*(?:[\]}]\s*)*$"#
+    };
+    let terminator_re = Regex::new(pattern).ok()?;
+    terminator_re
+        .find(segment)
+        .and_then(|m| segment.get(..m.start()).map(str::to_string))
+}
+
+fn is_likely_entry_start(text: &str, start: usize) -> bool {
+    matches!(
+        previous_non_whitespace_char(text, start),
+        None | Some((_, '[' | ','))
+    )
+}
+
+fn previous_char(text: &str, end: usize) -> Option<char> {
+    text.get(..end)?.chars().next_back()
+}
+
+fn previous_char_start(text: &str, end: usize) -> Option<usize> {
+    let ch = previous_char(text, end)?;
+    Some(end.saturating_sub(ch.len_utf8()))
+}
+
+fn previous_non_whitespace_char(text: &str, mut end: usize) -> Option<(usize, char)> {
+    while end > 0 {
+        let ch = previous_char(text, end)?;
+        let start = previous_char_start(text, end)?;
+        if !ch.is_whitespace() {
+            return Some((start, ch));
+        }
+        end = start;
+    }
+    None
 }
 
 fn extract_translation_array(value: &Value) -> Result<Vec<TranslationPair>> {
@@ -8818,6 +8904,157 @@ fn apply_theme_retry_result(
     Ok(())
 }
 
+fn collect_aggregated_retry_updates(
+    result: Result<ValueBatchReport>,
+    batch_type: &str,
+    is_plugin: bool,
+    updates: &mut Vec<Value>,
+    failed_ids: &mut HashSet<String>,
+    fallback_items: &[Value],
+) -> Result<()> {
+    match result {
+        Ok(report) => {
+            for item in report.translated_items {
+                let source_id = item
+                    .get("sourceId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if source_id.is_empty() {
+                    if let Some(failure_id) = item.get("failureId").and_then(Value::as_str) {
+                        if !failure_id.is_empty() {
+                            failed_ids.insert(failure_id.to_string());
+                        }
+                    }
+                    continue;
+                }
+                let update = if is_plugin {
+                    json!({
+                        "sourceId": source_id,
+                        "batchType": batch_type,
+                        "failureId": item["failureId"],
+                        "file": item["file"],
+                        "dictIndex": item["dictIndex"],
+                        "target": item["target"],
+                    })
+                } else {
+                    json!({
+                        "sourceId": source_id,
+                        "batchType": "theme",
+                        "failureId": item["failureId"],
+                        "dictIndex": item["dictIndex"],
+                        "target": item["target"],
+                    })
+                };
+                updates.push(update);
+            }
+            for item in report.failed_items {
+                if let Some(failure_id) = item.get("failureId").and_then(Value::as_str) {
+                    if !failure_id.is_empty() {
+                        failed_ids.insert(failure_id.to_string());
+                    }
+                }
+            }
+        }
+        Err(error) if error.to_string().contains(MANUAL_STOP) => return Err(error),
+        Err(_) => {
+            for item in fallback_items {
+                if let Some(failure_id) = item.get("failureId").and_then(Value::as_str) {
+                    if !failure_id.is_empty() {
+                        failed_ids.insert(failure_id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_aggregated_retry_items(
+    paths: &PersistencePaths,
+    window: &[BatchTaskFailureRecord],
+    is_plugin: bool,
+    translations: &mut HashMap<String, Value>,
+) -> AggregatedRetryItems {
+    let mut aggregated = AggregatedRetryItems::default();
+    let mut missing_sources = HashSet::<String>::new();
+    let mut ast_id = 0u64;
+    let mut regex_id = 0u64;
+    let mut theme_id = 0u64;
+
+    for failure in window {
+        if failure.source_id.is_empty() {
+            aggregated.skipped_failures.push(failure.clone());
+            continue;
+        }
+
+        if !translations.contains_key(failure.source_id.as_str())
+            && !missing_sources.contains(failure.source_id.as_str())
+        {
+            if let Some(translation_json) = read_translation(paths, &failure.source_id) {
+                translations.insert(failure.source_id.clone(), translation_json);
+            } else {
+                missing_sources.insert(failure.source_id.clone());
+            }
+        }
+
+        if missing_sources.contains(failure.source_id.as_str()) {
+            aggregated.skipped_failures.push(failure.clone());
+            continue;
+        }
+
+        if is_plugin {
+            match failure.batch_type.as_str() {
+                "ast" => {
+                    for item in &failure.items {
+                        aggregated.ast.push(json!({
+                            "id": ast_id,
+                            "sourceId": failure.source_id,
+                            "failureId": failure.id,
+                            "file": item.file.as_deref().unwrap_or_default(),
+                            "dictIndex": item.dict_index,
+                            "type": item.r#type.as_deref().unwrap_or(""),
+                            "name": item.name.as_deref().unwrap_or(""),
+                            "source": item.source,
+                            "target": item.target,
+                        }));
+                        ast_id += 1;
+                    }
+                }
+                "regex" => {
+                    for item in &failure.items {
+                        aggregated.regex.push(json!({
+                            "id": regex_id,
+                            "sourceId": failure.source_id,
+                            "failureId": failure.id,
+                            "file": item.file.as_deref().unwrap_or_default(),
+                            "dictIndex": item.dict_index,
+                            "source": item.source,
+                            "target": item.target,
+                        }));
+                        regex_id += 1;
+                    }
+                }
+                _ => {}
+            }
+        } else if failure.batch_type == "theme" {
+            for item in &failure.items {
+                aggregated.theme.push(json!({
+                    "id": theme_id,
+                    "sourceId": failure.source_id,
+                    "failureId": failure.id,
+                    "dictIndex": item.dict_index,
+                    "type": item.r#type.as_deref().unwrap_or(""),
+                    "source": item.source,
+                    "target": item.target,
+                }));
+                theme_id += 1;
+            }
+        }
+    }
+
+    aggregated
+}
+
 fn push_unique(items: &mut Vec<String>, value: String) {
     if !items.contains(&value) {
         items.push(value);
@@ -8938,108 +9175,161 @@ async fn handle_failure_retry(
         if window.is_empty() {
             break;
         }
-        let mut groups: HashMap<String, Vec<BatchTaskFailureRecord>> = HashMap::new();
-        for failure in &window {
-            groups
-                .entry(failure.source_id.clone())
-                .or_default()
-                .push(failure.clone());
+        if let Some(first) = window.first() {
+            touch_progress(&task, json!({ "currentLabel": first.resource_label })).await;
         }
 
-        for failures in groups.into_values() {
-            if !is_task_active(&task).await {
-                break;
-            }
-            let first = failures.first().cloned().context("empty failure group")?;
-            touch_progress(&task, json!({ "currentLabel": first.resource_label })).await;
-            let Some(mut translation_json) = read_translation(&paths, &first.source_id) else {
-                let skipped_ids = failures
-                    .iter()
-                    .map(|failure| failure.id.clone())
-                    .collect::<Vec<_>>();
-                remove_failures(state, &paths, &skipped_ids).await?;
-                increment_progress(&task, "processedItems", retry_failure_item_count(&failures))
-                    .await;
-                increment_progress(&task, "skippedCount", failures.len()).await;
-                increment_progress(
-                    &task,
-                    "processedResources",
-                    count_new_retry_failures(&mut processed_retry_ids, &failures),
-                )
-                .await;
-                bump_record_revision(&task).await;
-                continue;
-            };
-            let payload = json!({ "resourceId": first.resource_id, "resourceLabel": first.resource_label, "sourceId": first.source_id, "failures": failures.clone(), "config": retry.config });
-            let processed_items_before = task.progress.lock().await.processed_items;
-            let result = if is_plugin {
-                handle_plugin_retry(payload, Some(task.clone())).await
-            } else {
-                handle_theme_retry(payload, Some(task.clone())).await
-            }?;
-            let processed_items_after = task.progress.lock().await.processed_items;
-            let updates = result
-                .get("updates")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            apply_retry_updates_to_translation(&mut translation_json, &updates, is_plugin);
-            save_translated_source(state, &paths, &first.source_id, &translation_json).await?;
-            let completed_items = updates
+        let mut translation_jsons = HashMap::<String, Value>::new();
+        let aggregated =
+            collect_aggregated_retry_items(&paths, &window, is_plugin, &mut translation_jsons);
+
+        if !aggregated.skipped_failures.is_empty() {
+            let skipped_ids = aggregated
+                .skipped_failures
                 .iter()
-                .map(retry_completed_item_key_from_value)
+                .map(|failure| failure.id.clone())
                 .collect::<Vec<_>>();
-            let mut completed_failure_ids = Vec::new();
+            remove_failures(state, &paths, &skipped_ids).await?;
+            increment_progress(
+                &task,
+                "processedItems",
+                retry_failure_item_count(&aggregated.skipped_failures),
+            )
+            .await;
+            increment_progress(&task, "skippedCount", aggregated.skipped_failures.len()).await;
+            bump_record_revision(&task).await;
+        }
+
+        if !is_task_active(&task).await {
+            break;
+        }
+
+        let mut updates = Vec::<Value>::new();
+        let mut failed_ids = HashSet::<String>::new();
+        if is_plugin {
+            let ast_result = translate_value_batch_report_with_policy(
+                &aggregated.ast,
+                &retry.config.prompts.ast,
+                &retry.config,
+                |item| {
+                    json!({ "i": item["id"], "s": item["source"], "y": item["type"], "n": item["name"] })
+                },
+                Some(task.clone()),
+                false,
+            )
+            .await;
+            collect_aggregated_retry_updates(
+                ast_result,
+                "ast",
+                true,
+                &mut updates,
+                &mut failed_ids,
+                &aggregated.ast,
+            )?;
+
+            let regex_result = translate_value_batch_report_with_policy(
+                &aggregated.regex,
+                &retry.config.prompts.regex,
+                &retry.config,
+                |item| json!({ "i": item["id"], "s": item["source"] }),
+                Some(task.clone()),
+                false,
+            )
+            .await;
+            collect_aggregated_retry_updates(
+                regex_result,
+                "regex",
+                true,
+                &mut updates,
+                &mut failed_ids,
+                &aggregated.regex,
+            )?;
+        } else {
+            let theme_result = translate_value_batch_report_with_policy(
+                &aggregated.theme,
+                &retry.config.prompts.theme,
+                &retry.config,
+                |item| json!({ "i": item["id"], "s": item["source"], "y": item["type"] }),
+                Some(task.clone()),
+                false,
+            )
+            .await;
+            collect_aggregated_retry_updates(
+                theme_result,
+                "theme",
+                false,
+                &mut updates,
+                &mut failed_ids,
+                &aggregated.theme,
+            )?;
+        }
+
+        let mut updates_by_source = HashMap::<String, Vec<Value>>::new();
+        for update in &updates {
+            let source_id = update
+                .get("sourceId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !source_id.is_empty() {
+                updates_by_source
+                    .entry(source_id.to_string())
+                    .or_default()
+                    .push(update.clone());
+            }
+        }
+
+        let mut saved_source_ids = Vec::<String>::new();
+        for (source_id, source_updates) in &updates_by_source {
+            if let Some(translation_json) = translation_jsons.get_mut(source_id) {
+                apply_retry_updates_to_translation(translation_json, source_updates, is_plugin);
+                save_translated_source(state, &paths, source_id, translation_json).await?;
+                saved_source_ids.push(source_id.clone());
+            }
+        }
+
+        let completed_items = updates
+            .iter()
+            .map(retry_completed_item_key_from_value)
+            .collect::<Vec<_>>();
+        let mut completed_failure_ids = Vec::new();
+        if !completed_items.is_empty() {
             update_record(state, &paths, |record| {
                 completed_failure_ids =
                     remove_completed_retry_items_from_record(record, scope, &completed_items);
             })
             .await?;
-            update_retry_source_processing_state(state, &paths, scope, &first.source_id).await?;
-            for failure_id in &completed_failure_ids {
-                failed_retry_ids.remove(failure_id);
+            for source_id in &saved_source_ids {
+                update_retry_source_processing_state(state, &paths, scope, source_id).await?;
             }
-            if let Some(failed_ids) = result.get("failedFailureIds").and_then(Value::as_array) {
-                for failure_id in failed_ids.iter().filter_map(Value::as_str) {
-                    if !completed_failure_ids
-                        .iter()
-                        .any(|completed| completed == failure_id)
-                    {
-                        failed_retry_ids.insert(failure_id.to_string());
-                    }
-                }
+        }
+
+        for failure_id in &completed_failure_ids {
+            failed_retry_ids.remove(failure_id);
+        }
+        for failure_id in failed_ids {
+            if !completed_failure_ids
+                .iter()
+                .any(|completed| completed == &failure_id)
+            {
+                failed_retry_ids.insert(failure_id);
             }
-            touch_progress(&task, json!({ "failedCount": failed_retry_ids.len() })).await;
-            increment_progress(
-                &task,
-                "processedItems",
-                (result
-                    .get("processedItems")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0) as usize)
-                    .saturating_sub(processed_items_after.saturating_sub(processed_items_before)),
-            )
-            .await;
-            increment_progress(&task, "successCount", completed_failure_ids.len()).await;
-            increment_progress(
-                &task,
-                "skippedCount",
-                result
-                    .get("skippedFailureIds")
-                    .and_then(Value::as_array)
-                    .map(Vec::len)
-                    .unwrap_or(0),
-            )
-            .await;
-            increment_progress(
-                &task,
-                "processedResources",
-                count_new_retry_failures(&mut processed_retry_ids, &failures),
-            )
-            .await;
+        }
+
+        touch_progress(&task, json!({ "failedCount": failed_retry_ids.len() })).await;
+        increment_progress(&task, "successCount", completed_failure_ids.len()).await;
+        increment_progress(
+            &task,
+            "processedResources",
+            count_new_retry_failures(&mut processed_retry_ids, &window),
+        )
+        .await;
+        if !saved_source_ids.is_empty() {
             bump_source_revision(&task).await;
+        }
+        if !completed_items.is_empty() {
             bump_record_revision(&task).await;
         }
+
         prune_retry_window_from_queue(&mut retry_queue, &window);
     }
     Ok(())
@@ -9180,6 +9470,10 @@ mod tests {
         let _ = stream.write_all(response.as_bytes()).await;
     }
 
+    fn theme_heading_quote_ai_response() -> &'static str {
+        r#"[{"i":0,"t":"选择您的调色板"},{"i":1,"t":"默认"},{"i":2,"t":"百合"},{"i":3,"t":"象牙白"},{"i":4,"t":"天空蓝"},{"i":5,"t":"石板灰"},{"i":6,"t":"深色主题"},{"i":7,"t":"暖色"},{"i":8,"t":"丁香紫"},{"i":9,"t":"纯净"},{"i":10,"t":"启用强调色样式"},{"i":11,"t":"使用下方的强调色调整主题风格"},{"i":12,"t":"强调色"},{"i":13,"t":"与高亮颜色兼容"},{"i":14,"t":"红色"},{"i":15,"t":"玫瑰红"},{"i":16,"t":"紫罗兰"},{"i":17,"t":"蓝色"},{"i":18,"t":"海蓝"},{"i":19,"t":"青色"},{"i":20,"t":"绿松石"},{"i":21,"t":"绿色"},{"i":22,"t":"黄色"},{"i":23,"t":"柠檬黄"},{"i":24,"t":"橙色"},{"i":25,"t":"自定义调色板"},{"i":26,"t":"自定义您专属的调色板！"},{"i":27,"t":"主背景色"},{"i":28,"t":"基础色；用于 Markdown、垂直标签页内容及活动标签页。"},{"i":29,"t":"主背景色（备用）"},{"i":30,"t":"次背景色"},{"i":31,"t":"侧边色；用于布局、垂直标签页标题及非活动标签页。"},{"i":32,"t":"次背景色（备用）"},{"i":33,"t":"背景修饰边框色"},{"i":34,"t":"表面色；用于滚动条和边框。"},{"i":35,"t":"自定义强调色"},{"i":36,"t":"自定义您专属的强调色！"},{"i":37,"t":"强调色"},{"i":38,"t":"更改强调色的颜色。"},{"i":39,"t":"编辑器"},{"i":40,"t":"个性化笔记中标题、文本、引用块、标注及其他元素的外观。"},{"i":41,"t":"字体"},{"i":42,"t":"字体的特性、样式和选项。"},{"i":43,"t":"字体族"},{"i":44,"t":"文本字体"},{"i":45,"t":"主要字体不应用于代码文本。"},{"i":46,"t":"垂直栏（设置）"},{"i":47,"t":"文件夹与文件标题"},{"i":48,"t":"代码框"},{"i":49,"t":"codebox"},{"i":50,"t":"行内代码"},{"i":51,"t":"inline"},{"i":52,"t":"标签"},{"i":53,"t":"仓库名称"},{"i":54,"t":"字体大小"},{"i":55,"t":"文件夹与文件"},{"i":56,"t":"文件标题"},{"i":57,"t":"不适用于 Sliding Pane 插件。"},{"i":58,"t":"代码块"},{"i":59,"t":"标题"},{"i":60,"t":"标题的特性、颜色和字体。"},{"i":61,"t":"启用自定义标题颜色"},{"i":62,"t":"启用简洁标题"},{"i":63,"t":"编辑时显示格式标记，若非活动行则替换为灰色的 "H1"、"H2" 等。"},{"i":64,"t":"禁用 H1-H6 指示器"},{"i":65,"t":"鼠标悬停时移除标题前的 H1-H6 指示器。"},{"i":66,"t":"H1 设置"},{"i":67,"t":"H1 Shiba 字体"},{"i":68,"t":"H1 自定义字体"},{"i":69,"t":"H1 大小 (em)"},{"i":70,"t":"H1 字重"},{"i":71,"t":"H1 行高"},{"i":72,"t":"H1 颜色"},{"i":73,"t":"自定义 H1 颜色"},{"i":74,"t":"H1 下划线"},{"i":75,"t":"您必须启用自定义标题颜色，或者如果禁用，则需选择自定义颜色才能生效。"},{"i":76,"t":"H2 设置"},{"i":77,"t":"H2 Shiba 字体"},{"i":78,"t":"H2 自定义字体"},{"i":79,"t":"H2 大小 (em)"},{"i":80,"t":"H2 字重"},{"i":81,"t":"H2 行高"},{"i":82,"t":"H2 颜色"},{"i":83,"t":"自定义 H2 颜色"},{"i":84,"t":"H2 下划线"},{"i":85,"t":"H3 设置"},{"i":86,"t":"H3 Shiba 字体"},{"i":87,"t":"H3 自定义字体"},{"i":88,"t":"H3 大小 (em)"},{"i":89,"t":"H3 字重"},{"i":90,"t":"H3 行高"},{"i":91,"t":"H3 颜色"},{"i":92,"t":"自定义 H3 颜色"},{"i":93,"t":"H3 下划线"},{"i":94,"t":"H4 设置"},{"i":95,"t":"H4 Shiba 字体"},{"i":96,"t":"H4 自定义字体"},{"i":97,"t":"H4 大小 (em)"},{"i":98,"t":"H4 字重"},{"i":99,"t":"H4 行高"}]"#
+    }
+
     #[test]
     fn translate_window_item_limit_feeds_concurrency_without_scaling_to_resources() {
         assert_eq!(translate_window_item_limit(5, 3, 4), 60);
@@ -9194,6 +9488,20 @@ mod tests {
         assert!(!should_stop_batch_translate_for_failures(499, 100, 5));
         assert!(should_stop_batch_translate_for_failures(500, 100, 5));
         assert!(should_stop_batch_translate_for_failures(1, 0, 0));
+    }
+
+    #[test]
+    fn failure_retry_tasks_report_retry_mode_for_progress_display() {
+        let progress = create_initial_progress(
+            "theme-failure-retry",
+            &json!({ "totalResources": 3, "totalItems": 7 }),
+            "task".to_string(),
+        );
+
+        assert_eq!(progress.scope, "theme");
+        assert_eq!(progress.mode, "retry");
+        assert_eq!(progress.total_resources, 3);
+        assert_eq!(progress.total_items, 7);
     }
 
     #[test]
@@ -9260,6 +9568,88 @@ mod tests {
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].t, r#"line\nraw"broken"#);
+    }
+
+    #[test]
+    fn parse_translation_response_uses_next_increasing_i_as_entry_boundary() {
+        let items = parse_translation_response(
+            r#"[{"i":0,"t":"保留 "} 片段和 "H1""},{"i":1,"t":"第二条"}]"#,
+        )
+        .unwrap();
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].t, r#"保留 "} 片段和 "H1""#);
+        assert_eq!(items[1].t, "第二条");
+    }
+
+    #[test]
+    fn parse_translation_response_raw_parser_does_not_unescape_valid_json() {
+        let items =
+            parse_translation_response(r#"{"items":[{"i":0,"t":"line\nraw \"quote\""}]}"#).unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].t, r#"line\nraw \"quote\""#);
+    }
+
+    #[test]
+    fn parse_translation_response_reads_theme_items_with_unescaped_heading_quotes() {
+        let items = parse_translation_response(
+            r#"[{"i":62,"t":"启用简洁标题"},{"i":63,"t":"编辑时显示格式标记，若非活动行则替换为灰色的 "H1"、"H2" 等。"},{"i":64,"t":"禁用 H1-H6 指示器"}]"#,
+        )
+        .unwrap();
+
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].t, "启用简洁标题");
+        assert_eq!(
+            items[1].t,
+            r#"编辑时显示格式标记，若非活动行则替换为灰色的 "H1"、"H2" 等。"#
+        );
+        assert_eq!(items[2].t, "禁用 H1-H6 指示器");
+    }
+
+    #[test]
+    fn parse_translation_response_reads_full_theme_retry_sample_with_heading_quotes() {
+        let items = parse_translation_response(theme_heading_quote_ai_response()).unwrap();
+
+        assert_eq!(items.len(), 100);
+        assert_eq!(items[0].i, 0);
+        assert_eq!(items[0].t, "选择您的调色板");
+        assert_eq!(items[63].i, 63);
+        assert_eq!(
+            items[63].t,
+            r#"编辑时显示格式标记，若非活动行则替换为灰色的 "H1"、"H2" 等。"#
+        );
+        assert_eq!(items[99].i, 99);
+        assert_eq!(items[99].t, "H4 行高");
+    }
+
+    #[test]
+    fn parse_translation_response_keeps_inline_markdown_code_fences() {
+        let items = parse_translation_response(
+            r#"[{"i":50,"t":"Codebox"},{"i":51,"t":"```codebox```"},{"i":52,"t":"Inline Code"}]"#,
+        )
+        .unwrap();
+
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].i, 50);
+        assert_eq!(items[0].t, "Codebox");
+        assert_eq!(items[1].i, 51);
+        assert_eq!(items[1].t, "```codebox```");
+        assert_eq!(items[2].i, 52);
+        assert_eq!(items[2].t, "Inline Code");
+    }
+
+    #[test]
+    fn parse_translation_response_prefers_smallest_increasing_boundary() {
+        let items = parse_translation_response(
+            r#"[{"i":0,"t":"包含假边界 "}, {"i":99,"t":"只是文本"},{"i":1,"t":"真实下一条"}]"#,
+        )
+        .unwrap();
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].t, r#"包含假边界 "}, {"i":99,"t":"只是文本"#);
+        assert_eq!(items[1].i, 1);
+        assert_eq!(items[1].t, "真实下一条");
     }
 
     #[tokio::test]
@@ -10497,10 +10887,11 @@ mod tests {
         let state = test_app_state(base_path.clone());
 
         for task_type in ["plugin-batch-extract", "theme-batch-extract"] {
-            let error = match start_async_task(state.clone(), task_type.to_string(), json!({})).await {
-                Ok(_) => panic!("CJS-owned async tasks should be rejected by Rust"),
-                Err(error) => error,
-            };
+            let error =
+                match start_async_task(state.clone(), task_type.to_string(), json!({})).await {
+                    Ok(_) => panic!("CJS-owned async tasks should be rejected by Rust"),
+                    Err(error) => error,
+                };
             assert!(
                 error.to_string().contains("CJS companion worker owns task"),
                 "{task_type}: {error}"
@@ -11852,6 +12243,201 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failure_retry_continues_after_request_error_to_complete_item_progress() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request_ids = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let server_request_ids = request_ids.clone();
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let server_request_ids = server_request_ids.clone();
+                tokio::spawn(async move {
+                    let request = read_test_http_request(&mut stream).await;
+                    let id = request_item_id(&request);
+                    server_request_ids.lock().await.push(id);
+                    if id == 0 {
+                        write_test_http_json_response(
+                            &mut stream,
+                            "500 Internal Server Error",
+                            &json!({ "error": { "message": "bad batch" } }),
+                        )
+                        .await;
+                    } else {
+                        write_test_http_json_response(
+                            &mut stream,
+                            "200 OK",
+                            &json!({
+                                "choices": [{
+                                    "message": { "content": format!("{{\"items\":[{{\"i\":{},\"t\":\"译文{}\"}}]}}", id, id) },
+                                    "finish_reason": "stop"
+                                }]
+                            }),
+                        )
+                        .await;
+                    }
+                });
+            }
+        });
+
+        let base_path = env::temp_dir().join(format!("i18n-retry-request-progress-{}", nanoid!()));
+        let paths = paths(base_path.to_str().unwrap());
+        let source_id = "source-a";
+        save_translation(
+            &paths,
+            source_id,
+            &json!({
+                "schemaVersion": 1,
+                "metadata": {
+                    "plugin": "plugin-a",
+                    "language": "zh-CN",
+                    "version": "1.0.0",
+                    "supportedVersions": "*",
+                    "title": "Plugin A",
+                    "description": "",
+                    "author": ""
+                },
+                "dict": {
+                    "main.js": {
+                        "ast": [],
+                        "regex": [
+                            { "source": "A", "target": "" },
+                            { "source": "B", "target": "" },
+                            { "source": "C", "target": "" }
+                        ]
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        write_json_pretty(
+            &paths.meta_path,
+            &json!({
+                "schemaVersion": 2,
+                "sources": {
+                    source_id: {
+                        "id": source_id,
+                        "plugin": "plugin-a",
+                        "type": "plugin",
+                        "totalTranslationCount": 3,
+                        "processedTranslationCount": 0,
+                        "unprocessedTranslationCount": 3,
+                        "translationProcessingComplete": false
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        write_json_pretty(
+            &paths.batch_task_record_path,
+            &json!({
+                "schemaVersion": 1,
+                "checkpoints": {},
+                "failures": [
+                    {
+                        "id": "failure-a",
+                        "scope": "plugin",
+                        "resourceId": "plugin-a",
+                        "resourceLabel": "Plugin A",
+                        "sourceId": source_id,
+                        "batchType": "regex",
+                        "errorMessage": "failed",
+                        "items": [{ "source": "A", "target": "", "dictIndex": 0, "file": "main.js" }],
+                        "failedAt": 1
+                    },
+                    {
+                        "id": "failure-b",
+                        "scope": "plugin",
+                        "resourceId": "plugin-a",
+                        "resourceLabel": "Plugin A",
+                        "sourceId": source_id,
+                        "batchType": "regex",
+                        "errorMessage": "failed",
+                        "items": [{ "source": "B", "target": "", "dictIndex": 1, "file": "main.js" }],
+                        "failedAt": 2
+                    },
+                    {
+                        "id": "failure-c",
+                        "scope": "plugin",
+                        "resourceId": "plugin-a",
+                        "resourceLabel": "Plugin A",
+                        "sourceId": source_id,
+                        "batchType": "regex",
+                        "errorMessage": "failed",
+                        "items": [{ "source": "C", "target": "", "dictIndex": 2, "file": "main.js" }],
+                        "failedAt": 3
+                    }
+                ],
+                "successBatches": [],
+                "updatedAt": 0
+            }),
+        )
+        .unwrap();
+        let state = test_app_state(base_path.clone());
+        let task = test_task(3, 3);
+        let payload = json!({
+            "persistence": { "basePath": base_path.to_string_lossy() },
+            "config": {
+                "chatCompletionsUrl": format!("http://{addr}/v1/chat/completions"),
+                "apiKey": "test",
+                "model": "test",
+                "timeoutMs": 5000,
+                "responseFormat": "json_object",
+                "batchSize": 1,
+                "batchCharLimit": 0,
+                "batchWindowMultiplier": 4,
+                "overwriteExistingTranslations": false,
+                "concurrency": 1,
+                "prompts": { "ast": "", "regex": "", "theme": "" }
+            },
+            "concurrency": 1,
+            "totalResources": 3,
+            "totalItems": 3
+        });
+
+        handle_failure_retry(&state, task.clone(), payload, true)
+            .await
+            .unwrap();
+
+        assert_eq!(*request_ids.lock().await, vec![0, 1, 2]);
+        let progress = task.progress.lock().await.clone();
+        assert_eq!(progress.processed_items, 3);
+        assert_eq!(progress.processed_resources, 3);
+        assert_eq!(progress.success_count, 2);
+        assert_eq!(progress.failed_count, 1);
+
+        let saved = read_translation(&paths, source_id).unwrap();
+        assert_eq!(
+            saved
+                .pointer("/dict/main.js/regex/0/target")
+                .and_then(Value::as_str),
+            Some("")
+        );
+        assert_eq!(
+            saved
+                .pointer("/dict/main.js/regex/1/target")
+                .and_then(Value::as_str),
+            Some("译文1")
+        );
+        assert_eq!(
+            saved
+                .pointer("/dict/main.js/regex/2/target")
+                .and_then(Value::as_str),
+            Some("译文2")
+        );
+        let record = load_record(&paths);
+        let failures = record.get("failures").and_then(Value::as_array).unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].get("id").and_then(Value::as_str),
+            Some("failure-a")
+        );
+        let _ = fs::remove_dir_all(base_path);
+    }
+
+    #[tokio::test]
     async fn failure_retry_keeps_only_missing_or_empty_translation_items_failed() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -12491,6 +13077,179 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn theme_failure_retry_aggregates_failed_items_across_sources() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let request_counts = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let server_request_counts = request_counts.clone();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let server_request_counts = server_request_counts.clone();
+                tokio::spawn(async move {
+                    let request = read_test_http_request(&mut stream).await;
+                    let item_count = request_item_count(&request);
+                    server_request_counts.lock().await.push(item_count);
+                    let content = format!(
+                        "{{\"items\":[{}]}}",
+                        (0..item_count)
+                            .map(|index| format!("{{\"i\":{},\"t\":\"译文{}\"}}", index, index))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
+                    write_test_http_json_response(
+                        &mut stream,
+                        "200 OK",
+                        &json!({
+                            "choices": [{
+                                "message": { "content": content },
+                                "finish_reason": "stop"
+                            }]
+                        }),
+                    )
+                    .await;
+                });
+            }
+        });
+
+        let base_path = env::temp_dir().join(format!("i18n-theme-retry-aggregate-{}", nanoid!()));
+        let paths = paths(base_path.to_str().unwrap());
+        for (source_id, theme_id, source_text) in
+            [("source-a", "theme-a", "A"), ("source-b", "theme-b", "B")]
+        {
+            save_translation(
+                &paths,
+                source_id,
+                &json!({
+                    "schemaVersion": 1,
+                    "metadata": {
+                        "theme": theme_id,
+                        "language": "zh-CN",
+                        "version": "1.0.0",
+                        "supportedVersions": "*",
+                        "title": theme_id,
+                        "description": "",
+                        "author": ""
+                    },
+                    "dict": [
+                        { "type": "settings", "source": source_text, "target": "" }
+                    ]
+                }),
+            )
+            .unwrap();
+        }
+        write_json_pretty(
+            &paths.meta_path,
+            &json!({
+                "schemaVersion": 2,
+                "sources": {
+                    "source-a": {
+                        "id": "source-a",
+                        "plugin": "theme-a",
+                        "type": "theme",
+                        "totalTranslationCount": 1,
+                        "processedTranslationCount": 0,
+                        "unprocessedTranslationCount": 1,
+                        "translationProcessingComplete": false
+                    },
+                    "source-b": {
+                        "id": "source-b",
+                        "plugin": "theme-b",
+                        "type": "theme",
+                        "totalTranslationCount": 1,
+                        "processedTranslationCount": 0,
+                        "unprocessedTranslationCount": 1,
+                        "translationProcessingComplete": false
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        write_json_pretty(
+            &paths.batch_task_record_path,
+            &json!({
+                "schemaVersion": 1,
+                "checkpoints": {},
+                "failures": [
+                    {
+                        "id": "failure-a",
+                        "scope": "theme",
+                        "resourceId": "theme-a",
+                        "resourceLabel": "Theme A",
+                        "sourceId": "source-a",
+                        "batchType": "theme",
+                        "errorMessage": "failed",
+                        "items": [{ "source": "A", "target": "", "dictIndex": 0, "type": "settings" }],
+                        "failedAt": 1
+                    },
+                    {
+                        "id": "failure-b",
+                        "scope": "theme",
+                        "resourceId": "theme-b",
+                        "resourceLabel": "Theme B",
+                        "sourceId": "source-b",
+                        "batchType": "theme",
+                        "errorMessage": "failed",
+                        "items": [{ "source": "B", "target": "", "dictIndex": 0, "type": "settings" }],
+                        "failedAt": 2
+                    }
+                ],
+                "successBatches": [],
+                "updatedAt": 0
+            }),
+        )
+        .unwrap();
+        let state = test_app_state(base_path.clone());
+        let task = test_task(2, 2);
+        let payload = json!({
+            "persistence": { "basePath": base_path.to_string_lossy() },
+            "config": {
+                "chatCompletionsUrl": format!("http://{addr}/v1/chat/completions"),
+                "apiKey": "test",
+                "model": "test",
+                "timeoutMs": 5000,
+                "responseFormat": "json_object",
+                "batchSize": 10,
+                "batchCharLimit": 0,
+                "batchWindowMultiplier": 4,
+                "overwriteExistingTranslations": false,
+                "concurrency": 1,
+                "prompts": { "ast": "", "regex": "", "theme": "" }
+            },
+            "concurrency": 1,
+            "totalResources": 2,
+            "totalItems": 2
+        });
+
+        handle_failure_retry(&state, task.clone(), payload, false)
+            .await
+            .unwrap();
+
+        assert_eq!(*request_counts.lock().await, vec![2]);
+        let saved_a = read_translation(&paths, "source-a").unwrap();
+        let saved_b = read_translation(&paths, "source-b").unwrap();
+        assert_eq!(
+            saved_a.pointer("/dict/0/target").and_then(Value::as_str),
+            Some("译文0")
+        );
+        assert_eq!(
+            saved_b.pointer("/dict/0/target").and_then(Value::as_str),
+            Some("译文1")
+        );
+        let record = load_record(&paths);
+        let failures = record.get("failures").and_then(Value::as_array).unwrap();
+        assert!(failures.is_empty());
+        let progress = task.progress.lock().await.clone();
+        assert_eq!(progress.processed_items, 2);
+        assert_eq!(progress.processed_resources, 2);
+        assert_eq!(progress.success_count, 2);
+        assert_eq!(progress.failed_count, 0);
+        let _ = fs::remove_dir_all(base_path);
+    }
+
+    #[tokio::test]
     async fn theme_failure_retry_keeps_only_missing_or_empty_translation_items_failed() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -12644,6 +13403,382 @@ mod tests {
             Some(2)
         );
         let _ = fs::remove_dir_all(base_path);
+    }
+
+    #[tokio::test]
+    async fn theme_failure_retry_accepts_full_raw_heading_quote_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let assistant = theme_heading_quote_ai_response().to_string();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = read_test_http_request(&mut stream).await;
+            write_test_http_json_response(
+                &mut stream,
+                "200 OK",
+                &json!({
+                    "choices": [{
+                        "message": { "content": assistant },
+                        "finish_reason": "stop"
+                    }]
+                }),
+            )
+            .await;
+        });
+
+        let base_path =
+            env::temp_dir().join(format!("i18n-theme-retry-heading-quotes-{}", nanoid!()));
+        let paths = paths(base_path.to_str().unwrap());
+        let source_id = "source-a";
+        let dict = (0..100)
+            .map(|index| {
+                json!({
+                    "type": "settings",
+                    "source": format!("Source {index}"),
+                    "target": ""
+                })
+            })
+            .collect::<Vec<_>>();
+        let failure_items = (0..100)
+            .map(|index| {
+                json!({
+                    "source": format!("Source {index}"),
+                    "target": "",
+                    "dictIndex": index,
+                    "type": "settings"
+                })
+            })
+            .collect::<Vec<_>>();
+        save_translation(
+            &paths,
+            source_id,
+            &json!({
+                "schemaVersion": 1,
+                "metadata": {
+                    "theme": "theme-a",
+                    "language": "zh-CN",
+                    "version": "1.0.0",
+                    "supportedVersions": "*",
+                    "title": "Theme A",
+                    "description": "",
+                    "author": ""
+                },
+                "dict": dict
+            }),
+        )
+        .unwrap();
+        write_json_pretty(
+            &paths.meta_path,
+            &json!({
+                "schemaVersion": 2,
+                "sources": {
+                    source_id: {
+                        "id": source_id,
+                        "plugin": "theme-a",
+                        "type": "theme",
+                        "totalTranslationCount": 100,
+                        "processedTranslationCount": 0,
+                        "unprocessedTranslationCount": 100,
+                        "translationProcessingComplete": false
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        write_json_pretty(
+            &paths.batch_task_record_path,
+            &json!({
+                "schemaVersion": 1,
+                "checkpoints": {},
+                "failures": [{
+                    "id": "failure-a",
+                    "scope": "theme",
+                    "resourceId": "theme-a",
+                    "resourceLabel": "Theme A",
+                    "sourceId": source_id,
+                    "batchType": "theme",
+                    "errorMessage": "AI 翻译结果解析失败",
+                    "items": failure_items,
+                    "failedAt": 1
+                }],
+                "successBatches": [],
+                "updatedAt": 0
+            }),
+        )
+        .unwrap();
+        let state = test_app_state(base_path.clone());
+        let task = test_task(1, 100);
+        let payload = json!({
+            "persistence": { "basePath": base_path.to_string_lossy() },
+            "config": {
+                "chatCompletionsUrl": format!("http://{addr}/v1/chat/completions"),
+                "apiKey": "test",
+                "model": "test",
+                "timeoutMs": 5000,
+                "responseFormat": "json_object",
+                "batchSize": 100,
+                "batchCharLimit": 0,
+                "batchWindowMultiplier": 4,
+                "overwriteExistingTranslations": false,
+                "concurrency": 1,
+                "prompts": { "ast": "", "regex": "", "theme": "" }
+            },
+            "concurrency": 1,
+            "totalResources": 1,
+            "totalItems": 100
+        });
+
+        handle_failure_retry(&state, task, payload, false)
+            .await
+            .unwrap();
+
+        let saved = read_translation(&paths, source_id).unwrap();
+        assert_eq!(
+            saved.pointer("/dict/0/target").and_then(Value::as_str),
+            Some("选择您的调色板")
+        );
+        assert_eq!(
+            saved.pointer("/dict/63/target").and_then(Value::as_str),
+            Some(r#"编辑时显示格式标记，若非活动行则替换为灰色的 "H1"、"H2" 等。"#)
+        );
+        assert_eq!(
+            saved.pointer("/dict/99/target").and_then(Value::as_str),
+            Some("H4 行高")
+        );
+        let record = load_record(&paths);
+        let failures = record.get("failures").and_then(Value::as_array).unwrap();
+        assert!(failures.is_empty());
+        let meta = load_meta(&paths);
+        let source = meta.pointer("/sources/source-a").unwrap();
+        assert_eq!(
+            source
+                .get("processedTranslationCount")
+                .and_then(Value::as_u64),
+            Some(100)
+        );
+        assert_eq!(
+            source
+                .get("unprocessedTranslationCount")
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            source
+                .get("translationProcessingComplete")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let _ = fs::remove_dir_all(base_path);
+    }
+
+    #[tokio::test]
+    async fn theme_retry_returns_updates_for_full_raw_heading_quote_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let assistant = theme_heading_quote_ai_response().to_string();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = read_test_http_request(&mut stream).await;
+            write_test_http_json_response(
+                &mut stream,
+                "200 OK",
+                &json!({
+                    "choices": [{
+                        "message": { "content": assistant },
+                        "finish_reason": "stop"
+                    }]
+                }),
+            )
+            .await;
+        });
+        let failure_items = (0..100)
+            .map(|index| {
+                json!({
+                    "source": format!("Source {index}"),
+                    "target": "",
+                    "dictIndex": index,
+                    "type": "settings"
+                })
+            })
+            .collect::<Vec<_>>();
+        let payload = json!({
+            "resourceId": "theme-a",
+            "resourceLabel": "Theme A",
+            "sourceId": "source-a",
+            "failures": [{
+                "id": "failure-a",
+                "scope": "theme",
+                "resourceId": "theme-a",
+                "resourceLabel": "Theme A",
+                "sourceId": "source-a",
+                "batchType": "theme",
+                "errorMessage": "AI 翻译结果解析失败",
+                "items": failure_items,
+                "failedAt": 1
+            }],
+            "config": {
+                "chatCompletionsUrl": format!("http://{addr}/v1/chat/completions"),
+                "apiKey": "test",
+                "model": "test",
+                "timeoutMs": 5000,
+                "responseFormat": "json_object",
+                "batchSize": 100,
+                "batchCharLimit": 0,
+                "batchWindowMultiplier": 4,
+                "overwriteExistingTranslations": false,
+                "concurrency": 1,
+                "prompts": { "ast": "", "regex": "", "theme": "" }
+            }
+        });
+
+        let result = handle_theme_retry(payload, None).await.unwrap();
+        let updates = result.get("updates").and_then(Value::as_array).unwrap();
+
+        assert_eq!(updates.len(), 100, "result={result}");
+        assert_eq!(
+            updates[63].get("target").and_then(Value::as_str),
+            Some(r#"编辑时显示格式标记，若非活动行则替换为灰色的 "H1"、"H2" 等。"#)
+        );
+        assert_eq!(
+            result
+                .get("completedFailureIds")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            result
+                .get("failedFailureIds")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn call_chat_completion_reads_full_raw_heading_quote_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let assistant = theme_heading_quote_ai_response().to_string();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = read_test_http_request(&mut stream).await;
+            write_test_http_json_response(
+                &mut stream,
+                "200 OK",
+                &json!({
+                    "choices": [{
+                        "message": { "content": assistant },
+                        "finish_reason": "stop"
+                    }]
+                }),
+            )
+            .await;
+        });
+        let config = CompanionTranslationConfig {
+            chat_completions_url: format!("http://{addr}/v1/chat/completions"),
+            api_key: "test-key".to_string(),
+            model: "test-model".to_string(),
+            timeout_ms: 5_000,
+            response_format: "json_object".to_string(),
+            batch_size: 100,
+            batch_char_limit: 0,
+            batch_window_multiplier: 4,
+            overwrite_existing_translations: false,
+            concurrency: 1,
+            prompts: PromptConfig {
+                ast: String::new(),
+                regex: String::new(),
+                theme: String::new(),
+            },
+        };
+        let items = (0..100)
+            .map(|index| json!({ "i": index, "s": format!("Source {index}"), "y": "settings" }))
+            .collect::<Vec<_>>();
+
+        let result = call_chat_completion(&items, "", &config).await;
+        assert!(result.is_ok(), "error={result:?}");
+        let parsed = result.unwrap();
+
+        assert_eq!(parsed.len(), 100);
+        assert_eq!(
+            parsed[63].t,
+            r#"编辑时显示格式标记，若非活动行则替换为灰色的 "H1"、"H2" 等。"#
+        );
+    }
+
+    #[tokio::test]
+    async fn call_chat_completion_reads_streamed_full_raw_heading_quote_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let chunks = theme_heading_quote_ai_response()
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(180)
+            .map(|chunk| chunk.iter().collect::<String>())
+            .collect::<Vec<_>>();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = read_test_http_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            for chunk in chunks {
+                let event = json!({
+                    "choices": [{ "delta": { "content": chunk } }]
+                });
+                stream
+                    .write_all(format!("data: {}\n\n", event).as_bytes())
+                    .await
+                    .unwrap();
+            }
+            let final_event = json!({
+                "choices": [{ "delta": {}, "finish_reason": "stop" }]
+            });
+            stream
+                .write_all(format!("data: {}\n\ndata: [DONE]\n\n", final_event).as_bytes())
+                .await
+                .unwrap();
+        });
+        let config = CompanionTranslationConfig {
+            chat_completions_url: format!("http://{addr}/v1/chat/completions"),
+            api_key: "test-key".to_string(),
+            model: "test-model".to_string(),
+            timeout_ms: 5_000,
+            response_format: "json_object".to_string(),
+            batch_size: 100,
+            batch_char_limit: 0,
+            batch_window_multiplier: 4,
+            overwrite_existing_translations: false,
+            concurrency: 1,
+            prompts: PromptConfig {
+                ast: String::new(),
+                regex: String::new(),
+                theme: String::new(),
+            },
+        };
+        let items = (0..100)
+            .map(|index| json!({ "i": index, "s": format!("Source {index}"), "y": "settings" }))
+            .collect::<Vec<_>>();
+
+        let parsed = call_chat_completion(&items, "", &config).await.unwrap();
+
+        assert_eq!(parsed.len(), 100);
+        assert_eq!(
+            parsed[63].t,
+            r#"编辑时显示格式标记，若非活动行则替换为灰色的 "H1"、"H2" 等。"#
+        );
     }
 
     #[tokio::test]
@@ -13087,8 +14222,8 @@ mod tests {
                 let headers = String::from_utf8_lossy(&buffer[..header_end]).to_string();
                 let content_length = headers
                     .lines()
-                    .find_map(|line| line.split_once(':'))
-                    .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
                     .and_then(|(_, value)| value.trim().parse::<usize>().ok())
                     .unwrap_or(0);
                 if buffer.len() >= header_end + 4 + content_length {
@@ -13117,6 +14252,18 @@ mod tests {
             .and_then(Value::as_u64)
             .unwrap()
     }
+
+    fn request_item_count(request: &str) -> usize {
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let payload: Value = serde_json::from_str(body).unwrap();
+        let content = payload
+            .pointer("/messages/1/content")
+            .and_then(Value::as_str)
+            .unwrap();
+        let items: Vec<Value> = serde_json::from_str(content).unwrap();
+        items.len()
+    }
+
     #[test]
     fn translate_checkpoint_keeps_unfinished_resources_when_stopped_mid_window() {
         let resources = vec![

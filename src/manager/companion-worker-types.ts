@@ -522,11 +522,12 @@ export interface CompanionWorkerPersistenceConfig {
 }
 
 export type CompanionTaskStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+export type CompanionTaskMode = BatchTaskMode | 'retry' | 'backup';
 
 export interface CompanionTaskProgress {
     taskId: string;
     scope: BatchTaskScope;
-    mode: BatchTaskMode;
+    mode: CompanionTaskMode;
     status: CompanionTaskStatus;
     currentLabel: string;
     processedResources: number;
