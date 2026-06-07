@@ -39,3 +39,21 @@ node_modules
 AGENTS.md
 PROJECT_MEMORY.md
 CURRENT_TASK.md
+.context/
+
+# local secrets and machine-specific config
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+local.settings.json
+
+# dependency lock files; do not stage unless explicitly requested
+package-lock.json
+Cargo.lock
+rust-worker/Cargo.lock
+pnpm-lock.yaml
+yarn.lock
+bun.lockb
