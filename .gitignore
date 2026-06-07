@@ -34,3 +34,8 @@ cache
 
 
 node_modules
+
+# local AI-agent memory; keep out of published commits
+AGENTS.md
+PROJECT_MEMORY.md
+CURRENT_TASK.md
