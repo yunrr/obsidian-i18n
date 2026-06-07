@@ -8,58 +8,12 @@ import { useGlobalStoreInstance } from "~/utils/store/global";
 import { BaseProvider } from "./base-provider";
 import { LLM_PROVIDERS } from "./constants";
 import type { CompanionProxyRequest, CompanionProxyResponse } from "../manager/companion-worker-manager";
+import { chooseTranslationResponseContent, normalizeStreamingResponseText } from "../manager/streaming-response-normalizer";
 
 // 自定义消息类型
 interface ChatMessage {
     role: "system" | "user" | "assistant";
     content: string;
-}
-
-function normalizeStreamingResponseText(text: string): string {
-    const trimmed = text.trim();
-    if (!trimmed.startsWith('data:')) return text;
-
-    const chunks: string[] = [];
-    let lastEvent: any = null;
-    let errorEvent: any = null;
-
-    for (const line of text.split(/\r?\n/)) {
-        const trimmedLine = line.trim();
-        if (!trimmedLine.startsWith('data:')) continue;
-
-        const payload = trimmedLine.slice(5).trim();
-        if (!payload || payload === '[DONE]') continue;
-
-        try {
-            const event = JSON.parse(payload);
-            lastEvent = event;
-            if (event?.error) errorEvent = event;
-            const choice = event?.choices?.[0];
-            const deltaContent = choice?.delta?.content;
-            const messageContent = choice?.message?.content;
-            if (typeof deltaContent === 'string') chunks.push(deltaContent);
-            if (typeof messageContent === 'string') chunks.push(messageContent);
-        } catch {
-            // Ignore malformed SSE fragments and keep parsing subsequent chunks.
-        }
-    }
-
-    const content = chunks.join('');
-    if (!content && errorEvent) return JSON.stringify(errorEvent);
-    if (!content) return text;
-
-    return JSON.stringify({
-        id: lastEvent?.id || 'request-url-stream',
-        object: 'chat.completion',
-        created: lastEvent?.created || Math.floor(Date.now() / 1000),
-        model: lastEvent?.model || '',
-        choices: [{
-            index: 0,
-            message: { role: 'assistant', content },
-            finish_reason: lastEvent?.choices?.[0]?.finish_reason || 'stop',
-        }],
-        usage: lastEvent?.usage,
-    });
 }
 
 function getRequestUrlBodyText(response: any): string {
@@ -189,12 +143,21 @@ export class OpenAITranslationService extends BaseProvider {
             return completion.choices[0].message.content || '';
         }
 
-        const chunks: string[] = [];
+        const contentChunks: string[] = [];
+        const recoveredChunks: string[] = [];
         for await (const chunk of completion) {
-            const content = chunk?.choices?.[0]?.delta?.content;
-            if (typeof content === 'string') chunks.push(content);
+            const choice = chunk?.choices?.[0];
+            const content = choice?.delta?.content;
+            const reasoning = choice?.delta?.reasoning_content ?? choice?.delta?.reasoning;
+            if (typeof content === 'string') {
+                contentChunks.push(content);
+                recoveredChunks.push(content);
+            }
+            if (typeof reasoning === 'string') {
+                recoveredChunks.push(reasoning);
+            }
         }
-        return chunks.join('');
+        return chooseTranslationResponseContent(contentChunks.join(''), recoveredChunks.join(''));
     }
 
     /**

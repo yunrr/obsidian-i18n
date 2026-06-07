@@ -271,6 +271,7 @@ export interface CompanionPluginDiagnoseCleanupStepRequest {
     sessionId: string;
     probeId: string;
     success: boolean;
+    terminalFailure?: boolean;
     error?: string;
 }
 

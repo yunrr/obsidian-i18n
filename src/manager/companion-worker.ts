@@ -9,6 +9,7 @@ import { Worker } from 'worker_threads';
 import { nanoid } from 'nanoid';
 import { calculateChecksum } from '../utils/translator/translation';
 import { parseTranslationResponse } from '../utils/ai/response-parser';
+import { normalizeStreamingResponseText } from './streaming-response-normalizer';
 import type { AstItem, RegexItem } from '../views/plugin_editor/types';
 import type { ThemeTranslationItem } from '../views/theme_editor/types';
 import type { BatchTaskCheckpoint, BatchTaskFailureRecord, BatchTaskRecordMeta, BatchTaskScope, TranslationSource, TranslationSourceMeta, PluginTranslationV1, ThemeTranslationV1 } from '../types';
@@ -335,51 +336,6 @@ async function runConcurrent<T>(items: T[], limit: number, worker: (item: T, ind
     await Promise.all(workers);
 }
 
-function normalizeStreamingResponseText(text: string): string {
-    const trimmed = text.trim();
-    if (!trimmed.startsWith('data:')) return text;
-
-    const chunks: string[] = [];
-    let lastEvent: any = null;
-    let errorEvent: any = null;
-
-    for (const line of text.split(/\r?\n/)) {
-        const trimmedLine = line.trim();
-        if (!trimmedLine.startsWith('data:')) continue;
-
-        const payload = trimmedLine.slice(5).trim();
-        if (!payload || payload === '[DONE]') continue;
-
-        try {
-            const event = JSON.parse(payload);
-            lastEvent = event;
-            if (event?.error) errorEvent = event;
-            const choice = event?.choices?.[0];
-            const deltaContent = choice?.delta?.content;
-            const messageContent = choice?.message?.content;
-            if (typeof deltaContent === 'string') chunks.push(deltaContent);
-            if (typeof messageContent === 'string') chunks.push(messageContent);
-        } catch { }
-    }
-
-    const content = chunks.join('');
-    if (!content && errorEvent) return JSON.stringify(errorEvent);
-    if (!content) return text;
-
-    return JSON.stringify({
-        id: lastEvent?.id || 'companion-worker-stream',
-        object: 'chat.completion',
-        created: lastEvent?.created || Math.floor(Date.now() / 1000),
-        model: lastEvent?.model || '',
-        choices: [{
-            index: 0,
-            message: { role: 'assistant', content },
-            finish_reason: lastEvent?.choices?.[0]?.finish_reason || 'stop',
-        }],
-        usage: lastEvent?.usage,
-    });
-}
-
 async function callChatCompletion(items: JsonRecord[], systemPrompt: string, config: CompanionTranslationConfig): Promise<Array<{ i: number; t: string }>> {
     const startedAt = Date.now();
     const timeoutMs = Math.max(1000, Number(config.timeoutMs || 60000));
@@ -480,7 +436,7 @@ function mapResultsBack<T extends { id: number; source: string; target: string }
     for (const item of items) {
         const result = simplifiedResults.find(r => r.i === item.id);
         const target = result ? result.t : undefined;
-        if (!target || target.trim() === '' || target.trim() === '空') {
+        if (target === undefined || target.trim() === '') {
             failedItems.push(item);
             continue;
         }

@@ -33,7 +33,6 @@ import {
     getPluginFailureMessage,
     getPluginLoadState,
     getPluginRestorePlan,
-    forceUnloadPluginRuntime,
     getRuntimeProbeSwitchError,
     normalizePluginSwitchCooldownMs,
     normalizePluginTimeoutGraceMs,
@@ -150,6 +149,7 @@ type EnablePluginProbeResult = {
 type RuntimeProbeResult = {
     success: boolean;
     error: string;
+    terminalFailure?: boolean;
     loadDurationMs?: number;
     stopDurationMs?: number;
 };
@@ -157,8 +157,7 @@ type RuntimeProbeResult = {
 type DisablePluginProbeResult = {
     state: ReturnType<typeof getPluginLoadState>;
     durationMs: number;
-    usedForcedUnload: boolean;
-    forcedUnloadReason: string;
+    stopError: string;
 };
 
 const countTranslationDictItems = (dict: unknown): number => {
@@ -377,8 +376,7 @@ const disablePluginForProbe = async (
         return {
             state,
             durationMs: Date.now() - startedAt,
-            usedForcedUnload: false,
-            forcedUnloadReason: '',
+            stopError: '',
         };
     }
 
@@ -405,25 +403,17 @@ const disablePluginForProbe = async (
     }
 
     state = getPluginLoadState(pluginsApi, pluginId);
-    let usedForcedUnload = false;
-    let forcedUnloadReason = '';
-
-    if (state.loaded || state.enabled) {
-        usedForcedUnload = true;
-        forcedUnloadReason = disableError instanceof Error
-            ? disableError.message
-            : disableError
-                ? String(disableError)
-                : `插件关闭后状态异常：enabled=${state.enabled}, loaded=${state.loaded}`;
-        state = await forceUnloadPluginRuntime(pluginsApi, pluginId, {
-            commandsApi: options.commandsApi,
-        });
-    }
+    const stopError = disableError instanceof Error
+        ? disableError.message
+        : disableError
+            ? String(disableError)
+            : state.loaded || state.enabled
+                ? `插件关闭后状态异常：enabled=${state.enabled}, loaded=${state.loaded}`
+                : '';
     return {
         state,
         durationMs: Date.now() - startedAt,
-        usedForcedUnload,
-        forcedUnloadReason,
+        stopError,
     };
 };
 
@@ -807,13 +797,16 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
                 const waitSignal = useAbortSignal ? signal : undefined;
                 const state = getPluginLoadState(pluginsApi, pluginId);
                 if (state.loaded || state.enabled) {
-                    await disablePluginForProbe(pluginsApi, pluginId, {
+                    const stopped = await disablePluginForProbe(pluginsApi, pluginId, {
                         signal: waitSignal,
                         timeoutMs: baselineStopDurationMs === null
                             ? PLUGIN_STOP_TIMEOUT_MS
                             : pluginSwitchTimeoutFromBaseline(baselineStopDurationMs, timeoutGraceMs, PLUGIN_STOP_TIMEOUT_MS),
                         commandsApi,
                     });
+                    if (stopped.stopError) {
+                        throw new Error(stopped.stopError);
+                    }
                     await wait(normalizedSwitchCooldownMs, waitSignal);
                 }
             };
@@ -846,15 +839,12 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
                     if (probe.label === '原始运行验证') {
                         baselineStopDurationMs = stopped.durationMs;
                     }
-                    const switchError = getRuntimeProbeSwitchError(
-                        loadState,
-                        stopped.usedForcedUnload,
-                        stopped.forcedUnloadReason,
-                    );
+                    const switchError = stopped.stopError || getRuntimeProbeSwitchError(loadState, false);
                     await wait(normalizedSwitchCooldownMs, signal);
                     return {
                         success: !switchError,
                         error: switchError,
+                        terminalFailure: !!stopped.stopError,
                         loadDurationMs: enabled.loadDurationMs,
                         stopDurationMs: stopped.durationMs,
                     };
@@ -911,6 +901,7 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
                     probeId: response.probe.probeId,
                     success: probeResult.success,
                     error: probeResult.error,
+                    terminalFailure: probeResult.terminalFailure,
                 });
                 throwIfDiagnoseStopped(signal);
                 if (response.sessionId && diagnoseRuntimeRef.current) {

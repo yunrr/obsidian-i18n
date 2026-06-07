@@ -285,7 +285,7 @@ export abstract class BaseProvider implements ITranslationProvider {
         return items.map(item => {
             const result = simplifiedResults.find(r => r.i === item.id);
             let target = result ? result.t : undefined;
-            if (!target || target.trim() === '' || target.trim() === '空') {
+            if (target === undefined || target.trim() === '') {
                 target = item.target || item.source;
             }
             return { ...item, target };

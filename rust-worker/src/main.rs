@@ -116,6 +116,8 @@ struct PluginDiagnoseCleanupStepPayload {
     probe_id: String,
     success: bool,
     #[serde(default)]
+    terminal_failure: bool,
+    #[serde(default)]
     error: Option<String>,
 }
 
@@ -5268,6 +5270,18 @@ async fn handle_plugin_diagnose_cleanup_step(state: &AppState, payload: Value) -
         .unwrap_or_else(|| "regex".to_string());
     if payload.success {
         mark_runtime_candidates_cleared(session, &candidates)?;
+    } else if payload.terminal_failure {
+        let reason = payload
+            .error
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("插件运行验证失败");
+        mark_runtime_candidates_issues(session, &candidates, reason)?;
+        save_diagnose_checkpoint(session, "completed")?;
+        let response = completed_response(session, "completed");
+        restore_original_plugin_files(session)?;
+        sessions.remove(&payload.session_id);
+        return Ok(serde_json::to_value(response)?);
     } else if candidates.len() <= 1 {
         let reason = payload
             .error
@@ -7628,7 +7642,7 @@ fn fallback_target(item: &Value) -> String {
 
 fn is_valid_translated_target(target: &str) -> bool {
     let trimmed = target.trim();
-    if trimmed.is_empty() || trimmed == "空" {
+    if trimmed.is_empty() {
         return false;
     }
     true
@@ -8382,7 +8396,8 @@ fn normalize_streaming_response_text(text: &str) -> String {
     if !trimmed.starts_with("data:") {
         return text.to_string();
     }
-    let mut chunks = String::new();
+    let mut content_chunks = String::new();
+    let mut recovered_chunks = String::new();
     let mut last_event = Value::Null;
     let mut error_event = Value::Null;
     for line in text.lines() {
@@ -8404,14 +8419,27 @@ fn normalize_streaming_response_text(text: &str) -> String {
                 .or_else(|| event.pointer("/choices/0/message/content"))
                 .and_then(Value::as_str)
             {
-                chunks.push_str(content);
+                content_chunks.push_str(content);
+                recovered_chunks.push_str(content);
+            }
+            if let Some(reasoning) = event
+                .pointer("/choices/0/delta/reasoning_content")
+                .or_else(|| event.pointer("/choices/0/message/reasoning_content"))
+                .or_else(|| event.pointer("/choices/0/delta/reasoning"))
+                .or_else(|| event.pointer("/choices/0/message/reasoning"))
+                .or_else(|| event.get("reasoning_content"))
+                .or_else(|| event.get("reasoning"))
+                .and_then(Value::as_str)
+            {
+                recovered_chunks.push_str(reasoning);
             }
         }
     }
-    if chunks.is_empty() && !error_event.is_null() {
+    let content = choose_streaming_content(&content_chunks, &recovered_chunks);
+    if content.is_empty() && !error_event.is_null() {
         return error_event.to_string();
     }
-    if chunks.is_empty() {
+    if content.is_empty() {
         return text.to_string();
     }
     json!({
@@ -8419,9 +8447,26 @@ fn normalize_streaming_response_text(text: &str) -> String {
         "object": "chat.completion",
         "created": last_event.get("created").cloned().unwrap_or_else(|| json!(now_ms() / 1000)),
         "model": last_event.get("model").cloned().unwrap_or_else(|| json!("")),
-        "choices": [{ "index": 0, "message": { "role": "assistant", "content": chunks }, "finish_reason": last_event.pointer("/choices/0/finish_reason").cloned().unwrap_or_else(|| json!("stop")) }],
+        "choices": [{ "index": 0, "message": { "role": "assistant", "content": content }, "finish_reason": last_event.pointer("/choices/0/finish_reason").cloned().unwrap_or_else(|| json!("stop")) }],
         "usage": last_event.get("usage").cloned().unwrap_or(Value::Null),
     }).to_string()
+}
+
+fn choose_streaming_content(content: &str, recovered_content: &str) -> String {
+    if recovered_content.is_empty() || recovered_content == content {
+        return content.to_string();
+    }
+    let content_count = parse_translation_response(content)
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let recovered_count = parse_translation_response(recovered_content)
+        .map(|items| items.len())
+        .unwrap_or(0);
+    if recovered_count > content_count {
+        recovered_content.to_string()
+    } else {
+        content.to_string()
+    }
 }
 
 fn parse_translation_response(content: &str) -> Result<Vec<TranslationPair>> {
@@ -9552,6 +9597,13 @@ mod tests {
     }
 
     #[test]
+    fn translated_target_accepts_literal_chinese_empty_word() {
+        assert!(is_valid_translated_target("空"));
+        assert!(!is_valid_translated_target(""));
+        assert!(!is_valid_translated_target("   "));
+    }
+
+    #[test]
     fn parse_translation_response_reads_malformed_t_field_raw() {
         let items =
             parse_translation_response(r#"{"items":[{"i":350,"t":""text:sdjifsjk"}]}"#).unwrap();
@@ -9904,6 +9956,113 @@ mod tests {
         );
         assert!(paths.diagnose_checkpoint_path.exists());
         assert!(paths.diagnose_issue_record_path.exists());
+
+        let _ = fs::remove_dir_all(&base_path);
+    }
+
+    #[tokio::test]
+    async fn runtime_diagnose_terminal_probe_failure_stops_without_splitting() {
+        let base_path = env::temp_dir().join(format!("i18n-runtime-terminal-diagnose-{}", nanoid!()));
+        let _ = fs::remove_dir_all(&base_path);
+        let plugin_dir = base_path.join("demo-plugin");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        let original_code = r#"const first = "A"; const second = "B";"#;
+        fs::write(plugin_dir.join("main.js"), original_code).unwrap();
+
+        let paths = paths(base_path.to_str().unwrap());
+        let source_id = "source-a";
+        let translation_json = json!({
+            "schemaVersion": 1,
+            "metadata": {
+                "plugin": "demo-plugin",
+                "language": "zh-CN",
+                "version": "1.0.0",
+                "supportedVersions": "*",
+                "title": "Demo",
+                "description": "",
+                "author": ""
+            },
+            "dict": {
+                "main.js": {
+                    "ast": [],
+                    "regex": [
+                        { "source": "A", "target": "甲" },
+                        { "source": "B", "target": "乙" }
+                    ]
+                }
+            }
+        });
+        save_translation(&paths, source_id, &translation_json).unwrap();
+
+        let state = AppState {
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            diagnose_sessions: Arc::new(Mutex::new(HashMap::new())),
+            persistence_lock: Arc::new(Mutex::new(())),
+            plugin_dir: base_path.clone(),
+            http: reqwest::Client::new(),
+            shutdown: Arc::new(Mutex::new(None)),
+        };
+
+        let start_value = handle_plugin_diagnose_cleanup_start(
+            &state,
+            json!({
+                "pluginId": "demo-plugin",
+                "pluginDir": plugin_dir.to_string_lossy(),
+                "backupBasePath": base_path.to_string_lossy(),
+                "persistence": { "basePath": base_path.to_string_lossy() },
+                "translationSourceId": source_id,
+                "applyAst": true,
+                "applyRegex": true,
+                "runtimeProbe": true,
+                "isApplied": false
+            }),
+        )
+        .await
+        .unwrap();
+        let start: PluginDiagnoseCleanupResponse = serde_json::from_value(start_value).unwrap();
+        let baseline_probe = start.probe.unwrap();
+
+        let after_baseline_value = handle_plugin_diagnose_cleanup_step(
+            &state,
+            json!({
+                "sessionId": start.session_id.unwrap(),
+                "probeId": baseline_probe.probe_id,
+                "success": true
+            }),
+        )
+        .await
+        .unwrap();
+        let after_baseline: PluginDiagnoseCleanupResponse =
+            serde_json::from_value(after_baseline_value).unwrap();
+        let full_probe = after_baseline.probe.unwrap();
+
+        let after_terminal_value = handle_plugin_diagnose_cleanup_step(
+            &state,
+            json!({
+                "sessionId": after_baseline.session_id.unwrap(),
+                "probeId": full_probe.probe_id,
+                "success": false,
+                "terminalFailure": true,
+                "error": "插件关闭超时：demo-plugin"
+            }),
+        )
+        .await
+        .unwrap();
+        let after_terminal: PluginDiagnoseCleanupResponse =
+            serde_json::from_value(after_terminal_value).unwrap();
+
+        assert_eq!(after_terminal.status, "completed");
+        assert!(after_terminal.probe.is_none());
+        assert!(after_terminal.session_id.is_none());
+        assert_eq!(after_terminal.issue_items.len(), 2);
+        assert!(after_terminal
+            .issue_items
+            .iter()
+            .all(|issue| issue.reason == "插件关闭超时：demo-plugin"));
+        assert_eq!(
+            fs::read_to_string(plugin_dir.join("main.js")).unwrap(),
+            original_code
+        );
 
         let _ = fs::remove_dir_all(&base_path);
     }
@@ -13779,6 +13938,68 @@ mod tests {
             parsed[63].t,
             r#"编辑时显示格式标记，若非活动行则替换为灰色的 "H1"、"H2" 等。"#
         );
+    }
+
+    #[tokio::test]
+    async fn call_chat_completion_recovers_translation_json_continued_in_reasoning_content() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = read_test_http_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let first_event = json!({
+                "choices": [{ "delta": { "content": "[{\"i\":0,\"t\":\"空\"},{\"i\":1,\"t\":\"从助手输出中移除 " } }]
+            });
+            let second_event = json!({
+                "choices": [{
+                    "delta": { "reasoning_content": "、<reasoning> 和 <thought> 块。\"},{\"i\":2,\"t\":\"完成\"}]" },
+                    "finish_reason": "stop"
+                }]
+            });
+            stream
+                .write_all(format!("data: {}\n\n", first_event).as_bytes())
+                .await
+                .unwrap();
+            stream
+                .write_all(format!("data: {}\n\ndata: [DONE]\n\n", second_event).as_bytes())
+                .await
+                .unwrap();
+        });
+        let config = CompanionTranslationConfig {
+            chat_completions_url: format!("http://{addr}/v1/chat/completions"),
+            api_key: "test-key".to_string(),
+            model: "test-model".to_string(),
+            timeout_ms: 5_000,
+            response_format: "json_object".to_string(),
+            batch_size: 100,
+            batch_char_limit: 0,
+            batch_window_multiplier: 4,
+            overwrite_existing_translations: false,
+            concurrency: 1,
+            prompts: PromptConfig {
+                ast: String::new(),
+                regex: String::new(),
+                theme: String::new(),
+            },
+        };
+        let items = (0..3)
+            .map(|index| json!({ "i": index, "s": format!("Source {index}") }))
+            .collect::<Vec<_>>();
+
+        let parsed = call_chat_completion(&items, "", &config).await.unwrap();
+
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].t, "空");
+        assert_eq!(parsed[1].t, "从助手输出中移除 、<reasoning> 和 <thought> 块。");
+        assert_eq!(parsed[2].t, "完成");
     }
 
     #[tokio::test]
