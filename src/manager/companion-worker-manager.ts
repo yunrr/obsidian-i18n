@@ -41,6 +41,8 @@ import type {
     CompanionPluginDiagnoseCleanupApplyResponse,
     CompanionPluginDiagnoseCleanupCancelRequest,
     CompanionPluginDiagnoseCleanupCancelResponse,
+    CompanionPluginDiagnoseRecoveryRestoreRequest,
+    CompanionPluginDiagnoseRecoveryRestoreResponse,
     CompanionPluginDiagnoseCleanupStartRequest,
     CompanionPluginDiagnoseCleanupStepRequest,
     CompanionProxyRequest,
@@ -81,6 +83,8 @@ export type {
     CompanionPluginDiagnoseCleanupApplyResponse,
     CompanionPluginDiagnoseCleanupCancelRequest,
     CompanionPluginDiagnoseCleanupCancelResponse,
+    CompanionPluginDiagnoseRecoveryRestoreRequest,
+    CompanionPluginDiagnoseRecoveryRestoreResponse,
     CompanionPluginDiagnoseCleanupStartRequest,
     CompanionPluginDiagnoseCleanupStepRequest,
     CompanionPluginBatchExtractPayload,
@@ -212,6 +216,10 @@ export class CompanionWorkerManager {
 
     public async applyPluginDiagnoseCleanup(request: CompanionPluginDiagnoseCleanupApplyRequest): Promise<CompanionPluginDiagnoseCleanupApplyResponse> {
         return this.runTask<CompanionPluginDiagnoseCleanupApplyResponse>('plugin-diagnose-cleanup-apply', request);
+    }
+
+    public async restorePluginDiagnoseRecovery(request: CompanionPluginDiagnoseRecoveryRestoreRequest): Promise<CompanionPluginDiagnoseRecoveryRestoreResponse> {
+        return this.runTask<CompanionPluginDiagnoseRecoveryRestoreResponse>('plugin-diagnose-recovery-restore', request);
     }
 
     public async applyThemeTranslation(request: CompanionThemeApplyTranslationRequest): Promise<CompanionApplyTranslationResponse> {

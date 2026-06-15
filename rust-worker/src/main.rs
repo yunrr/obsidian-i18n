@@ -127,6 +127,14 @@ struct PluginDiagnoseCleanupCancelPayload {
     session_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginDiagnoseRecoveryRestorePayload {
+    plugin_id: String,
+    plugin_dir: String,
+    persistence: PersistenceConfig,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 struct TranslationIssueItem {
@@ -177,6 +185,20 @@ struct PluginDiagnoseCleanupResponse {
     processed_files: usize,
     translation_version: String,
     progress: DiagnoseProgress,
+    #[serde(default)]
+    recovered_files: usize,
+    #[serde(default)]
+    recovered_entries: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginDiagnoseRecoveryRestoreResponse {
+    state: bool,
+    restored_files: usize,
+    restored_entries: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -547,6 +569,7 @@ struct PersistencePaths {
     checkpoint_path: PathBuf,
     batch_task_record_path: PathBuf,
     diagnose_checkpoint_path: PathBuf,
+    diagnose_recovery_journal_path: PathBuf,
     diagnose_issue_record_path: PathBuf,
     diagnose_originals_dir: PathBuf,
 }
@@ -3526,6 +3549,9 @@ async fn handle_sync_task(state: &AppState, task_type: &str, payload: Value) -> 
         "plugin-diagnose-cleanup-apply" => {
             handle_plugin_diagnose_cleanup_apply(state, payload).await
         }
+        "plugin-diagnose-recovery-restore" => {
+            handle_plugin_diagnose_recovery_restore(state, payload).await
+        }
         "source-export"
         | "source-read"
         | "source-import"
@@ -4020,6 +4046,227 @@ fn response_probe_files(files: &[RuntimeProbeFile]) -> Vec<RuntimeProbeFile> {
         .collect()
 }
 
+fn diagnose_recovery_entry_id(plugin_id: &str, plugin_dir: &str) -> String {
+    sha256_hex(&format!("{plugin_id}\n{}", normalize_path_for_hash(plugin_dir)))
+}
+
+fn normalize_path_for_hash(path: &str) -> String {
+    path.replace('\\', "/").to_lowercase()
+}
+
+fn diagnose_recovery_backup_ref(entry_id: &str, file: &str) -> String {
+    format!("recovery/{entry_id}/{}.txt", sha256_hex(file))
+}
+
+fn load_diagnose_recovery_journal(paths: &PersistencePaths) -> Value {
+    let raw = load_json_or(
+        &paths.diagnose_recovery_journal_path,
+        json!({ "schemaVersion": 1, "entries": {}, "updatedAt": 0 }),
+    );
+    if raw.get("schemaVersion").and_then(Value::as_u64) == Some(1)
+        && raw.get("entries").and_then(Value::as_object).is_some()
+    {
+        raw
+    } else {
+        json!({ "schemaVersion": 1, "entries": {}, "updatedAt": 0 })
+    }
+}
+
+fn write_or_clear_diagnose_recovery_journal(
+    paths: &PersistencePaths,
+    mut journal: Value,
+) -> Result<()> {
+    let entry_count = journal
+        .get("entries")
+        .and_then(Value::as_object)
+        .map(|entries| entries.len())
+        .unwrap_or(0);
+    if entry_count == 0 {
+        match fs::remove_file(&paths.diagnose_recovery_journal_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to remove {}",
+                        paths.diagnose_recovery_journal_path.display()
+                    )
+                })
+            }
+        }
+        return Ok(());
+    }
+    journal["updatedAt"] = json!(now_ms());
+    write_json_pretty(&paths.diagnose_recovery_journal_path, &journal)
+}
+
+fn diagnose_recovery_entry_matches(entry: &Value, plugin_id: &str, plugin_dir: &str) -> bool {
+    entry.get("pluginId").and_then(Value::as_str) == Some(plugin_id)
+        && entry.get("pluginDirHash").and_then(Value::as_str)
+            == Some(sha256_hex(&normalize_path_for_hash(plugin_dir)).as_str())
+        && entry.get("status").and_then(Value::as_str) == Some("pending")
+}
+
+fn save_diagnose_recovery_journal_entry(session: &DiagnoseCleanupSession) -> Result<()> {
+    let entry_id = diagnose_recovery_entry_id(&session.plugin_id, &session.plugin_dir);
+    let now = now_ms();
+    let mut files = serde_json::Map::new();
+    let mut file_names = session.original_files.keys().cloned().collect::<Vec<_>>();
+    file_names.sort();
+    for file in file_names {
+        let content = session
+            .original_files
+            .get(&file)
+            .and_then(|value| value.as_ref());
+        let mut meta = serde_json::Map::new();
+        meta.insert("exists".to_string(), json!(content.is_some()));
+        if let Some(content) = content {
+            let backup_ref = diagnose_recovery_backup_ref(&entry_id, &file);
+            let backup_path = diagnose_original_backup_path(&session.paths, &backup_ref)?;
+            if let Some(parent) = backup_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&backup_path, content)
+                .with_context(|| format!("failed to write {}", backup_path.display()))?;
+            meta.insert("backupRef".to_string(), json!(backup_ref));
+            meta.insert("sha256".to_string(), json!(sha256_hex(content)));
+            meta.insert("size".to_string(), json!(content.as_bytes().len()));
+        }
+        files.insert(file, Value::Object(meta));
+    }
+
+    let mut journal = load_diagnose_recovery_journal(&session.paths);
+    if journal.get("entries").and_then(Value::as_object).is_none() {
+        journal["entries"] = json!({});
+    }
+    let created_at = journal
+        .pointer(&format!("/entries/{entry_id}/createdAt"))
+        .and_then(Value::as_u64)
+        .unwrap_or(now);
+    journal["entries"][&entry_id] = json!({
+        "entryId": entry_id,
+        "pluginId": session.plugin_id.clone(),
+        "pluginDirHash": sha256_hex(&normalize_path_for_hash(&session.plugin_dir)),
+        "pluginDir": session.plugin_dir.clone(),
+        "status": "pending",
+        "createdAt": created_at,
+        "updatedAt": now,
+        "files": Value::Object(files),
+    });
+    write_or_clear_diagnose_recovery_journal(&session.paths, journal)
+}
+
+fn restore_diagnose_recovery_entry_files(
+    paths: &PersistencePaths,
+    entry: &Value,
+    plugin_dir: &str,
+) -> Result<usize> {
+    let Some(files) = entry.get("files").and_then(Value::as_object) else {
+        return Ok(0);
+    };
+    let mut restored_files = 0usize;
+    for (file, meta) in files {
+        let target_path = safe_join(plugin_dir, file)?;
+        let exists = meta.get("exists").and_then(Value::as_bool).unwrap_or(true);
+        if !exists {
+            match fs::remove_file(&target_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to remove {}", target_path.display()))
+                }
+            }
+            restored_files += 1;
+            continue;
+        }
+        let backup_ref = meta
+            .get("backupRef")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("diagnose recovery backup ref missing for {file}"))?;
+        let backup_path = diagnose_original_backup_path(paths, backup_ref)?;
+        let content = fs::read_to_string(&backup_path)
+            .with_context(|| format!("failed to read {}", backup_path.display()))?;
+        if let Some(expected) = meta.get("sha256").and_then(Value::as_str) {
+            let actual = sha256_hex(&content);
+            if actual != expected {
+                bail!("diagnose recovery backup checksum mismatch for {file}");
+            }
+        }
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&target_path, content)
+            .with_context(|| format!("failed to restore {}", target_path.display()))?;
+        restored_files += 1;
+    }
+    Ok(restored_files)
+}
+
+fn clear_diagnose_recovery_backup(paths: &PersistencePaths, entry_id: &str) -> Result<()> {
+    let backup_dir = diagnose_original_backup_path(paths, &format!("recovery/{entry_id}"))?;
+    match fs::remove_dir_all(&backup_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to remove {}", backup_dir.display()))
+        }
+    }
+    Ok(())
+}
+
+fn restore_diagnose_recovery_entries(
+    paths: &PersistencePaths,
+    plugin_id: &str,
+    plugin_dir: &str,
+) -> Result<PluginDiagnoseRecoveryRestoreResponse> {
+    let mut journal = load_diagnose_recovery_journal(paths);
+    let matching_entries = journal
+        .get("entries")
+        .and_then(Value::as_object)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|(entry_id, entry)| {
+                    if diagnose_recovery_entry_matches(entry, plugin_id, plugin_dir) {
+                        Some((entry_id.clone(), entry.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if matching_entries.is_empty() {
+        return Ok(PluginDiagnoseRecoveryRestoreResponse {
+            state: true,
+            restored_files: 0,
+            restored_entries: 0,
+            errors: Vec::new(),
+        });
+    }
+
+    let mut restored_files = 0usize;
+    let mut restored_entries = 0usize;
+    for (entry_id, entry) in matching_entries {
+        let restored = restore_diagnose_recovery_entry_files(paths, &entry, plugin_dir)?;
+        restored_files += restored;
+        restored_entries += 1;
+        if let Some(entries) = journal.get_mut("entries").and_then(Value::as_object_mut) {
+            entries.remove(&entry_id);
+        }
+        clear_diagnose_recovery_backup(paths, &entry_id)?;
+    }
+    write_or_clear_diagnose_recovery_journal(paths, journal)?;
+    Ok(PluginDiagnoseRecoveryRestoreResponse {
+        state: true,
+        restored_files,
+        restored_entries,
+        errors: Vec::new(),
+    })
+}
+
 fn write_probe_files(plugin_dir: &str, files: &[RuntimeProbeFile]) -> Result<Vec<String>> {
     let mut written = Vec::new();
     for file in files {
@@ -4082,6 +4329,11 @@ fn restore_original_plugin_files(session: &DiagnoseCleanupSession) -> Result<()>
         &session.paths,
         &session.plugin_id,
         &session.translation_source_id,
+    )?;
+    let _ = restore_diagnose_recovery_entries(
+        &session.paths,
+        &session.plugin_id,
+        &session.plugin_dir,
     )?;
     Ok(())
 }
@@ -4866,6 +5118,8 @@ async fn probe_response(
 ) -> Result<PluginDiagnoseCleanupResponse> {
     let probe_id = nanoid!(16);
     let files = render_probe_files_for_session(state, session, &candidates).await?;
+    save_original_plugin_file_snapshots(session)?;
+    save_diagnose_recovery_journal_entry(session)?;
     let written_files = write_probe_files(&session.plugin_dir, &files)?;
     let progress = diagnose_progress(session, phase, candidates.len());
     session.probe_map.insert(probe_id.clone(), candidates);
@@ -4892,6 +5146,8 @@ async fn probe_response(
             .unwrap_or("0.0.0")
             .to_string(),
         progress,
+        recovered_files: 0,
+        recovered_entries: 0,
     })
 }
 
@@ -4914,6 +5170,8 @@ fn completed_response(
             .unwrap_or("0.0.0")
             .to_string(),
         progress: completed_diagnose_progress(session),
+        recovered_files: 0,
+        recovered_entries: 0,
     }
 }
 
@@ -5144,6 +5402,11 @@ async fn handle_plugin_diagnose_cleanup_start(state: &AppState, payload: Value) 
     let _guard = state.persistence_lock.lock().await;
     let payload: PluginDiagnoseCleanupStartPayload = serde_json::from_value(payload)?;
     let paths = paths(&payload.persistence.base_path);
+    let recovered = restore_diagnose_recovery_entries(
+        &paths,
+        &payload.plugin_id,
+        &payload.plugin_dir,
+    )?;
     restore_originals_from_checkpoint(
         &paths,
         &payload.plugin_id,
@@ -5207,14 +5470,14 @@ async fn handle_plugin_diagnose_cleanup_start(state: &AppState, payload: Value) 
             &session.plugin_id,
             &session.translation_source_id,
         )?;
-        return Ok(serde_json::to_value(completed_response(
-            &session,
-            "completed",
-        ))?);
+        let mut response = completed_response(&session, "completed");
+        response.recovered_files = recovered.restored_files;
+        response.recovered_entries = recovered.restored_entries;
+        return Ok(serde_json::to_value(response)?);
     }
 
     let session_id = nanoid!(16);
-    let response = probe_response(
+    let mut response = probe_response(
         state,
         &session_id,
         &mut session,
@@ -5223,6 +5486,8 @@ async fn handle_plugin_diagnose_cleanup_start(state: &AppState, payload: Value) 
         "baseline",
     )
     .await?;
+    response.recovered_files = recovered.restored_files;
+    response.recovered_entries = recovered.restored_entries;
     state
         .diagnose_sessions
         .lock()
@@ -5323,6 +5588,21 @@ async fn handle_plugin_diagnose_cleanup_apply(state: &AppState, payload: Value) 
     Ok(serde_json::to_value(response)?)
 }
 
+async fn handle_plugin_diagnose_recovery_restore(
+    state: &AppState,
+    payload: Value,
+) -> Result<Value> {
+    let _guard = state.persistence_lock.lock().await;
+    let payload: PluginDiagnoseRecoveryRestorePayload = serde_json::from_value(payload)?;
+    let paths = paths(&payload.persistence.base_path);
+    let response = restore_diagnose_recovery_entries(
+        &paths,
+        &payload.plugin_id,
+        &payload.plugin_dir,
+    )?;
+    Ok(serde_json::to_value(response)?)
+}
+
 fn paths(base_path: &str) -> PersistencePaths {
     let base_path = PathBuf::from(base_path);
     PersistencePaths {
@@ -5331,6 +5611,7 @@ fn paths(base_path: &str) -> PersistencePaths {
         checkpoint_path: base_path.join("backup-checkpoint.json"),
         batch_task_record_path: base_path.join("batch-task-records.json"),
         diagnose_checkpoint_path: base_path.join("diagnose-checkpoint.json"),
+        diagnose_recovery_journal_path: base_path.join("diagnose-recovery-journal.json"),
         diagnose_issue_record_path: base_path.join("diagnose-issues.json"),
         diagnose_originals_dir: base_path.join("diagnose-originals"),
     }
@@ -10526,6 +10807,268 @@ mod tests {
         .unwrap();
 
         let _ = full;
+        let _ = fs::remove_dir_all(&base_path);
+    }
+
+    #[tokio::test]
+    async fn diagnose_recovery_journal_restores_replacements_across_source_changes() {
+        let base_path = env::temp_dir().join(format!("i18n-recovery-cross-source-{}", nanoid!()));
+        let _ = fs::remove_dir_all(&base_path);
+        let plugin_dir = base_path.join("demo-plugin");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        let original_code = r#"console.log("A");"#;
+        fs::write(plugin_dir.join("main.js"), original_code).unwrap();
+
+        let paths = paths(base_path.to_str().unwrap());
+        let source_a = "source-a";
+        let source_b = "source-b";
+        let translation_a = json!({
+            "schemaVersion": 1,
+            "metadata": {
+                "plugin": "demo-plugin",
+                "language": "zh-CN",
+                "version": "1.0.0",
+                "supportedVersions": "*",
+                "title": "Demo",
+                "description": "",
+                "author": ""
+            },
+            "dict": {
+                "main.js": {
+                    "ast": [],
+                    "regex": [
+                        { "source": "A", "target": "AX" }
+                    ]
+                }
+            }
+        });
+        let translation_b = json!({
+            "schemaVersion": 1,
+            "metadata": {
+                "plugin": "demo-plugin",
+                "language": "zh-CN",
+                "version": "1.0.0",
+                "supportedVersions": "*",
+                "title": "Demo",
+                "description": "",
+                "author": ""
+            },
+            "dict": {
+                "main.js": {
+                    "ast": [],
+                    "regex": [
+                        { "source": "A", "target": "BX" }
+                    ]
+                }
+            }
+        });
+        save_translation(&paths, source_a, &translation_a).unwrap();
+        save_translation(&paths, source_b, &translation_b).unwrap();
+
+        let first_state = test_app_state(base_path.clone());
+        let start_value = handle_plugin_diagnose_cleanup_start(
+            &first_state,
+            json!({
+                "pluginId": "demo-plugin",
+                "pluginDir": plugin_dir.to_string_lossy(),
+                "backupBasePath": base_path.to_string_lossy(),
+                "persistence": { "basePath": base_path.to_string_lossy() },
+                "translationSourceId": source_a,
+                "applyAst": true,
+                "applyRegex": true,
+                "runtimeProbe": true,
+                "isApplied": false
+            }),
+        )
+        .await
+        .unwrap();
+        let start: PluginDiagnoseCleanupResponse = serde_json::from_value(start_value).unwrap();
+        let baseline_probe = start.probe.unwrap();
+        let full_value = handle_plugin_diagnose_cleanup_step(
+            &first_state,
+            json!({
+                "sessionId": start.session_id.unwrap(),
+                "probeId": baseline_probe.probe_id,
+                "success": true
+            }),
+        )
+        .await
+        .unwrap();
+        let full: PluginDiagnoseCleanupResponse = serde_json::from_value(full_value).unwrap();
+        assert!(fs::read_to_string(plugin_dir.join("main.js"))
+            .unwrap()
+            .contains("AX"));
+        assert!(paths.diagnose_recovery_journal_path.exists());
+
+        let restarted_state = test_app_state(base_path.clone());
+        let restore_value = handle_plugin_diagnose_recovery_restore(
+            &restarted_state,
+            json!({
+                "pluginId": "demo-plugin",
+                "pluginDir": plugin_dir.to_string_lossy(),
+                "persistence": { "basePath": base_path.to_string_lossy() }
+            }),
+        )
+        .await
+        .unwrap();
+        let restore: PluginDiagnoseRecoveryRestoreResponse =
+            serde_json::from_value(restore_value).unwrap();
+        assert_eq!(restore.restored_files, 1);
+        assert_eq!(restore.restored_entries, 1);
+        assert_eq!(fs::read_to_string(plugin_dir.join("main.js")).unwrap(), original_code);
+        assert!(!paths.diagnose_recovery_journal_path.exists());
+
+        let start_b_value = handle_plugin_diagnose_cleanup_start(
+            &restarted_state,
+            json!({
+                "pluginId": "demo-plugin",
+                "pluginDir": plugin_dir.to_string_lossy(),
+                "backupBasePath": base_path.to_string_lossy(),
+                "persistence": { "basePath": base_path.to_string_lossy() },
+                "translationSourceId": source_b,
+                "applyAst": true,
+                "applyRegex": true,
+                "runtimeProbe": true,
+                "isApplied": false
+            }),
+        )
+        .await
+        .unwrap();
+        let start_b: PluginDiagnoseCleanupResponse = serde_json::from_value(start_b_value).unwrap();
+        assert_eq!(start_b.recovered_files, 0);
+
+        let _ = full;
+        let _ = fs::remove_dir_all(&base_path);
+    }
+
+    #[tokio::test]
+    async fn diagnose_recovery_journal_restore_failure_keeps_pending_entry() {
+        let base_path = env::temp_dir().join(format!("i18n-recovery-corrupt-{}", nanoid!()));
+        let _ = fs::remove_dir_all(&base_path);
+        let plugin_dir = base_path.join("demo-plugin");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(plugin_dir.join("main.js"), r#"console.log("AX");"#).unwrap();
+
+        let paths = paths(base_path.to_str().unwrap());
+        let backup_ref = "recovery/test-entry/main.js.txt";
+        let backup_path = diagnose_original_backup_path(&paths, backup_ref).unwrap();
+        fs::create_dir_all(backup_path.parent().unwrap()).unwrap();
+        fs::write(&backup_path, r#"console.log("A");"#).unwrap();
+        write_json_pretty(
+            &paths.diagnose_recovery_journal_path,
+            &json!({
+                "schemaVersion": 1,
+                "updatedAt": now_ms(),
+                "entries": {
+                    "test-entry": {
+                        "entryId": "test-entry",
+                        "pluginId": "demo-plugin",
+                        "pluginDirHash": sha256_hex(&normalize_path_for_hash(plugin_dir.to_string_lossy().as_ref())),
+                        "pluginDir": plugin_dir.to_string_lossy(),
+                        "status": "pending",
+                        "createdAt": now_ms(),
+                        "updatedAt": now_ms(),
+                        "files": {
+                            "main.js": {
+                                "exists": true,
+                                "backupRef": backup_ref,
+                                "sha256": "not-the-real-checksum",
+                                "size": 17
+                            }
+                        }
+                    }
+                }
+            }),
+        )
+        .unwrap();
+
+        let state = test_app_state(base_path.clone());
+        let error = handle_plugin_diagnose_recovery_restore(
+            &state,
+            json!({
+                "pluginId": "demo-plugin",
+                "pluginDir": plugin_dir.to_string_lossy(),
+                "persistence": { "basePath": base_path.to_string_lossy() }
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("checksum mismatch"));
+        assert!(paths.diagnose_recovery_journal_path.exists());
+        assert!(fs::read_to_string(plugin_dir.join("main.js"))
+            .unwrap()
+            .contains("AX"));
+
+        let _ = fs::remove_dir_all(&base_path);
+    }
+
+    #[tokio::test]
+    async fn diagnose_recovery_journal_is_saved_before_probe_file_write() {
+        let base_path = env::temp_dir().join(format!("i18n-recovery-before-write-{}", nanoid!()));
+        let _ = fs::remove_dir_all(&base_path);
+        let plugin_dir = base_path.join("demo-plugin");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(plugin_dir.join("blocked"), "not a directory").unwrap();
+
+        let paths = paths(base_path.to_str().unwrap());
+        let mut source_by_file = HashMap::new();
+        source_by_file.insert(
+            "blocked/main.js".to_string(),
+            r#"console.log("A");"#.to_string(),
+        );
+        let mut original_files = HashMap::new();
+        original_files.insert("blocked/main.js".to_string(), None);
+        let mut session = DiagnoseCleanupSession {
+            paths: paths.clone(),
+            plugin_id: "demo-plugin".to_string(),
+            plugin_dir: plugin_dir.to_string_lossy().to_string(),
+            cjs_endpoint: None,
+            translation_source_id: "source-before-write".to_string(),
+            translation_json: json!({
+                "schemaVersion": 1,
+                "metadata": { "version": "1.0.0" },
+                "dict": {
+                    "blocked/main.js": {
+                        "ast": [],
+                        "regex": [
+                            { "source": "A", "target": "AX" }
+                        ]
+                    }
+                }
+            }),
+            source_by_file,
+            original_files,
+            issue_items: Vec::new(),
+            cleared_runtime_candidates: Vec::new(),
+            pending_candidates: Vec::new(),
+            probe_map: HashMap::new(),
+            probe_files: HashMap::new(),
+            phase_order: vec!["regex".to_string()],
+            active_phase_index: 0,
+            phase_queues: HashMap::new(),
+            processed_files: 1,
+        };
+
+        let state = test_app_state(base_path.clone());
+        let error = probe_response(
+            &state,
+            "session-before-write",
+            &mut session,
+            vec![TranslationCandidate {
+                file: "blocked/main.js".to_string(),
+                kind: "regex".to_string(),
+                index: 0,
+                item: json!({ "source": "A", "target": "AX" }),
+            }],
+            "Regex 全量运行验证",
+            "regex",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(!error.to_string().is_empty());
+        assert!(paths.diagnose_recovery_journal_path.exists());
+
         let _ = fs::remove_dir_all(&base_path);
     }
 

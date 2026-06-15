@@ -34,6 +34,7 @@ test('workflow, state, translation, retry, source, and cloud tasks are routed to
         'plugin-diagnose-cleanup-step',
         'plugin-diagnose-cleanup-cancel',
         'plugin-diagnose-cleanup-apply',
+        'plugin-diagnose-recovery-restore',
         'source-read',
         'source-export',
         'source-import',

@@ -774,6 +774,7 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
             const manifestName = getManifestName(manifest);
             let baselineLoadDurationMs: number | null = null;
             let baselineStopDurationMs: number | null = null;
+            let notifiedRecovery = false;
 
             const startedState = getPluginLoadState(pluginsApi, pluginId);
             restoreAfterBackendChange = async () => {
@@ -859,6 +860,22 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
                 }
             };
 
+            const notifyRecoveredReplacements = (restoredFiles: unknown, restoredEntries: unknown) => {
+                const fileCount = typeof restoredFiles === 'number' ? restoredFiles : 0;
+                const entryCount = typeof restoredEntries === 'number' ? restoredEntries : 0;
+                if (notifiedRecovery || (fileCount <= 0 && entryCount <= 0)) return;
+                notifiedRecovery = true;
+                notice.info(`已自动恢复上次运行前检查遗留的替换文件（${fileCount} 个文件）`);
+            };
+
+            const recovery = await i18n.companionWorkerManager.restorePluginDiagnoseRecovery({
+                pluginId,
+                pluginDir,
+                persistence: { basePath: i18n.sourceManager.getBasePath() },
+            });
+            notifyRecoveredReplacements(recovery.restoredFiles, recovery.restoredEntries);
+            throwIfDiagnoseStopped(signal);
+
             await stopPluginForBackendWrite();
             const cjsEndpoint = await i18n.companionWorkerManager.getCjsEndpoint();
             throwIfDiagnoseStopped(signal);
@@ -875,6 +892,7 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
                 runtimeProbe: true,
                 isApplied,
             });
+            notifyRecoveredReplacements(response.recoveredFiles, response.recoveredEntries);
             throwIfDiagnoseStopped(signal);
             i18n.sourceManager.reloadFromDisk();
             useGlobalStoreInstance.setState({

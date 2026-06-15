@@ -283,6 +283,19 @@ export interface CompanionPluginDiagnoseCleanupCancelResponse {
     state: boolean;
 }
 
+export interface CompanionPluginDiagnoseRecoveryRestoreRequest {
+    pluginId: string;
+    pluginDir: string;
+    persistence: CompanionWorkerPersistenceConfig;
+}
+
+export interface CompanionPluginDiagnoseRecoveryRestoreResponse {
+    state: boolean;
+    restoredFiles: number;
+    restoredEntries: number;
+    errors?: string[];
+}
+
 export interface CompanionPluginDiagnoseCleanupApplyRequest {
     persistence: CompanionWorkerPersistenceConfig;
     translationSourceId: string;
@@ -307,6 +320,8 @@ export interface CompanionPluginDiagnoseCleanupResponse {
     processedFiles: number;
     translationVersion: string;
     progress: CompanionDiagnoseProgress;
+    recoveredFiles?: number;
+    recoveredEntries?: number;
 }
 
 export interface CompanionSourceManagerRequest {
@@ -622,4 +637,4 @@ export interface CompanionThemeFailureRetryPayload {
 
 export type CompanionAsyncTaskType = 'plugin-batch-extract' | 'theme-batch-extract' | 'plugin-batch-translate' | 'theme-batch-translate' | 'plugin-failure-retry' | 'theme-failure-retry' | 'cloud-backup-all';
 
-export type CompanionBatchTaskType = 'plugin-extract' | 'theme-extract' | 'plugin-translate' | 'theme-translate' | 'plugin-retry' | 'theme-retry' | 'ast-replace' | 'code-extract' | 'plugin-render-translation' | 'plugin-diagnose-render-probe' | 'plugin-apply-translation' | 'plugin-diagnose-cleanup-start' | 'plugin-diagnose-cleanup-step' | 'plugin-diagnose-cleanup-cancel' | 'plugin-diagnose-cleanup-apply' | 'theme-apply-translation' | 'source-read' | 'source-export' | 'source-import' | 'source-remove' | 'source-set-active' | 'source-index' | 'source-clear-batch-records' | CompanionCloudTaskType;
+export type CompanionBatchTaskType = 'plugin-extract' | 'theme-extract' | 'plugin-translate' | 'theme-translate' | 'plugin-retry' | 'theme-retry' | 'ast-replace' | 'code-extract' | 'plugin-render-translation' | 'plugin-diagnose-render-probe' | 'plugin-apply-translation' | 'plugin-diagnose-cleanup-start' | 'plugin-diagnose-cleanup-step' | 'plugin-diagnose-cleanup-cancel' | 'plugin-diagnose-cleanup-apply' | 'plugin-diagnose-recovery-restore' | 'theme-apply-translation' | 'source-read' | 'source-export' | 'source-import' | 'source-remove' | 'source-set-active' | 'source-index' | 'source-clear-batch-records' | CompanionCloudTaskType;
