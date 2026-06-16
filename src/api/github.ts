@@ -349,7 +349,7 @@ export class GitHubAPI {
             const res = await this.getFileContent(owner, repo, path, branch);
             if (res.state && res.data) {
                 // 如果有 content 字段，直接解码返回
-                if (res.data.content) {
+                if (typeof res.data.content === 'string' && res.data.content.trim()) {
                     const decoded = Buffer.from(res.data.content, 'base64').toString('utf-8');
                     try {
                         return { state: true, data: JSON.parse(decoded), status: res.status };

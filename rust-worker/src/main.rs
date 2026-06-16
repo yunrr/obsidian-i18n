@@ -2212,8 +2212,7 @@ async fn github_get_file_content_with_fallback(
 
     match github_get_file_content(state, &content_payload).await {
         Ok(response) if response.state => {
-            if let Some(content) = response.data.get("content").and_then(Value::as_str) {
-                let decoded = decode_github_content(content)?;
+            if let Some(decoded) = decode_github_embedded_content(&response.data)? {
                 return Ok(success_with_status(
                     parse_text_or_json(decoded),
                     response.status,
@@ -2525,6 +2524,16 @@ fn decode_github_content(content: &str) -> Result<String> {
     let compact = content.replace(['\n', '\r'], "");
     let bytes = BASE64_STANDARD.decode(compact)?;
     Ok(String::from_utf8_lossy(&bytes).to_string())
+}
+
+fn decode_github_embedded_content(data: &Value) -> Result<Option<String>> {
+    let Some(content) = data.get("content").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if content.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(decode_github_content(content)?))
 }
 
 fn parse_text_or_json(text: String) -> Value {
@@ -3083,7 +3092,7 @@ async fn handle_cloud_backup_all(
 
     if files_to_upload.is_empty() && current_idx == 0 {
         touch_progress(&task, json!({ "currentLabel": "读取云端索引" })).await;
-        manifest = fetch_manifest(state, &payload).await.unwrap_or_default();
+        manifest = fetch_manifest(state, &payload).await?;
         payload.manifest = manifest.clone();
         touch_progress(&task, json!({ "currentLabel": "准备备份数据" })).await;
         let prepared = handle_cloud_prepare_backup(state, serde_json::to_value(&payload)?).await?;
@@ -3345,27 +3354,7 @@ async fn fetch_manifest_with_sha(
 ) -> Result<(Vec<Value>, Option<String>)> {
     let read = github_get_file_content(
         state,
-        &GithubReadRequest {
-            operation: "getFileContent".to_string(),
-            token: payload.token.clone(),
-            github_proxy_url: None,
-            owner: Some(payload.owner.clone()),
-            repo: Some(payload.repo.clone()),
-            path: Some("metadata.json".to_string()),
-            branch: Some(payload.branch.clone()),
-            r#ref: Some(payload.branch.clone()),
-            username: None,
-            repo_name: None,
-            url: None,
-            target_owner: None,
-            target_repo: None,
-            repo_address: None,
-            creator: None,
-            page: None,
-            per_page: None,
-            recursive: None,
-            timeout_ms: None,
-        },
+        &cloud_manifest_read_request(payload),
     )
     .await?;
     if !read.state {
@@ -3379,13 +3368,57 @@ async fn fetch_manifest_with_sha(
         .get("sha")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let manifest = if let Some(content) = read.data.get("content").and_then(Value::as_str) {
-        let text = decode_github_content(content)?;
-        serde_json::from_str::<Vec<Value>>(&text).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    Ok((manifest, sha))
+    if let Some(text) = decode_github_embedded_content(&read.data)? {
+        return Ok((parse_manifest_text(&text)?, sha));
+    }
+
+    if let Some(download_url) = read.data.get("download_url").and_then(Value::as_str) {
+        let raw_response = github_get_url(
+            state,
+            &cloud_manifest_read_request(payload),
+            download_url.to_string(),
+        )
+        .await?;
+        let status = raw_response.status().as_u16();
+        if status >= 400 {
+            bail!(
+                "读取 metadata.json raw 内容失败: {}",
+                response_body_value(raw_response).await?
+            );
+        }
+        let text = raw_response.text().await?;
+        return Ok((parse_manifest_text(&text)?, sha));
+    }
+
+    Ok((Vec::new(), sha))
+}
+
+fn cloud_manifest_read_request(payload: &CloudTaskPayload) -> GithubReadRequest {
+    GithubReadRequest {
+        operation: "getFileContent".to_string(),
+        token: payload.token.clone(),
+        github_proxy_url: None,
+        owner: Some(payload.owner.clone()),
+        repo: Some(payload.repo.clone()),
+        path: Some("metadata.json".to_string()),
+        branch: Some(payload.branch.clone()),
+        r#ref: Some(payload.branch.clone()),
+        username: None,
+        repo_name: None,
+        url: None,
+        target_owner: None,
+        target_repo: None,
+        repo_address: None,
+        creator: None,
+        page: None,
+        per_page: None,
+        recursive: None,
+        timeout_ms: None,
+    }
+}
+
+fn parse_manifest_text(text: &str) -> Result<Vec<Value>> {
+    serde_json::from_str::<Vec<Value>>(text).context("metadata.json 不是有效的 JSON 数组")
 }
 
 async fn upload_manifest(
@@ -9871,6 +9904,26 @@ mod tests {
         assert_eq!(progress.mode, "retry");
         assert_eq!(progress.total_resources, 3);
         assert_eq!(progress.total_items, 7);
+    }
+
+    #[test]
+    fn github_embedded_content_ignores_empty_large_file_placeholder() {
+        let data = json!({
+            "content": "",
+            "encoding": "none",
+            "download_url": "https://raw.githubusercontent.com/example/repo/main/metadata.json",
+        });
+
+        let decoded = decode_github_embedded_content(&data).unwrap();
+
+        assert!(decoded.is_none());
+    }
+
+    #[test]
+    fn parse_manifest_text_rejects_invalid_or_non_array_metadata() {
+        assert!(parse_manifest_text("").is_err());
+        assert!(parse_manifest_text(r#"{"items":[]}"#).is_err());
+        assert!(parse_manifest_text(r#"[{"id":"source-a"}]"#).is_ok());
     }
 
     #[test]
