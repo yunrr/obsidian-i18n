@@ -482,7 +482,8 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
     const loggerPrefix = t('Editor.Titles.Main');
 
     // 插件翻译文件
-    const pluginTranslation = useGlobalStoreInstance.getState().editorPluginTranslation;
+    const pluginTranslation = useGlobalStoreInstance((state) => state.editorPluginTranslation);
+    const pluginTranslationPath = useGlobalStoreInstance((state) => state.editorPluginTranslationPath);
 
     // Lifted Translation State (Persists across tab switching)
     const astController = useAstTranslation();
@@ -497,8 +498,8 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
     const addFile = useRegexStore.use.addFile();
     const deleteFile = useRegexStore.use.deleteFile();
 
-    // 使用 ref 标记是否已初始化，防止 useEffect 重复执行时用原始数据覆盖用户编辑中的内容
-    const initializedRef = useRef(false);
+    // 按译文源路径重载，避免同一文件内编辑时被原始数据覆盖。
+    const loadedTranslationPathRef = useRef('');
     const savingRef = useRef(false);
     const diagnoseAbortRef = useRef<AbortController | null>(null);
     const diagnoseRuntimeRef = useRef<PluginDiagnoseRuntime | null>(null);
@@ -537,8 +538,7 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
     }, [i18n]);
 
     useEffect(() => {
-        // 如果已经初始化过，不再用原始数据覆盖 store
-        if (initializedRef.current) return;
+        if (!pluginTranslationPath || loadedTranslationPathRef.current === pluginTranslationPath) return;
 
         if (pluginTranslation?.dict) {
             useRegexStore.setState({ currentFile: '' });
@@ -555,8 +555,8 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
             setMetadata(pluginTranslation.metadata);
         }
 
-        initializedRef.current = true;
-    }, [pluginTranslation, setDictData, setCurrentFile, setMetadata, logger]);
+        loadedTranslationPathRef.current = pluginTranslationPath;
+    }, [pluginTranslation, pluginTranslationPath, setDictData, setCurrentFile, setMetadata, logger]);
 
     // =================================== Function ===================================
     const save = React.useCallback(async (silent = false) => {
@@ -895,9 +895,10 @@ const ReactEditor: React.FC<EditorProps> = (_) => {
             notifyRecoveredReplacements(response.recoveredFiles, response.recoveredEntries);
             throwIfDiagnoseStopped(signal);
             i18n.sourceManager.reloadFromDisk();
+            const latestPluginTranslation = useGlobalStoreInstance.getState().editorPluginTranslation;
             useGlobalStoreInstance.setState({
                 editorPluginTranslation: {
-                    ...pluginTranslation,
+                    ...latestPluginTranslation,
                     dict: draft.dict as any,
                     metadata: draft.metadata as any,
                 },

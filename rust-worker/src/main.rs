@@ -2784,7 +2784,18 @@ async fn handle_cloud_publish_source(state: &AppState, payload: Value) -> Result
     let created_at = existing_index
         .and_then(|index| manifest[index].get("created_at").cloned())
         .unwrap_or_else(|| Value::String(now.clone()));
-    let version = payload.version.clone().unwrap_or_default();
+    let translation_version = content
+        .pointer("/metadata/version")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .or(payload.version.as_deref())
+        .unwrap_or_default();
+    let supported_versions = content
+        .pointer("/metadata/supportedVersions")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .or(payload.version.as_deref())
+        .unwrap_or_default();
     let title = payload.title.clone().unwrap_or_else(|| {
         source
             .get("title")
@@ -2797,8 +2808,8 @@ async fn handle_cloud_publish_source(state: &AppState, payload: Value) -> Result
         "id": source_id,
         "plugin": plugin,
         "language": payload.language,
-        "version": version,
-        "supported_versions": version,
+        "version": translation_version,
+        "supported_versions": supported_versions,
         "title": title,
         "description": description,
         "hash": hash,
@@ -5632,16 +5643,48 @@ fn write_json_pretty(path: &Path, value: &Value) -> Result<()> {
     Ok(())
 }
 
+fn normalize_source_record(source: &Value) -> Value {
+    let mut normalized = source.clone();
+    if let Some(obj) = normalized.as_object_mut() {
+        let legacy_type = obj.get("type").and_then(Value::as_str).map(str::to_string);
+        if !obj.contains_key("origin")
+            && matches!(legacy_type.as_deref(), Some("cloud") | Some("local"))
+        {
+            obj.insert(
+                "origin".to_string(),
+                Value::String(legacy_type.clone().unwrap_or_default()),
+            );
+            obj.insert("type".to_string(), Value::String("plugin".to_string()));
+        }
+        if !obj.contains_key("plugin") {
+            if let Some(plugin_id) = obj.get("pluginId").cloned() {
+                obj.insert("plugin".to_string(), plugin_id);
+            }
+        }
+        obj.remove("pluginId");
+        obj.remove("version");
+    }
+    normalized
+}
+
 fn load_meta(paths: &PersistencePaths) -> Value {
     let raw = load_json_or(
         &paths.meta_path,
         json!({ "schemaVersion": 2, "sources": {} }),
     );
-    if raw.get("sources").is_some() {
-        raw
-    } else {
-        json!({ "schemaVersion": 2, "sources": {} })
+    let Some(sources) = raw.get("sources").and_then(Value::as_object) else {
+        return json!({ "schemaVersion": 2, "sources": {} });
+    };
+    let mut meta = json!({
+        "schemaVersion": 2,
+        "sources": {}
+    });
+    if let Some(target_sources) = meta.get_mut("sources").and_then(Value::as_object_mut) {
+        for (source_id, source) in sources {
+            target_sources.insert(source_id.clone(), normalize_source_record(source));
+        }
     }
+    meta
 }
 
 fn source_export_blocking(payload: SourceManagerPayload) -> Result<SourceImportExportResponse> {
@@ -11271,6 +11314,42 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(false)
         );
+    }
+
+    #[test]
+    fn load_meta_migrates_legacy_source_records_to_v2_shape() {
+        let base_path = env::temp_dir().join(format!("i18n-load-meta-migration-{}", nanoid!()));
+        let paths = paths(base_path.to_str().unwrap());
+        write_json_pretty(
+            &paths.meta_path,
+            &json!({
+                "schemaVersion": 1,
+                "sources": {
+                    "source-a": {
+                        "id": "source-a",
+                        "pluginId": "plugin-a",
+                        "title": "Legacy cloud",
+                        "type": "cloud",
+                        "version": "0.9.0",
+                        "isActive": true,
+                        "checksum": "abc",
+                        "createdAt": 1,
+                        "updatedAt": 2
+                    }
+                }
+            }),
+        )
+        .unwrap();
+
+        let meta = load_meta(&paths);
+        let source = meta.pointer("/sources/source-a").unwrap();
+        assert_eq!(source.get("plugin").and_then(Value::as_str), Some("plugin-a"));
+        assert_eq!(source.get("type").and_then(Value::as_str), Some("plugin"));
+        assert_eq!(source.get("origin").and_then(Value::as_str), Some("cloud"));
+        assert!(source.get("pluginId").is_none());
+        assert!(source.get("version").is_none());
+
+        let _ = fs::remove_dir_all(&base_path);
     }
 
     #[tokio::test]

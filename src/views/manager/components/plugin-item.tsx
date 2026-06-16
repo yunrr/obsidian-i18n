@@ -5,7 +5,7 @@ import { useTranslation } from 'react-i18next';
 import { Settings, FolderOpen, Pen, FileOutput, XCircle, Loader2, MoreHorizontal, CloudDownload, Cloud } from 'lucide-react';
 import I18N from 'src/main';
 import { i18nOpen } from '../../../utils/common/general';
-import { getPluginTranslationSources, hasExtractedTranslationContent, calculateChecksum } from '../../../utils/translator/light';
+import { getPluginTranslationSources, hasExtractedTranslationContent } from '../../../utils/translator/light';
 import { openPluginSourceEditor } from '../utils/source-editor';
 import { getEffectiveExtractionSettings } from '../../../utils/translator/config';
 import { runPluginApplyTranslationFlow } from './plugin-apply-flow';
@@ -72,6 +72,12 @@ interface PluginItemProps {
     close: () => void;
     viewMode: 'list' | 'grid';
 }
+
+const getSourceVersionLabel = (source: any) => {
+    const version = source?.translationVersion ? String(source.translationVersion) : '';
+    if (version) return `v${version}`;
+    return source?.title || source?.id || '';
+};
 
 export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n, settings, isEnabled, data, reloadPlugin, refreshParent, close, viewMode }) => {
     const { t } = useTranslation();
@@ -149,31 +155,21 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
 
             const existingSource = sourceManager?.getAllSources().find(s => s.id === entry.id);
             if (existingSource) {
-                sourceManager?.saveSourceFile(existingSource.id, content);
-                sourceManager?.saveSource({
-                    ...existingSource,
-                    origin: 'cloud',
+                sourceManager?.saveCloudSourceFile(existingSource.id, content, {
+                    plugin: entry.plugin,
                     title: entry.title || existingSource.title,
-                    checksum: calculateChecksum(content),
+                    type: entry.type,
                     cloud: { owner, repo: repoName, hash: entry.hash },
-                    updatedAt: Date.now()
-                });
+                }, { activate: existingSource.isActive });
                 i18n.notice.successPrefix('Cloud', t('Cloud.Notices.UpdateSuccess' as any) || 'Update success');
             } else {
-                sourceManager?.saveSourceFile(entry.id, content);
                 const isOnly = !sourceManager?.getActiveSourceId(plugin.id);
-                sourceManager?.saveSource({
-                    id: entry.id,
+                sourceManager?.saveCloudSourceFile(entry.id, content, {
                     plugin: entry.plugin,
                     title: entry.title || 'Unknown',
                     type: entry.type,
-                    origin: 'cloud',
-                    isActive: isOnly,
-                    checksum: calculateChecksum(content),
                     cloud: { owner, repo: repoName, hash: entry.hash },
-                    updatedAt: Date.now(),
-                    createdAt: Date.now()
-                });
+                }, { activate: isOnly });
                 i18n.notice.successPrefix('Cloud', t('Cloud.Notices.DownloadSuccess' as any) || 'Download success');
             }
             refreshParent();
@@ -334,7 +330,7 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
                                     <SelectContent className="backdrop-blur-md bg-background/95 border-border/40">
                                         {sources.map(source => (
                                             <SelectItem key={source.id} value={source.id} className="text-[11px]">
-                                                {source.title}
+                                                {getSourceVersionLabel(source)}
                                             </SelectItem>
                                         ))}
                                     </SelectContent>
@@ -490,7 +486,7 @@ export const PluginItem: React.FC<PluginItemProps> = React.memo(({ plugin, i18n,
                             <SelectContent className="backdrop-blur-md bg-background/95 border-border/40">
                                 {sources.map(source => (
                                     <SelectItem key={source.id} value={source.id} className="text-[11px]">
-                                        {source.title}
+                                        {getSourceVersionLabel(source)}
                                     </SelectItem>
                                 ))}
                             </SelectContent>

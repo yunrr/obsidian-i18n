@@ -1205,11 +1205,33 @@ function createEmptyBatchTaskRecord(): BatchTaskRecordMeta {
     return { schemaVersion: 1, checkpoints: {}, failures: [], updatedAt: 0 };
 }
 
+function normalizeSourceRecord(source: any): TranslationSource {
+    const next = { ...source };
+    if (!next.origin && (next.type === 'cloud' || next.type === 'local')) {
+        next.origin = next.type;
+        next.type = 'plugin';
+    }
+    if ('pluginId' in next && !('plugin' in next)) {
+        next.plugin = next.pluginId;
+    }
+    delete next.pluginId;
+    delete next.version;
+    return next as TranslationSource;
+}
+
 async function loadMeta(paths: WorkerPersistencePaths): Promise<TranslationSourceMeta> {
     try {
         if (!await fs.pathExists(paths.metaPath)) return createEmptyMeta();
         const raw = await fs.readJson(paths.metaPath);
-        return raw?.sources ? raw : createEmptyMeta();
+        if (!raw?.sources) return createEmptyMeta();
+        const meta: TranslationSourceMeta = {
+            schemaVersion: 2,
+            sources: {},
+        };
+        for (const [sourceId, source] of Object.entries(raw.sources)) {
+            meta.sources[sourceId] = normalizeSourceRecord(source);
+        }
+        return meta;
     } catch {
         return createEmptyMeta();
     }

@@ -379,24 +379,33 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
         const basePath = path.normalize(i18n.app.vault.adapter.getBasePath());
 
         for (const plugin of plugins) {
+            const sources = sourceIndex.byPlugin[plugin.id] || [];
             const pluginDir = path.join(basePath, plugin.dir || '');
             const activeSourceId = sourceIndex.activeByPlugin[plugin.id] || null;
-            const langDoc = activeSourceId ? i18n.sourceManager.getSourceFilePath(activeSourceId) : '';
-            const sources = sourceIndex.byPlugin[plugin.id] || [];
+            const activeSource = activeSourceId ? i18n.sourceManager.getSource(activeSourceId) : null;
+            const selectedVersionSource = batchTranslationVersion
+                ? i18n.sourceManager.getSourceForPluginVersion(plugin.id, 'plugin', batchTranslationVersion)
+                : null;
+            const displaySource = batchTranslationVersion ? selectedVersionSource : activeSource;
+            const displaySourceId = displaySource?.id || null;
+            const langDoc = displaySourceId ? i18n.sourceManager.getSourceFilePath(displaySourceId) : '';
             const isLangDoc = sources.some(source => source.sourceFileExists !== false);
             const hasCurrentVersionTranslation = i18n.sourceManager.hasSourceForPluginVersion(plugin.id, 'plugin', currentExtractionVersion);
             const manifestDoc = path.join(pluginDir, 'manifest.json');
             const mainDoc = path.join(pluginDir, 'main.js');
 
             const state = i18n.stateManager.getPluginState(plugin.id);
-            const activeSource = activeSourceId ? i18n.sourceManager.getSource(activeSourceId) : null;
-            const translationFormatMark = isLangDoc ? activeSource?.translationFormatValid !== false : true;
-            const pendingTranslationCount = activeSource?.pendingTranslationCount || 0;
-            const translatedEntryCount = getTranslatedEntryCount(activeSource);
-            const totalTranslationCount = activeSource?.totalTranslationCount || 0;
-            const hasTranslationCounts = typeof activeSource?.pendingTranslationCount === 'number' && typeof activeSource?.totalTranslationCount === 'number';
-            const isTranslated = !!(isLangDoc && activeSourceId && translationFormatMark && hasTranslationCounts && isTranslationProcessingComplete(activeSource));
-            const hasFailedBatches = !!activeSourceId && failedSourceIds.has(activeSourceId) && !isTranslated;
+            const hasDisplaySourceFile = !!displaySource && displaySource.sourceFileExists !== false;
+            const translationFormatMark = hasDisplaySourceFile ? displaySource?.translationFormatValid !== false : true;
+            const pendingTranslationCount = displaySource?.pendingTranslationCount || 0;
+            const translatedEntryCount = getTranslatedEntryCount(displaySource);
+            const totalTranslationCount = displaySource?.totalTranslationCount || 0;
+            const hasTranslationCounts = typeof displaySource?.pendingTranslationCount === 'number' && typeof displaySource?.totalTranslationCount === 'number';
+            const isTranslated = !!(hasDisplaySourceFile && displaySourceId && translationFormatMark && hasTranslationCounts && isTranslationProcessingComplete(displaySource));
+            const hasFailedBatches = !!displaySourceId && failedSourceIds.has(displaySourceId) && !isTranslated;
+            const stateTranslationVersion = state?.translationVersion ? String(state.translationVersion) : '';
+            const displayTranslationVersion = displaySource?.translationVersion ? String(displaySource.translationVersion) : '';
+            const isAppliedForSource = !!(state?.isApplied && (!displayTranslationVersion || stateTranslationVersion === displayTranslationVersion));
 
             let statusColor: string = 'bg-muted-foreground';
             let statusText: string = t('Manager.Plugins.Status.ToExtract');
@@ -405,14 +414,12 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             let translationVersion = '';
             let supportedVersion = '';
 
-            if (isLangDoc && translationFormatMark && activeSource) {
-                translationVersion = activeSource.translationVersion || '';
-                supportedVersion = activeSource.supportedVersions || '';
-                mtime = activeSource.sourceFileMtime || activeSource.updatedAt || Date.now();
+            if (hasDisplaySourceFile && translationFormatMark && displaySource) {
+                translationVersion = displaySource.translationVersion || '';
+                supportedVersion = displaySource.supportedVersions || '';
+                mtime = displaySource.sourceFileMtime || displaySource.updatedAt || Date.now();
 
-                const isApplied = !!(state && state.isApplied);
-
-                if (isApplied && isTranslated) {
+                if (isAppliedForSource && isTranslated) {
                     statusColor = 'bg-green-500 dark:bg-green-600';
                     statusText = t('Manager.Plugins.Status.Applied');
                 } else if (hasFailedBatches) {
@@ -426,7 +433,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                     statusText = t('Manager.Plugins.Status.Untranslated');
                 }
                 statusDesc = `${t('Manager.Plugins.Labels.Mtime')}: ${formatTimestamp(mtime)}`;
-            } else if (isLangDoc && !translationFormatMark) {
+            } else if (hasDisplaySourceFile && !translationFormatMark) {
                 statusColor = 'bg-destructive';
                 statusText = t('Manager.Common.Errors.Error');
                 statusDesc = t('Manager.Common.Errors.ErrorDesc');
@@ -436,18 +443,18 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
                 statusColor,
                 statusText,
                 statusDesc,
-                isLangDoc,
+                isLangDoc: hasDisplaySourceFile,
                 hasCurrentVersionTranslation,
                 langDoc,
                 pluginDir,
                 sources,
-                activeSourceId,
+                activeSourceId: displaySourceId,
                 translationFormatMark,
                 hasFailedBatches,
-                hasFormatError: isLangDoc && !translationFormatMark,
+                hasFormatError: hasDisplaySourceFile && !translationFormatMark,
                 mainDoc,
                 manifestDoc,
-                isApplied: !!(state && state.isApplied),
+                isApplied: isAppliedForSource,
                 isTranslated,
                 pendingTranslationCount,
                 translatedEntryCount,
@@ -458,7 +465,7 @@ export const PluginManager: React.FC<PluginManagerProps> = ({ i18n, close }) => 
             };
         }
         return stats;
-    }, [plugins, i18n, refreshKey, sourceIndex, t, cloudEntriesByPlugin, failedSourceIds, currentExtractionVersion]);
+    }, [plugins, i18n, refreshKey, sourceIndex, t, cloudEntriesByPlugin, failedSourceIds, currentExtractionVersion, batchTranslationVersion]);
 
     const displayPlugins = useMemo(() => {
         let result = [...plugins];

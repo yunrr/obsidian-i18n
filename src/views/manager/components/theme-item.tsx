@@ -6,7 +6,7 @@ import { FolderOpen, FileOutput, XCircle, Loader2, MoreHorizontal, Pen, CloudDow
 import I18N from 'src/main';
 import { OBThemeManifest } from 'src/types';
 import { i18nOpen } from '../../../utils/common/general';
-import { getThemeTranslationSources, hasExtractedTranslationContent, calculateChecksum } from '../../../utils/translator/light';
+import { getThemeTranslationSources, hasExtractedTranslationContent } from '../../../utils/translator/light';
 import { openThemeSourceEditor } from '../utils/source-editor';
 import { getEffectiveExtractionSettings } from '../../../utils/translator/config';
 import {
@@ -135,31 +135,21 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
 
             const existingSource = sourceManager?.getAllSources().find(s => s.id === entry.id);
             if (existingSource) {
-                sourceManager?.saveSourceFile(existingSource.id, content);
-                sourceManager?.saveSource({
-                    ...existingSource,
-                    origin: 'cloud',
+                sourceManager?.saveCloudSourceFile(existingSource.id, content, {
+                    plugin: entry.plugin,
                     title: entry.title || existingSource.title,
-                    checksum: calculateChecksum(content),
+                    type: entry.type,
                     cloud: { owner, repo: repoName, hash: entry.hash },
-                    updatedAt: Date.now()
-                });
+                }, { activate: existingSource.isActive });
                 i18n.notice.successPrefix('Cloud', t('Cloud.Notices.UpdateSuccess' as any) || 'Update success');
             } else {
-                sourceManager?.saveSourceFile(entry.id, content);
                 const isOnly = !sourceManager?.getActiveSourceId(theme.name);
-                sourceManager?.saveSource({
-                    id: entry.id,
+                sourceManager?.saveCloudSourceFile(entry.id, content, {
                     plugin: entry.plugin,
                     title: entry.title || 'Unknown',
                     type: entry.type,
-                    origin: 'cloud',
-                    isActive: isOnly,
-                    checksum: calculateChecksum(content),
                     cloud: { owner, repo: repoName, hash: entry.hash },
-                    updatedAt: Date.now(),
-                    createdAt: Date.now()
-                });
+                }, { activate: isOnly });
                 i18n.notice.successPrefix('Cloud', t('Cloud.Notices.DownloadSuccess' as any) || 'Download success');
             }
             refreshParent();

@@ -13,8 +13,6 @@ import { useGlobalStoreInstance } from '~/utils/store/global';
 import { t } from '@/src/locales/index';
 import { CommitEntry, ManifestEntry } from '../types';
 import { cn } from '@/src/shadcn/lib/utils';
-import { calculateChecksum } from '@/src/utils/translator/light';
-import { TranslationSource } from '@/src/types';
 import { LoginRequired } from './login-required';
 
 /** 计算字符串的简单 hash (与 publish-tab 一致) */
@@ -174,17 +172,14 @@ export const HistoryTab: React.FC = () => {
             // 3. 同步到本地
             try {
                 const content = JSON.parse(previewContent);
-                i18n.sourceManager.saveSourceFile(entry.id, content);
-
                 const existingSource = i18n.sourceManager.getSource(entry.id);
                 if (existingSource) {
-                    const updatedSource: TranslationSource = {
-                        ...existingSource,
-                        checksum: calculateChecksum(content),
+                    i18n.sourceManager.saveCloudSourceFile(entry.id, content, {
+                        plugin: entry.plugin,
+                        title: entry.title || existingSource.title,
+                        type: entry.type,
                         cloud: { owner: username, repo: userRepo, hash: newHash },
-                        updatedAt: Date.now(),
-                    };
-                    i18n.sourceManager.saveSource(updatedSource);
+                    }, { activate: existingSource.isActive });
                 }
             } catch { /* 如果本地源不存在则忽略 */ }
 

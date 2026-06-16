@@ -45,41 +45,51 @@ export class SourceManager {
         try {
             if (fs.existsSync(this.metaPath)) {
                 const raw = fs.readJsonSync(this.metaPath);
-                // 自动迁移旧版本数据
-                if (raw.sources) {
-                    let needsSave = false;
-                    for (const source of Object.values(raw.sources) as any[]) {
-                        // 迁移 type → origin（旧版 type 值为 'cloud'|'local'）
-                        if (!source.origin && (source.type === 'cloud' || source.type === 'local')) {
-                            source.origin = source.type;
-                            source.type = 'plugin'; // 旧数据全部是插件翻译
-                            needsSave = true;
-                        }
-                        // 迁移 pluginId → plugin
-                        if ('pluginId' in source && !('plugin' in source)) {
-                            source.plugin = source.pluginId;
-                            delete source.pluginId;
-                            needsSave = true;
-                        }
-                        // 清理旧版字段；language/supportedVersions 现在作为本地索引保留。
-                        for (const field of ['version']) {
-                            if (field in source) {
-                                delete source[field];
-                                needsSave = true;
-                            }
-                        }
-                    }
-                    if (needsSave) {
-                        fs.ensureDirSync(this.sourcesDir);
-                        fs.writeJsonSync(this.metaPath, raw, { spaces: 2 });
-                    }
+                const { meta, changed } = this.normalizeLoadedMeta(raw);
+                if (changed) {
+                    fs.ensureDirSync(this.sourcesDir);
+                    fs.writeJsonSync(this.metaPath, meta, { spaces: 2 });
                 }
-                return raw;
+                return meta;
             }
         } catch (error) {
             console.error('[SourceManager] Failed to load meta:', error);
         }
         return JSON.parse(JSON.stringify(EMPTY_META));
+    }
+
+    private normalizeSourceRecord(source: any): TranslationSource {
+        let next = { ...source };
+        if (!next.origin && (next.type === 'cloud' || next.type === 'local')) {
+            next.origin = next.type;
+            next.type = 'plugin';
+        }
+        if ('pluginId' in next && !('plugin' in next)) {
+            next.plugin = next.pluginId;
+        }
+        delete next.pluginId;
+        delete next.version;
+        return next as TranslationSource;
+    }
+
+    private normalizeLoadedMeta(raw: any): { meta: TranslationSourceMeta; changed: boolean } {
+        if (!raw?.sources) {
+            return { meta: JSON.parse(JSON.stringify(EMPTY_META)), changed: false };
+        }
+
+        let changed = false;
+        if (raw.schemaVersion !== 2) {
+            raw.schemaVersion = 2;
+            changed = true;
+        }
+        for (const [sourceId, source] of Object.entries(raw.sources) as Array<[string, any]>) {
+            const normalized = this.normalizeSourceRecord(source);
+            if (JSON.stringify(normalized) !== JSON.stringify(source)) {
+                raw.sources[sourceId] = normalized;
+                changed = true;
+            }
+        }
+        return { meta: raw as TranslationSourceMeta, changed };
     }
 
     /**
@@ -114,6 +124,32 @@ export class SourceManager {
             bucket.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
         }
         this.sourceVersionIndex = index;
+    }
+
+    private buildSourceFromContent(
+        sourceId: string,
+        content: any,
+        source: Partial<TranslationSource>,
+        existing?: TranslationSource | null,
+    ): TranslationSource {
+        const now = Date.now();
+        const normalizedExisting = existing ? this.normalizeSourceRecord(existing) : null;
+        return {
+            ...(normalizedExisting || {}),
+            ...source,
+            id: sourceId,
+            plugin: source.plugin || normalizedExisting?.plugin || content?.metadata?.plugin || sourceId,
+            title: source.title || content?.metadata?.title || normalizedExisting?.title || t('func.extract_local'),
+            type: source.type || normalizedExisting?.type || 'plugin',
+            origin: source.origin || normalizedExisting?.origin || 'local',
+            isActive: source.isActive ?? normalizedExisting?.isActive ?? false,
+            checksum: calculateChecksum(content),
+            ...this.getMetadataIndex(content),
+            sourceFileExists: true,
+            sourceFileMtime: this.getSourceFileMtime(sourceId),
+            createdAt: normalizedExisting?.createdAt || source.createdAt || now,
+            updatedAt: now,
+        } as TranslationSource;
     }
 
     private getMetadataIndex(content: any): Pick<TranslationSource, 'translationVersion' | 'supportedVersions' | 'language' | 'description' | 'totalTranslationCount' | 'pendingTranslationCount' | 'translatedEntryCount' | 'processedTranslationCount' | 'unprocessedTranslationCount' | 'translationProcessingComplete' | 'translationFormatValid' | 'metadataIndexedAt'> {
@@ -349,19 +385,20 @@ export class SourceManager {
     private upsertSourceInMemory(source: TranslationSource): void {
         const now = Date.now();
         const existing = this.meta.sources[source.id];
+        const normalizedSource = this.normalizeSourceRecord(source);
 
         if (existing) {
             this.meta.sources[source.id] = {
-                ...existing,
-                ...source,
+                ...this.normalizeSourceRecord(existing),
+                ...normalizedSource,
                 updatedAt: now
             };
             return;
         }
 
         this.meta.sources[source.id] = {
-            ...source,
-            createdAt: source.createdAt || now,
+            ...normalizedSource,
+            createdAt: normalizedSource.createdAt || now,
             updatedAt: now
         };
     }
@@ -533,6 +570,27 @@ export class SourceManager {
             };
             this.saveMeta();
         }
+    }
+
+    saveCloudSourceFile(
+        sourceId: string,
+        content: any,
+        cloudSource: Pick<TranslationSource, 'plugin' | 'type' | 'title' | 'cloud'> & Partial<TranslationSource>,
+        options?: { activate?: boolean },
+    ): void {
+        const filePath = path.join(this.sourcesDir, `${sourceId}.${TRANSLATION_FILE_EXTENSION}`);
+        saveTranslationFile(filePath, content);
+        const existing = this.meta.sources[sourceId] || null;
+        const source = this.buildSourceFromContent(sourceId, content, {
+            ...cloudSource,
+            origin: 'cloud',
+            isActive: options?.activate ?? existing?.isActive ?? false,
+        }, existing);
+        this.upsertSourceInMemory(source);
+        if (options?.activate) {
+            this.setActiveInMemory(sourceId, true);
+        }
+        this.saveMeta();
     }
 
     /**

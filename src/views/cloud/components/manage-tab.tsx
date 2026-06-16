@@ -16,8 +16,6 @@ import { SUPPORTED_LANGUAGES } from '@/src/constants/languages';
 import { Badge } from '@/src/shadcn/ui/badge';
 import { ManifestEntry, getCloudFilePath } from '../types';
 import { cn } from '@/src/shadcn/lib/utils';
-import { calculateChecksum } from '@/src/utils/translator/light';
-import { TranslationSource } from '@/src/types';
 import * as fs from 'fs-extra';
 import { LoginRequired } from './login-required';
 
@@ -467,37 +465,14 @@ export const ManageTab: React.FC = () => {
                 throw new Error(t('Cloud.Errors.InitFailed'));
             }
 
-            // 直接保存/覆盖
-            manager.saveSourceFile(entry.id, content);
-
-            // 更新或创建元数据
             const existingSource = manager.getAllSources().find(s => s.id === entry.id);
-            if (existingSource) {
-                const updatedSource: TranslationSource = {
-                    ...existingSource,
-                    origin: 'cloud',
-                    title: entry.title || existingSource.title,
-                    checksum: calculateChecksum(content),
-                    cloud: { owner: username, repo: userRepo, hash: entry.hash },
-                    updatedAt: Date.now(),
-                };
-                manager.saveSource(updatedSource);
-            } else {
-                const sourceInfo: TranslationSource = {
-                    id: entry.id,
-                    plugin: entry.plugin,
-                    title: entry.title || t('Cloud.Labels.UnnamedTranslation'),
-                    type: entry.type,
-                    origin: 'cloud',
-                    isActive: false,
-                    checksum: calculateChecksum(content),
-                    cloud: { owner: username, repo: userRepo, hash: entry.hash },
-                    updatedAt: Date.now(),
-                    createdAt: Date.now(),
-                };
-                const shouldActivate = !manager.hasAnySources(entry.plugin);
-                manager.saveSource(sourceInfo, { activate: shouldActivate });
-            }
+            const shouldActivate = existingSource?.isActive ?? !manager.hasAnySources(entry.plugin);
+            manager.saveCloudSourceFile(entry.id, content, {
+                plugin: entry.plugin,
+                title: entry.title || existingSource?.title || t('Cloud.Labels.UnnamedTranslation'),
+                type: entry.type,
+                cloud: { owner: username, repo: userRepo, hash: entry.hash },
+            }, { activate: shouldActivate });
 
             // 触发列表状态刷新
             useGlobalStoreInstance.getState().triggerSourceUpdate();

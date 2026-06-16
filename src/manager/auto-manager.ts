@@ -2,8 +2,7 @@ import I18N from '../main';
 import { Notice } from 'obsidian';
 import { t } from '../locales';
 import { RegistryItem, CommunityStatsData, ManifestEntry, getCloudFilePath } from '../views/cloud/types';
-import { calculateChecksum } from '../utils/translator/translation';
-import { TranslationSource, IState } from '../types';
+import { IState } from '../types';
 import { RegistryCacheManager } from './registry-cache';
 import { useAutoStore } from '../views/manager/auto-store';
 import { HistoryManager } from './history-manager';
@@ -625,21 +624,12 @@ export class AutoManager {
 
             if (existing) this.i18n.backupManager.backupTranslationSync(existing.id, manager.sourcesDir);
 
-            manager.saveSourceFile(match.entry.id, content);
-            const sourceInfo: TranslationSource = {
-                id: match.entry.id,
+            manager.saveCloudSourceFile(match.entry.id, content, {
                 plugin: match.entry.plugin,
                 title: match.entry.title,
                 type: match.entry.type,
-                origin: 'cloud',
-                isActive: true,
-                checksum: calculateChecksum(content),
                 cloud: { owner, repo, hash: match.entry.hash },
-                updatedAt: Date.now(),
-                createdAt: existing?.createdAt || Date.now(),
-            };
-
-            manager.saveSource(sourceInfo, { activate: true });
+            }, { activate: true });
 
             return type === 'theme'
                 ? await this.i18n.injectorManager.applyToTheme(match.entry.plugin)
