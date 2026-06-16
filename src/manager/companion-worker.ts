@@ -119,6 +119,7 @@ const rustOwnedTaskTypes = new Set<string>([
     'cloud-prepare-backup',
     'cloud-restore-all',
     'cloud-backup-all',
+    'cloud-publish-diff-sources',
 ] satisfies Array<CompanionBatchTaskType | CompanionAsyncTaskType>);
 
 type JsonRecord = Record<string, any>;

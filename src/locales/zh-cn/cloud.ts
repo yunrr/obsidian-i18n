@@ -31,7 +31,10 @@ export default {
         CreateNewRepo: "创建新仓库",
         Delete: "删除",
         Logout: "退出登录",
-        ResumeLastBackup: "恢复上次备份"
+        ResumeLastBackup: "恢复上次备份",
+        BulkReplaceChanged: "批量替换云端差异",
+        ReplaceChangedCloud: "替换差异项",
+        ResumeBulkReplace: "继续替换"
     },
     Status: {
         Published: "已发布",
@@ -63,6 +66,8 @@ export default {
         LoadingContent: "加载版本内容...",
         LoadingDiff: "正在加载并对比数据...",
         UploadingFile: "正在上传翻译文件...",
+        BulkReplacingCloud: "正在替换 {{count}} 个云端翻译...",
+        ResumingBulkReplace: "正在继续替换云端差异...",
         UpdatingIndex: "正在更新索引文件...",
         Processing: "正在处理",
         PreparingData: "正在准备待备份数据...",
@@ -136,6 +141,8 @@ export default {
         NoReadme: "未找到 README.md或者文件为空",
         NoReadmeDesc: "该仓库作者尚未提供介绍文档",
         AllLatestDesc: "您订阅的所有翻译库内容在本地均为最新版本",
+        BulkReplaceChangedDesc: "检测到 {{count}} 个已发布翻译与本地文件不同，将用本地版本覆盖云端并统一更新索引。",
+        NoChangedCloudSources: "所有已发布翻译都已与本地文件保持一致。",
         SelectHistoryEntry: "请从我的翻译列表中选择一个条目查看历史",
         LoadingCommits: "正在获取提交历史...",
         NoCommits: "该文件暂无提交记录",
@@ -280,7 +287,8 @@ export default {
         DeleteConfirmSingle: "确定要从云端删除此翻译包吗？\n删除后将无法恢复。",
         RollbackConfirm: "确定要将此文件回滚到选定的历史版本吗？这会产生一条新的提交记录并覆盖当前云端版本。",
         ConfirmUpdate: "确认要更新此翻译包吗？",
-        ConfirmRestoreAll: "确定要从云端恢复全部翻译吗？\n本地已有的同名翻译源将被覆盖。"
+        ConfirmRestoreAll: "确定要从云端恢复全部翻译吗？\n本地已有的同名翻译源将被覆盖。",
+        ConfirmBulkReplace: "确定要用本地文件覆盖 {{count}} 个已有云端翻译吗？完成后会统一更新 metadata.json。"
     },
     Errors: {
         ManifestFormatError: "metadata.json 格式错误",
@@ -377,6 +385,8 @@ export default {
         UploadSuccessItem: "✅ {{title}} 上传成功",
         BackupCompleteStat: "备份完成: 已上传 {{uploaded}} 个，跳过 {{skipped}} 个",
         BackupSuccessCount: "成功备份了 {{count}} 个翻译包",
+        BulkReplaceSuccessCount: "已替换 {{count}} 个云端翻译，并更新索引。",
+        FoundBulkReplaceCheckpoint: "发现未完成的替换任务：已上传 {{current}}/{{count}}",
         FoundCheckpoint: "发现上次未完成的备份 ({{date}})",
         FoundCloudSources: "在云端发现 {{count}} 个翻译源",
         ItemsToUpload: "检测到有 {{count}} 个项目需要上传到云端",

@@ -17,6 +17,7 @@ import { ScrollArea } from '~/shadcn/ui/scroll-area';
 import { Badge } from '~/shadcn/ui/badge';
 import { cn } from '~/shadcn/lib/utils';
 import { MarkdownViewer } from './markdown-viewer';
+import { translationFileHash } from '@/src/utils/translation-hash';
 
 type UpdateStatus = 'not_downloaded' | 'up_to_date' | 'update_available' | 'fork_available';
 
@@ -59,6 +60,16 @@ export const ExploreTab: React.FC = () => {
     const setIsCheckingUpdates = useCloudStore.use.setIsCheckingUpdates();
 
     const [installedItems, setInstalledItems] = useState<InstalledItem[]>([]);
+
+    const isSourceOutdatedFromEntry = useCallback((source: any, entry: ManifestEntry) => {
+        try {
+            const filePath = i18n.sourceManager.getSourceFilePath(source.id);
+            if (!filePath) return true;
+            return translationFileHash(filePath) !== entry.hash;
+        } catch {
+            return true;
+        }
+    }, [i18n.sourceManager]);
 
     // 获取已安装的插件和主题
     useEffect(() => {
@@ -128,7 +139,7 @@ export const ExploreTab: React.FC = () => {
                                 s.cloud?.repo === repo
                             );
 
-                            if (local && local.cloud?.hash !== remoteEntry.hash) {
+                            if (local && isSourceOutdatedFromEntry(local, remoteEntry)) {
                                 foundOutdated.push({
                                     sourceId: local.id,
                                     pluginId: local.plugin,
@@ -157,7 +168,7 @@ export const ExploreTab: React.FC = () => {
         } finally {
             setIsCheckingUpdates(false);
         }
-    }, [i18n, savedRepos, isCheckingUpdates, setOutdatedSources, setIsCheckingUpdates, t]);
+    }, [i18n, savedRepos, isCheckingUpdates, setOutdatedSources, setIsCheckingUpdates, t, isSourceOutdatedFromEntry]);
 
     /**
      * 一键更新所有待更新项
@@ -217,9 +228,9 @@ export const ExploreTab: React.FC = () => {
 
         if (!matchedSource) return 'not_downloaded';
         if (matchedSource.origin === 'local' || matchedSource.cloud?.owner !== owner || matchedSource.cloud?.repo !== repo) return 'fork_available';
-        if (matchedSource.cloud?.hash !== entry.hash) return 'update_available';
+        if (isSourceOutdatedFromEntry(matchedSource, entry)) return 'update_available';
         return 'up_to_date';
-    }, [i18n, targetRepoAddress, sourceUpdateTick]);
+    }, [i18n, targetRepoAddress, sourceUpdateTick, isSourceOutdatedFromEntry]);
 
     React.useEffect(() => {
         if (i18n.settings.cloudRepos) {

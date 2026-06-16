@@ -357,6 +357,7 @@ export interface CompanionCloudResponse {
     restored?: number;
     skipped?: number;
     total?: number;
+    updated?: number;
     error?: string;
 }
 
@@ -635,6 +636,6 @@ export interface CompanionThemeFailureRetryPayload {
     totalItems?: number;
 }
 
-export type CompanionAsyncTaskType = 'plugin-batch-extract' | 'theme-batch-extract' | 'plugin-batch-translate' | 'theme-batch-translate' | 'plugin-failure-retry' | 'theme-failure-retry' | 'cloud-backup-all';
+export type CompanionAsyncTaskType = 'plugin-batch-extract' | 'theme-batch-extract' | 'plugin-batch-translate' | 'theme-batch-translate' | 'plugin-failure-retry' | 'theme-failure-retry' | 'cloud-backup-all' | 'cloud-publish-diff-sources';
 
 export type CompanionBatchTaskType = 'plugin-extract' | 'theme-extract' | 'plugin-translate' | 'theme-translate' | 'plugin-retry' | 'theme-retry' | 'ast-replace' | 'code-extract' | 'plugin-render-translation' | 'plugin-diagnose-render-probe' | 'plugin-apply-translation' | 'plugin-diagnose-cleanup-start' | 'plugin-diagnose-cleanup-step' | 'plugin-diagnose-cleanup-cancel' | 'plugin-diagnose-cleanup-apply' | 'plugin-diagnose-recovery-restore' | 'theme-apply-translation' | 'source-read' | 'source-export' | 'source-import' | 'source-remove' | 'source-set-active' | 'source-index' | 'source-clear-batch-records' | CompanionCloudTaskType;

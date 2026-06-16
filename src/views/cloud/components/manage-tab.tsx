@@ -18,18 +18,7 @@ import { ManifestEntry, getCloudFilePath } from '../types';
 import { cn } from '@/src/shadcn/lib/utils';
 import * as fs from 'fs-extra';
 import { LoginRequired } from './login-required';
-
-/** 计算字符串的简单 hash (MD5-like hex)，与 upload-tab 保持一致 */
-function simpleHash(str: string): string {
-    let hash = 0;
-    for (let i = 0; i < str.length; i++) {
-        const char = str.charCodeAt(i);
-        hash = ((hash << 5) - hash) + char;
-        hash = hash & hash; // Convert to 32bit integer
-    }
-    const hex = Math.abs(hash).toString(16).padStart(8, '0');
-    return hex.repeat(4); // 填充到 32 字符
-}
+import { translationFileHash } from '@/src/utils/translation-hash';
 
 interface InstalledItem {
     id: string;
@@ -504,8 +493,7 @@ export const ManageTab: React.FC = () => {
             const filePath = manager.getSourceFilePath(matchedSource.id);
             if (!filePath || !fs.existsSync(filePath)) return 'not_downloaded';
 
-            const content = fs.readFileSync(filePath, 'utf-8');
-            const localHash = simpleHash(content);
+            const localHash = translationFileHash(filePath);
             if (localHash === entry.hash) return 'up_to_date';
 
             return 'update_available';

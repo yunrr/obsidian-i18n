@@ -9,6 +9,7 @@ import { i18nOpen } from '../../../utils/common/general';
 import { getThemeTranslationSources, hasExtractedTranslationContent } from '../../../utils/translator/light';
 import { openThemeSourceEditor } from '../utils/source-editor';
 import { getEffectiveExtractionSettings } from '../../../utils/translator/config';
+import { translationFileHash } from '../../../utils/translation-hash';
 import {
     Button,
     Select,
@@ -85,6 +86,18 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
 
     const sourceManager = i18n.sourceManager;
     const [downloadingCloudId, setDownloadingCloudId] = useState<string | null>(null);
+
+    const isCloudEntryOutdated = (entry: any) => {
+        const source = sources.find(s => s.id === entry.id);
+        if (!source) return false;
+        try {
+            const filePath = sourceManager.getSourceFilePath(source.id);
+            if (!filePath || !fs.existsSync(filePath)) return true;
+            return translationFileHash(filePath) !== entry.hash;
+        } catch {
+            return true;
+        }
+    };
 
     const setActiveSource = async (sourceId: string) => {
         try {
@@ -348,7 +361,7 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
                                         <DropdownMenuContent align="end" className="w-56 shadow-2xl backdrop-blur-md bg-background/95 border-border/40">
                                             {cloudEntries.map(entry => {
                                                 const isDownloaded = sources.some(s => s.id === entry.id);
-                                                const isOutdated = sources.some(s => s.id === entry.id && s.cloud?.hash !== entry.hash);
+                                                const isOutdated = isCloudEntryOutdated(entry);
                                                 return (
                                                     <DropdownMenuItem key={entry.id} onClick={() => handleCloudDownload(entry)} className="text-[11px] py-1.5 flex items-center justify-between">
                                                         <div className="flex items-center truncate">
@@ -519,7 +532,7 @@ export const ThemeItem: React.FC<ThemeItemProps> = React.memo(({ theme, i18n, da
                                 <DropdownMenuContent align="end" className="w-56 shadow-2xl backdrop-blur-md bg-background/95 border-border/40">
                                     {cloudEntries.map(entry => {
                                         const isDownloaded = sources.some(s => s.id === entry.id);
-                                        const isOutdated = sources.some(s => s.id === entry.id && s.cloud?.hash !== entry.hash);
+                                        const isOutdated = isCloudEntryOutdated(entry);
                                         return (
                                             <DropdownMenuItem key={entry.id} onClick={() => handleCloudDownload(entry)} className="text-[12px] py-2 flex items-center justify-between">
                                                 <div className="flex items-center truncate">

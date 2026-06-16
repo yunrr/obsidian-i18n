@@ -453,6 +453,8 @@ struct CloudTaskPayload {
     #[serde(default)]
     sources: Vec<Value>,
     #[serde(default)]
+    source_ids: Vec<String>,
+    #[serde(default)]
     manifest: Vec<Value>,
     #[serde(default)]
     overwrite: bool,
@@ -1433,6 +1435,9 @@ async fn run_async_task(
         "plugin-failure-retry" => handle_plugin_failure_retry(&state, task.clone(), payload).await,
         "theme-failure-retry" => handle_theme_failure_retry(&state, task.clone(), payload).await,
         "cloud-backup-all" => handle_cloud_backup_all(&state, task.clone(), payload).await,
+        "cloud-publish-diff-sources" => {
+            handle_cloud_publish_diff_sources_async(&state, task.clone(), payload).await
+        }
         _ => Err(anyhow!("未知任务类型: {task_type}")),
     };
 
@@ -2743,10 +2748,6 @@ async fn handle_cloud_publish_source(state: &AppState, payload: Value) -> Result
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("plugin");
-    let plugin = source
-        .get("plugin")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
     let remote_path = cloud_file_path(source_id, source_type);
     let message_title = payload
         .title
@@ -2787,64 +2788,18 @@ async fn handle_cloud_publish_source(state: &AppState, payload: Value) -> Result
 
     let (mut manifest, manifest_sha) = fetch_manifest_with_sha(state, &payload).await?;
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let existing_index = manifest
-        .iter()
-        .position(|entry| entry.get("id").and_then(Value::as_str) == Some(source_id));
-    let created_at = existing_index
-        .and_then(|index| manifest[index].get("created_at").cloned())
-        .unwrap_or_else(|| Value::String(now.clone()));
-    let translation_version = content
-        .pointer("/metadata/version")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .or(payload.version.as_deref())
-        .unwrap_or_default();
-    let supported_versions = content
-        .pointer("/metadata/supportedVersions")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .or(payload.version.as_deref())
-        .unwrap_or_default();
-    let title = payload.title.clone().unwrap_or_else(|| {
-        source
-            .get("title")
-            .and_then(Value::as_str)
-            .unwrap_or(source_id)
-            .to_string()
-    });
-    let description = payload.description.clone().unwrap_or_default();
-    let mut entry = json!({
-        "id": source_id,
-        "plugin": plugin,
-        "language": payload.language,
-        "version": translation_version,
-        "supported_versions": supported_versions,
-        "title": title,
-        "description": description,
-        "hash": hash,
-        "created_at": created_at,
-        "updated_at": now,
-        "type": source_type,
-    });
-    if let Some(index) = existing_index {
-        let existing = manifest[index].clone();
-        merge_object(
-            &mut entry,
-            &existing,
-            &["id", "plugin", "language", "type", "created_at"],
-        );
-        manifest[index] = entry;
-        manifest = manifest
-            .into_iter()
-            .enumerate()
-            .filter(|(item_index, item)| {
-                *item_index == index || item.get("id").and_then(Value::as_str) != Some(source_id)
-            })
-            .map(|(_, item)| item)
-            .collect();
-    } else {
-        manifest.push(entry);
-    }
+    let entry = manifest_entry_from_source(
+        source_id,
+        &source,
+        &content,
+        &payload.language,
+        &hash,
+        &now,
+        payload.title.as_deref(),
+        payload.description.as_deref(),
+        payload.version.as_deref(),
+    );
+    merge_manifest_entry(&mut manifest, source_id, entry);
 
     upload_manifest(state, &payload, &manifest, manifest_sha).await?;
     let mut updated_source = source.clone();
@@ -2854,6 +2809,298 @@ async fn handle_cloud_publish_source(state: &AppState, payload: Value) -> Result
     merge_metadata_index(&mut updated_source, &content, true);
     save_source_entry(state, &paths, source_id, updated_source.clone(), false).await?;
     Ok(json!({ "state": true, "manifest": manifest, "source": updated_source }))
+}
+
+async fn handle_cloud_prepare_publish_diff_sources(
+    state: &AppState,
+    payload: Value,
+) -> Result<Value> {
+    let payload: CloudTaskPayload = serde_json::from_value(payload)?;
+    if token_missing(&payload.token) {
+        return Ok(json!({ "state": false, "error": "GitHub Token 缺失" }));
+    }
+    let paths = paths(&payload.persistence.base_path);
+    let meta = load_meta(&paths);
+    let source_map = meta
+        .get("sources")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("翻译源不存在"))?;
+    let (mut manifest, _manifest_sha) = fetch_manifest_with_sha(state, &payload).await?;
+    let source_ids = payload
+        .source_ids
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    if source_ids.is_empty() {
+        return Ok(json!({ "state": true, "data": { "filesToUpload": [], "sourcesToSave": [], "manifest": manifest, "skipped": 0 }, "total": 0 }));
+    }
+
+    let mut files = Vec::<GithubBatchUploadFile>::new();
+    let mut updated_sources = Vec::<Value>::new();
+    let mut skipped = 0usize;
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+    for source_id in &source_ids {
+        let Some(source) = source_map.get(source_id.as_str()).cloned() else {
+            skipped += 1;
+            continue;
+        };
+        let Some(content) = read_translation(&paths, source_id) else {
+            skipped += 1;
+            continue;
+        };
+        let content_text = serde_json::to_string_pretty(&content)?;
+        let hash = simple_hash(&content_text);
+        let source_type = source
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("plugin");
+        let is_different = manifest.iter().any(|entry| {
+            entry.get("id").and_then(Value::as_str) == Some(source_id.as_str())
+                && entry.get("hash").and_then(Value::as_str) != Some(hash.as_str())
+        });
+        if !is_different {
+            skipped += 1;
+            continue;
+        }
+
+        let entry = manifest_entry_from_source(
+            source_id,
+            &source,
+            &content,
+            &payload.language,
+            &hash,
+            &now,
+            None,
+            None,
+            None,
+        );
+        merge_manifest_entry(&mut manifest, source_id, entry);
+        files.push(GithubBatchUploadFile {
+            path: cloud_file_path(source_id, source_type),
+            content: content_text,
+        });
+
+        let mut updated_source = source.clone();
+        updated_source["origin"] = json!("cloud");
+        updated_source["cloud"] =
+            json!({ "owner": payload.owner, "repo": payload.repo, "hash": hash });
+        updated_source["updatedAt"] = json!(now_ms());
+        merge_metadata_index(&mut updated_source, &content, true);
+        updated_sources.push(updated_source);
+    }
+
+    if files.is_empty() {
+        return Ok(json!({ "state": true, "data": { "filesToUpload": [], "sourcesToSave": [], "manifest": manifest, "skipped": skipped }, "total": source_ids.len() }));
+    }
+
+    Ok(json!({
+        "state": true,
+        "data": {
+            "filesToUpload": files,
+            "sourcesToSave": updated_sources,
+            "manifest": manifest,
+            "skipped": skipped,
+        },
+        "total": payload.source_ids.len(),
+    }))
+}
+
+async fn handle_cloud_publish_diff_sources_async(
+    state: &AppState,
+    task: Arc<TaskRuntime>,
+    payload: Value,
+) -> Result<()> {
+    let payload: CloudTaskPayload = serde_json::from_value(payload)?;
+    if token_missing(&payload.token) {
+        bail!("GitHub Token 缺失");
+    }
+    let paths = paths(&payload.persistence.base_path);
+    let checkpoint_path = cloud_publish_diff_checkpoint_path(&paths);
+    let mut manifest = Vec::new();
+    let mut files_to_upload = Vec::<GithubBatchUploadFile>::new();
+    let mut sources_to_save = Vec::<Value>::new();
+    let mut current_idx = 0usize;
+    let mut skipped = 0usize;
+
+    if payload.resume {
+        if let Some(checkpoint) = load_backup_checkpoint_from(&checkpoint_path) {
+            files_to_upload = checkpoint_files(&checkpoint);
+            sources_to_save = checkpoint
+                .get("sourcesToSave")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            manifest = checkpoint
+                .get("manifest")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            current_idx = checkpoint
+                .get("currentIdx")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            skipped = checkpoint
+                .get("skipped")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+        }
+    }
+
+    if files_to_upload.is_empty() && current_idx == 0 {
+        touch_progress(&task, json!({ "currentLabel": "读取云端索引" })).await;
+        let prepared =
+            handle_cloud_prepare_publish_diff_sources(state, serde_json::to_value(&payload)?)
+                .await?;
+        if !prepared
+            .get("state")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            bail!(
+                "{}",
+                prepared
+                    .get("error")
+                    .or_else(|| prepared.get("data"))
+                    .unwrap_or(&Value::Null)
+            );
+        }
+        let data = prepared.get("data").cloned().unwrap_or_else(|| json!({}));
+        files_to_upload = checkpoint_files(&data);
+        sources_to_save = data
+            .get("sourcesToSave")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        manifest = data
+            .get("manifest")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        skipped = data
+            .get("skipped")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+    }
+
+    let total = files_to_upload.len();
+    touch_progress(
+        &task,
+        json!({
+            "totalResources": total,
+            "totalItems": total,
+            "processedResources": current_idx.min(total),
+            "processedItems": current_idx.min(total),
+            "successCount": current_idx.min(total),
+            "skippedCount": skipped,
+        }),
+    )
+    .await;
+
+    if total == 0 {
+        clear_backup_checkpoint_at(&checkpoint_path)?;
+        bump_record_revision(&task).await;
+        return Ok(());
+    }
+
+    current_idx = current_idx.min(total);
+    while current_idx < total {
+        ensure_not_cancelled(&task).await?;
+        let end = (current_idx + CLOUD_BACKUP_CHUNK_SIZE).min(total);
+        let chunk = files_to_upload[current_idx..end].to_vec();
+        let batch_index = current_idx / CLOUD_BACKUP_CHUNK_SIZE + 1;
+        let batch_total = total.div_ceil(CLOUD_BACKUP_CHUNK_SIZE);
+        touch_progress(
+            &task,
+            json!({
+                "currentLabel": format!("上传批次 {batch_index}/{batch_total}"),
+                "processedResources": current_idx,
+                "processedItems": current_idx,
+            }),
+        )
+        .await;
+
+        let upload = github_batch_upload_files(
+            state,
+            &GithubWriteRequest {
+                operation: "batchUploadFiles".to_string(),
+                token: payload.token.clone(),
+                owner: Some(payload.owner.clone()),
+                repo: Some(payload.repo.clone()),
+                name: None,
+                path: None,
+                content: None,
+                message: Some(format!(
+                    "Bulk replace changed translations ({batch_index}/{batch_total})"
+                )),
+                branch: Some(payload.branch.clone()),
+                sha: None,
+                title: None,
+                body: None,
+                label: None,
+                target_owner: None,
+                target_repo: None,
+                base_tree: None,
+                tree_data: None,
+                tree: None,
+                parents: None,
+                r#ref: None,
+                files: Some(chunk),
+                timeout_ms: None,
+            },
+        )
+        .await?;
+        if !upload.state {
+            save_backup_checkpoint_to(
+                &checkpoint_path,
+                &files_to_upload,
+                &sources_to_save,
+                &manifest,
+                total,
+                current_idx,
+                skipped,
+            )?;
+            bump_record_revision(&task).await;
+            bail!("{}", upload.data);
+        }
+
+        current_idx = end;
+        touch_progress(
+            &task,
+            json!({
+                "processedResources": current_idx,
+                "processedItems": current_idx,
+                "successCount": current_idx,
+                "skippedCount": skipped,
+            }),
+        )
+        .await;
+        save_backup_checkpoint_to(
+            &checkpoint_path,
+            &files_to_upload,
+            &sources_to_save,
+            &manifest,
+            total,
+            current_idx,
+            skipped,
+        )?;
+        bump_record_revision(&task).await;
+    }
+
+    ensure_not_cancelled(&task).await?;
+    touch_progress(&task, json!({ "currentLabel": "更新云端索引" })).await;
+    upload_manifest(state, &payload, &manifest, None).await?;
+
+    ensure_not_cancelled(&task).await?;
+    touch_progress(&task, json!({ "currentLabel": "同步本地元数据" })).await;
+    save_backup_sources(state, &paths, &sources_to_save).await?;
+    bump_source_revision(&task).await;
+    clear_backup_checkpoint_at(&checkpoint_path)?;
+    bump_record_revision(&task).await;
+    Ok(())
 }
 
 async fn handle_cloud_download_source(state: &AppState, payload: Value) -> Result<Value> {
@@ -3237,7 +3484,11 @@ async fn handle_cloud_backup_all(
 }
 
 fn load_backup_checkpoint(paths: &PersistencePaths) -> Option<Value> {
-    fs::read_to_string(&paths.checkpoint_path)
+    load_backup_checkpoint_from(&paths.checkpoint_path)
+}
+
+fn load_backup_checkpoint_from(path: &Path) -> Option<Value> {
+    fs::read_to_string(path)
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
 }
@@ -3250,25 +3501,58 @@ fn save_backup_checkpoint(
     total: usize,
     current_idx: usize,
 ) -> Result<()> {
-    write_json_pretty(
+    save_backup_checkpoint_to(
         &paths.checkpoint_path,
+        files_to_upload,
+        sources_to_save,
+        manifest,
+        total,
+        current_idx,
+        0,
+    )
+}
+
+fn save_backup_checkpoint_to(
+    path: &Path,
+    files_to_upload: &[GithubBatchUploadFile],
+    sources_to_save: &[Value],
+    manifest: &[Value],
+    total: usize,
+    current_idx: usize,
+    skipped: usize,
+) -> Result<()> {
+    write_json_pretty(
+        path,
         &json!({
             "filesToUpload": files_to_upload,
             "sourcesToSave": sources_to_save,
             "manifest": manifest,
             "total": total,
             "currentIdx": current_idx,
+            "skipped": skipped,
             "timestamp": now_ms(),
         }),
     )
 }
 
 fn clear_backup_checkpoint(paths: &PersistencePaths) -> Result<()> {
-    match fs::remove_file(&paths.checkpoint_path) {
+    clear_backup_checkpoint_at(&paths.checkpoint_path)
+}
+
+fn clear_backup_checkpoint_at(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+fn cloud_publish_diff_checkpoint_path(paths: &PersistencePaths) -> PathBuf {
+    paths
+        .checkpoint_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("publish-diff-checkpoint.json")
 }
 
 fn checkpoint_files(value: &Value) -> Vec<GithubBatchUploadFile> {
@@ -3555,6 +3839,77 @@ fn cloud_file_path(source_id: &str, source_type: &str) -> String {
         "plugins"
     };
     format!("{dir}/{source_id}.json")
+}
+
+fn manifest_entry_from_source(
+    source_id: &str,
+    source: &Value,
+    content: &Value,
+    language: &str,
+    hash: &str,
+    now: &str,
+    title_override: Option<&str>,
+    description_override: Option<&str>,
+    version_override: Option<&str>,
+) -> Value {
+    let translation_version = content
+        .pointer("/metadata/version")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .or(version_override)
+        .unwrap_or_default();
+    let supported_versions = content
+        .pointer("/metadata/supportedVersions")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .or(version_override)
+        .unwrap_or_default();
+    let title = title_override
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| source.get("title").and_then(Value::as_str))
+        .unwrap_or(source_id);
+    let description = description_override
+        .or_else(|| content.pointer("/metadata/description").and_then(Value::as_str))
+        .unwrap_or_default();
+
+    json!({
+        "id": source_id,
+        "plugin": source.get("plugin").and_then(Value::as_str).unwrap_or_default(),
+        "language": language,
+        "version": translation_version,
+        "supported_versions": supported_versions,
+        "title": title,
+        "description": description,
+        "hash": hash,
+        "created_at": now,
+        "updated_at": now,
+        "type": source.get("type").and_then(Value::as_str).unwrap_or("plugin"),
+    })
+}
+
+fn merge_manifest_entry(manifest: &mut Vec<Value>, source_id: &str, mut entry: Value) {
+    let existing_index = manifest
+        .iter()
+        .position(|item| item.get("id").and_then(Value::as_str) == Some(source_id));
+    if let Some(index) = existing_index {
+        let existing = manifest[index].clone();
+        merge_object(
+            &mut entry,
+            &existing,
+            &["id", "plugin", "language", "type", "created_at"],
+        );
+        manifest[index] = entry;
+        *manifest = manifest
+            .drain(..)
+            .enumerate()
+            .filter(|(item_index, item)| {
+                *item_index == index || item.get("id").and_then(Value::as_str) != Some(source_id)
+            })
+            .map(|(_, item)| item)
+            .collect();
+    } else {
+        manifest.push(entry);
+    }
 }
 
 fn merge_object(target: &mut Value, existing: &Value, keys: &[&str]) {
@@ -9924,6 +10279,30 @@ mod tests {
         assert!(parse_manifest_text("").is_err());
         assert!(parse_manifest_text(r#"{"items":[]}"#).is_err());
         assert!(parse_manifest_text(r#"[{"id":"source-a"}]"#).is_ok());
+    }
+
+    #[test]
+    fn merge_manifest_entry_replaces_existing_and_keeps_created_at() {
+        let mut manifest = vec![
+            json!({ "id": "source-a", "hash": "old", "created_at": "first", "updated_at": "old" }),
+            json!({ "id": "source-b", "hash": "other", "created_at": "other", "updated_at": "other" }),
+            json!({ "id": "source-a", "hash": "duplicate", "created_at": "dup", "updated_at": "dup" }),
+        ];
+
+        merge_manifest_entry(
+            &mut manifest,
+            "source-a",
+            json!({ "id": "source-a", "hash": "new", "created_at": "now", "updated_at": "now" }),
+        );
+
+        assert_eq!(manifest.len(), 2);
+        let entry = manifest
+            .iter()
+            .find(|entry| entry.get("id").and_then(Value::as_str) == Some("source-a"))
+            .unwrap();
+        assert_eq!(entry.get("hash").and_then(Value::as_str), Some("new"));
+        assert_eq!(entry.get("created_at").and_then(Value::as_str), Some("first"));
+        assert_eq!(entry.get("updated_at").and_then(Value::as_str), Some("now"));
     }
 
     #[test]

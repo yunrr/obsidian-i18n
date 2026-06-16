@@ -6,8 +6,9 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import * as fs from 'fs-extra';
 import { PluginManifest } from 'obsidian';
 import { Button, Input, Label, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Textarea } from '@/src/shadcn';
-import { Upload, FileCheck, FileX, Info, Package, Globe, Tag, MessageSquare, AlertCircle, Plus, CheckCircle2, Loader2, RefreshCcw, Send, FolderOpen, GitCompare, ArrowLeft, Palette, Captions, Languages, Rocket, History as HistoryIcon, FileType, ArrowUpCircle, CloudUpload } from 'lucide-react';
+import { Upload, FileCheck, FileX, Info, Package, Globe, Tag, MessageSquare, AlertCircle, Plus, CheckCircle2, Loader2, RefreshCcw, Send, FolderOpen, GitCompare, ArrowLeft, Palette, Captions, Languages, Rocket, History as HistoryIcon, FileType, ArrowUpCircle, CloudUpload, Replace } from 'lucide-react';
 import { ScrollArea } from '@/src/shadcn/ui/scroll-area';
+import { Progress } from '@/src/shadcn/ui/progress';
 import { useCloudStore } from '../cloud-store';
 import { useGlobalStoreInstance } from '~/utils/store/global';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/src/shadcn/ui/card';
@@ -17,19 +18,8 @@ import { ManifestEntry, getCloudFilePath } from '../types';
 import { DiffViewerDialog } from './diff-viewer-dialog';
 import { t } from '@/src/locales/index';
 import { LoginRequired } from './login-required';
-
-/** 计算字符串的简单 hash (MD5-like hex) */
-function simpleHash(str: string): string {
-    let hash = 0;
-    for (let i = 0; i < str.length; i++) {
-        const char = str.charCodeAt(i);
-        hash = ((hash << 5) - hash) + char;
-        hash = hash & hash; // Convert to 32bit integer
-    }
-    // Output hex string
-    const hex = Math.abs(hash).toString(16).padStart(8, '0');
-    return hex.repeat(4); // Fill to 32 chars
-}
+import { CompanionTaskProgress } from '~/manager/companion-worker-manager';
+import { translationFileHash } from '@/src/utils/translation-hash';
 
 export const PublishTab: React.FC = () => {
     const i18n = useGlobalStoreInstance.getState().i18n;
@@ -65,8 +55,26 @@ export const PublishTab: React.FC = () => {
     const userRepo = i18n.settings.shareRepo;
 
     const [isUploading, setIsUploading] = useState(false);
+    const [isBulkUploading, setIsBulkUploading] = useState(false);
+    const [bulkProgress, setBulkProgress] = useState<CompanionTaskProgress | null>(null);
+    const [bulkCheckpoint, setBulkCheckpoint] = useState<any | null>(null);
 
     const setCurrentTab = useCloudStore.use.setCurrentTab();
+
+    const loadBulkCheckpoint = useCallback(() => {
+        const basePath = i18n.sourceManager.getBasePath();
+        const checkpointPath = require('path').join(basePath, 'publish-diff-checkpoint.json');
+        try {
+            if (fs.existsSync(checkpointPath)) {
+                return fs.readJsonSync(checkpointPath);
+            }
+        } catch { /* ignore */ }
+        return null;
+    }, [i18n.sourceManager]);
+
+    useEffect(() => {
+        setBulkCheckpoint(loadBulkCheckpoint());
+    }, [loadBulkCheckpoint, sourceUpdateTick]);
 
     // 获取插件列表 - 仅显示有翻译源(meta.json)的插件
     // @ts-ignore
@@ -128,8 +136,7 @@ export const PublishTab: React.FC = () => {
         const filePath = i18n.sourceManager.getSourceFilePath(selectedSourceId);
         if (filePath && fs.existsSync(filePath)) {
             try {
-                const content = fs.readFileSync(filePath, 'utf-8');
-                return simpleHash(content);
+                return translationFileHash(filePath);
             } catch (e) {
                 return '';
             }
@@ -141,6 +148,100 @@ export const PublishTab: React.FC = () => {
         if (!cloudEntry || !localHash) return false;
         return cloudEntry.hash === localHash;
     }, [cloudEntry, localHash]);
+
+    const changedCloudSources = useMemo(() => {
+        const manifestById = new Map(repoManifest.map(entry => [entry.id, entry]));
+        const changed: Array<{ id: string; title: string; plugin: string; hash: string; cloudHash: string }> = [];
+        const allSources = i18n.sourceManager.getAllSources?.() || [];
+
+        for (const source of allSources) {
+            if (source.type !== uploadType) continue;
+            const cloud = manifestById.get(source.id);
+            if (!cloud) continue;
+            const sourcePath = i18n.sourceManager.getSourceFilePath(source.id);
+            if (!sourcePath || !fs.existsSync(sourcePath)) continue;
+            try {
+                const hash = translationFileHash(sourcePath);
+                if (hash && hash !== cloud.hash) {
+                    changed.push({
+                        id: source.id,
+                        title: source.title || cloud.title || source.id,
+                        plugin: source.plugin || cloud.plugin || '',
+                        hash,
+                        cloudHash: cloud.hash,
+                    });
+                }
+            } catch {
+                // Ignore unreadable local files; the backend will re-check before upload.
+            }
+        }
+
+        return changed;
+    }, [i18n.sourceManager, repoManifest, sourceUpdateTick, uploadType]);
+
+    const handleBulkUploadChanged = useCallback(async (isResume = false) => {
+        if (!isResume && changedCloudSources.length === 0) return;
+        if (!githubUser) {
+            i18n.notice.errorPrefix(t('Cloud.Errors.UploadFailed'), t('Cloud.Errors.NoGithubUser'));
+            return;
+        }
+        if (!isResume && !confirm(t('Cloud.Dialogs.ConfirmBulkReplace', { count: changedCloudSources.length }))) {
+            return;
+        }
+
+        setIsBulkUploading(true);
+        try {
+            i18n.notice.successPrefix(
+                t('Cloud.Status.Processing'),
+                isResume ? t('Cloud.Status.ResumingBulkReplace') : t('Cloud.Status.BulkReplacingCloud', { count: changedCloudSources.length })
+            );
+            const started = await i18n.companionWorkerManager.startTask('cloud-publish-diff-sources', {
+                persistence: { basePath: i18n.sourceManager.getBasePath() },
+                token: i18n.settings.shareToken,
+                owner: githubUser.login,
+                repo: userRepo,
+                branch: 'main',
+                language: i18n.settings.language,
+                sourceIds: changedCloudSources.map(source => source.id),
+                totalResources: isResume ? bulkCheckpoint?.total || 0 : changedCloudSources.length,
+                totalItems: isResume ? bulkCheckpoint?.total || 0 : changedCloudSources.length,
+                completedResources: isResume ? bulkCheckpoint?.currentIdx || 0 : 0,
+                processedItems: isResume ? bulkCheckpoint?.currentIdx || 0 : 0,
+                resume: isResume,
+            });
+
+            let progress = started.progress;
+            setBulkProgress(progress);
+            while (progress.status === 'queued' || progress.status === 'running') {
+                await new Promise(resolve => window.setTimeout(resolve, 150));
+                const status = await i18n.companionWorkerManager.getTaskStatus(started.taskId, 'cloud-publish-diff-sources');
+                progress = status.progress;
+                setBulkProgress(progress);
+            }
+
+            if (progress.status === 'failed') throw new Error(progress.error || t('Cloud.Errors.UploadFailed'));
+            if (progress.status === 'cancelled') throw new Error(t('Common.Errors.TaskCancelled'));
+
+            i18n.sourceManager.reloadFromDisk();
+            const manifestRes = await i18n.api.github.getFileContentWithFallback(githubUser.login, userRepo, 'metadata.json');
+            if (manifestRes.state && Array.isArray(manifestRes.data)) {
+                setRepoManifest(manifestRes.data as ManifestEntry[]);
+            }
+            useGlobalStoreInstance.getState().triggerSourceUpdate();
+            setBulkCheckpoint(null);
+            i18n.notice.successPrefix(
+                t('Cloud.Notices.UploadSuccess'),
+                t('Cloud.Notices.BulkReplaceSuccessCount', { count: progress.successCount || progress.totalResources || changedCloudSources.length })
+            );
+        } catch (error) {
+            console.error(t('Cloud.Errors.UploadFailed'), error);
+            i18n.notice.errorPrefix(t('Cloud.Errors.UploadFailed'), `${error}`);
+            setBulkCheckpoint(loadBulkCheckpoint());
+        } finally {
+            setIsBulkUploading(false);
+            setBulkProgress(null);
+        }
+    }, [bulkCheckpoint, changedCloudSources, githubUser, i18n, loadBulkCheckpoint, setRepoManifest, userRepo]);
 
     // 检测翻译源文件（以 selectedSourceId 为准）
     useEffect(() => {
@@ -331,6 +432,88 @@ export const PublishTab: React.FC = () => {
                         <span>{t('Cloud.Notices.RepoReadyPrefix')}</span>
                         <span className="font-mono font-medium">{githubUser?.login}/{userRepo}</span>
                     </div>
+
+                    <section className="border border-border/50 bg-card/40 rounded-lg p-4 space-y-3">
+                        <div className="flex items-start justify-between gap-3">
+                            <div className="flex items-start gap-3 min-w-0">
+                                <div className={cn(
+                                    "mt-0.5 flex h-8 w-8 items-center justify-center rounded-md shrink-0",
+                                    changedCloudSources.length > 0 ? "bg-amber-500/10 text-amber-600" : "bg-green-500/10 text-green-600"
+                                )}>
+                                    {changedCloudSources.length > 0 ? <Replace className="w-4 h-4" /> : <CheckCircle2 className="w-4 h-4" />}
+                                </div>
+                                <div className="space-y-1 min-w-0">
+                                    <div className="flex items-center gap-2">
+                                        <h3 className="text-sm font-semibold text-foreground">{t('Cloud.Actions.BulkReplaceChanged')}</h3>
+                                        <Badge variant="outline" className="h-5 text-[10px]">
+                                            {changedCloudSources.length}
+                                        </Badge>
+                                    </div>
+                                    <p className="text-[11px] text-muted-foreground leading-relaxed">
+                                        {changedCloudSources.length > 0
+                                            ? t('Cloud.Tips.BulkReplaceChangedDesc', { count: changedCloudSources.length })
+                                            : t('Cloud.Tips.NoChangedCloudSources')}
+                                    </p>
+                                </div>
+                            </div>
+                            <Button
+                                variant={changedCloudSources.length > 0 ? "default" : "outline"}
+                                size="sm"
+                                className="h-9 gap-1.5 shrink-0 text-[12px]"
+                                onClick={() => handleBulkUploadChanged(false)}
+                                disabled={isBulkUploading || changedCloudSources.length === 0}
+                            >
+                                {isBulkUploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <CloudUpload className="w-4 h-4" />}
+                                {isBulkUploading ? t('Cloud.Status.Processing') : t('Cloud.Actions.ReplaceChangedCloud')}
+                            </Button>
+                        </div>
+                        {bulkCheckpoint && !isBulkUploading && (
+                            <div className="flex items-center justify-between gap-3 border border-amber-500/20 bg-amber-500/5 rounded-md px-3 py-2">
+                                <div className="text-[11px] text-amber-700 dark:text-amber-300">
+                                    {t('Cloud.Notices.FoundBulkReplaceCheckpoint', { count: bulkCheckpoint.total || 0, current: bulkCheckpoint.currentIdx || 0 })}
+                                </div>
+                                <Button
+                                    variant="outline"
+                                    size="sm"
+                                    className="h-8 gap-1.5 shrink-0 text-[11px]"
+                                    onClick={() => handleBulkUploadChanged(true)}
+                                >
+                                    <RefreshCcw className="w-3.5 h-3.5" />
+                                    {t('Cloud.Actions.ResumeBulkReplace')}
+                                </Button>
+                            </div>
+                        )}
+                        {bulkProgress && (
+                            <div className="space-y-2 border border-muted-foreground/20 bg-muted/10 rounded-md px-3 py-2">
+                                <div className="flex items-center justify-between gap-3 text-[11px]">
+                                    <span className="font-medium text-foreground/90 truncate">
+                                        {bulkProgress.currentLabel || t('Cloud.Status.BulkReplacingCloud', { count: bulkProgress.totalResources })}
+                                    </span>
+                                    <span className="text-muted-foreground shrink-0">
+                                        {bulkProgress.processedResources}/{bulkProgress.totalResources}
+                                    </span>
+                                </div>
+                                <Progress
+                                    value={bulkProgress.totalResources > 0 ? (bulkProgress.processedResources / bulkProgress.totalResources) * 100 : 0}
+                                    className="h-2 rounded-none"
+                                />
+                            </div>
+                        )}
+                        {changedCloudSources.length > 0 && (
+                            <div className="flex flex-wrap gap-1.5 pt-1">
+                                {changedCloudSources.slice(0, 8).map(source => (
+                                    <Badge key={source.id} variant="secondary" className="max-w-[180px] justify-start text-[10px] font-normal">
+                                        <span className="truncate">{source.title}</span>
+                                    </Badge>
+                                ))}
+                                {changedCloudSources.length > 8 && (
+                                    <Badge variant="outline" className="text-[10px]">
+                                        +{changedCloudSources.length - 8}
+                                    </Badge>
+                                )}
+                            </div>
+                        )}
+                    </section>
 
                     {/* 第一步：选择翻译类型 */}
                     <section className="space-y-3">
