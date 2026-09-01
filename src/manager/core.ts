@@ -55,7 +55,10 @@ export class CoreManager {
 
     // 激活沉浸式翻译
     public async activateIMT() {
-        await activateIMT(this.i18n.settings);
+        activateIMT({
+            settings: this.i18n.settings,
+            registerCleanup: (cleanup: () => void) => this.i18n.register(cleanup),
+        });
         this.i18n.settings.modeImt = true;
         this.i18n.saveSettings();
     }

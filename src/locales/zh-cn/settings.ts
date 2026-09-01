@@ -203,7 +203,15 @@ export default {
         TranslationClassesTitle: "译文类名 (Class)",
         TranslationClassesDesc: "为生成的译文元素添加额外的 CSS 类名。",
         InjectedCssTitle: "注入自定义 CSS",
-        InjectedCssDesc: "在页面中嵌入额外的 CSS 样式代码。"
+        InjectedCssDesc: "在页面中嵌入额外的 CSS 样式代码。",
+        PanelTitle: "Kiss 翻译",
+        PanelTranslate: "翻译界面",
+        PanelRestore: "恢复原文",
+        Translating: "翻译中",
+        TranslateDone: "界面翻译完成",
+        TranslateFailed: "界面翻译失败",
+        NothingToTranslate: "未发现可翻译内容",
+        Restored: "已恢复原文"
     },
     Ai: {
         // ── 服务配置 ──
