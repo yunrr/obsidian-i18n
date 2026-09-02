@@ -211,7 +211,25 @@ export default {
         TranslateDone: "界面翻译完成",
         TranslateFailed: "界面翻译失败",
         NothingToTranslate: "未发现可翻译内容",
-        Restored: "已恢复原文"
+        Restored: "已恢复原文",
+        KissHeader: "Kiss 翻译核心",
+        KissHeaderDesc: "来自 kiss-translator 全量移植的多供应商翻译核心：接口配置与提示词按供应商独立保存。",
+        KissProvider: "翻译供应商",
+        KissProviderDesc: "切换界面翻译使用的翻译接口（Google/微软/DeepL/OpenAI/Gemini 等，含免费接口）。",
+        KissApiKey: "API Key",
+        KissApiKeyDesc: "当前供应商的接口密钥；免费接口留空即可。",
+        KissBaseUrl: "接口地址 (BaseURL)",
+        KissBaseUrlDesc: "当前供应商的 API 端点地址，留空使用官方默认。",
+        KissModel: "模型",
+        KissModelDesc: "AI 类供应商使用的模型名称。",
+        KissTargetLang: "目标语言",
+        KissTargetLangDesc: "界面文本将被翻译成的语言。",
+        KissTextStyle: "译文样式",
+        KissTextStyleDesc: "译文文本的视觉效果（下划线、马克笔高亮、虚线框等），来自 kiss 内置样式。",
+        KissSystemPrompt: "批量翻译提示词",
+        KissSystemPromptDesc: "批量接口（Google/微软/DeepL 等）或 AI 批量模式使用的系统提示词。",
+        KissNobatchPrompt: "逐句翻译提示词",
+        KissNobatchPromptDesc: "AI 接口逐句翻译使用的系统提示词，留空使用 kiss 内置默认。"
     },
     Ai: {
         // ── 服务配置 ──

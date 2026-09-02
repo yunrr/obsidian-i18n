@@ -51,6 +51,15 @@ const commonOptions = {
     // 定义全局变量，用于在代码中判断环境
     define: {
         "process.env.DEV_MODE": JSON.stringify(!prod),
+
+        // ===== kiss-translator 核心编译期常量 (src/imt/kiss/vendor) =====
+        "process.env.REACT_APP_CLIENT": JSON.stringify("obsidian"),
+        "process.env.REACT_APP_VERSION": JSON.stringify("2.0.32"),
+        "process.env.REACT_APP_NAME": JSON.stringify("KISS Translator"),
+        "process.env.REACT_APP_HOMEPAGE": JSON.stringify("https://github.com/fishjar/kiss-translator"),
+        "process.env.REACT_APP_RULESURL": JSON.stringify("https://fishjar.github.io/kiss-rules/kiss-rules_v2.json"),
+        "process.env.REACT_APP_RULESURL_ON": JSON.stringify("https://fishjar.github.io/kiss-rules/kiss-rules-on_v2.json"),
+        "process.env.REACT_APP_RULESURL_OFF": JSON.stringify("https://fishjar.github.io/kiss-rules/kiss-rules-off_v2.json"),
     },
 
     /**

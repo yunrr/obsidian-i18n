@@ -1,6 +1,9 @@
 import { Notice, Setting } from "obsidian";
 import BaseSetting from "../base-setting";
 import { t } from "src/locales";
+import { getSettingWithDefault, putSetting } from "src/imt/kiss/vendor/libs/storage";
+import { OPT_LANGS_TO, OPT_TRANS_BUILTINAI } from "src/imt/kiss/vendor/config/api";
+import { OPT_STYLE_ALL } from "src/imt/kiss/vendor/config/styles";
 
 // 自动更新
 export default class I18nModIMT extends BaseSetting {
@@ -158,6 +161,131 @@ export default class I18nModIMT extends BaseSetting {
                     await this.i18n.saveSettings();
                 })
                 .inputEl.onblur = () => { new Notice(t('Settings.Immersive.RestartNotice'), 5000); };
+            cb.inputEl.setAttr("rows", 4);
+        });
+
+        // [设置组] Kiss 翻译核心（多供应商 / 接口 / 提示词 / 译文样式）
+        new Setting(this.containerEl).setName(t('Settings.Immersive.KissHeader')).setDesc(t('Settings.Immersive.KissHeaderDesc')).setHeading();
+        void this.renderKissSettings();
+    }
+
+    /** 读取 kiss 核心设置（含默认值合并） */
+    private async loadKissSetting(): Promise<any> {
+        return await getSettingWithDefault() as any;
+    }
+
+    /** 获取当前选中的 kiss 翻译 API 配置 */
+    private pickKissApi(setting: any): any {
+        const apis: any[] = Array.isArray(setting?.transApis) ? setting.transApis : [];
+        return apis.find(api => api.apiSlug === setting.selectedApiSlug) || apis[0] || {};
+    }
+
+    /** 修改 kiss 核心设置并持久化到插件数据 */
+    private async saveKissSetting(mutate: (setting: any) => void): Promise<void> {
+        const setting = await this.loadKissSetting();
+        mutate(setting);
+        await putSetting(setting);
+    }
+
+    /** 渲染 Kiss 翻译核心配置区（供应商/接口参数/目标语言/译文样式/提示词） */
+    private async renderKissSettings(): Promise<void> {
+        const kiss = await this.loadKissSetting();
+        const apis: any[] = Array.isArray(kiss.transApis) ? kiss.transApis : [];
+        const activeApi = this.pickKissApi(kiss);
+
+        // [设置项] 翻译供应商
+        const providerSetting = new Setting(this.containerEl);
+        providerSetting.setName(t('Settings.Immersive.KissProvider'));
+        providerSetting.setDesc(t('Settings.Immersive.KissProviderDesc'));
+        providerSetting.addDropdown(cb => {
+            apis.filter(api => !api.isDisabled && api.apiType !== OPT_TRANS_BUILTINAI).forEach(api => {
+                cb.addOption(api.apiSlug, api.apiName || api.apiSlug);
+            });
+            cb.setValue(activeApi.apiSlug || '');
+            cb.onChange(async (value) => {
+                await this.saveKissSetting(s => { s.selectedApiSlug = value; });
+                this.settingTab.imtDisplay(); // 切换供应商后重渲染，载入对应参数
+            });
+        });
+
+        // [设置项] API Key
+        const apiKeySetting = new Setting(this.containerEl);
+        apiKeySetting.setName(t('Settings.Immersive.KissApiKey'));
+        apiKeySetting.setDesc(t('Settings.Immersive.KissApiKeyDesc'));
+        apiKeySetting.addText(cb => cb
+            .setValue(activeApi.apiKey || '')
+            .onChange(async (v) => {
+                await this.saveKissSetting(s => { this.pickKissApi(s).apiKey = v.trim(); });
+            })
+        );
+
+        // [设置项] 接口地址
+        const baseUrlSetting = new Setting(this.containerEl);
+        baseUrlSetting.setName(t('Settings.Immersive.KissBaseUrl'));
+        baseUrlSetting.setDesc(t('Settings.Immersive.KissBaseUrlDesc'));
+        baseUrlSetting.addText(cb => cb
+            .setValue(activeApi.baseURL || '')
+            .onChange(async (v) => {
+                await this.saveKissSetting(s => { this.pickKissApi(s).baseURL = v.trim(); });
+            })
+        );
+
+        // [设置项] 模型
+        const modelSetting = new Setting(this.containerEl);
+        modelSetting.setName(t('Settings.Immersive.KissModel'));
+        modelSetting.setDesc(t('Settings.Immersive.KissModelDesc'));
+        modelSetting.addText(cb => cb
+            .setValue(activeApi.model || '')
+            .onChange(async (v) => {
+                await this.saveKissSetting(s => { this.pickKissApi(s).model = v.trim(); });
+            })
+        );
+
+        // [设置项] 目标语言
+        const targetLangSetting = new Setting(this.containerEl);
+        targetLangSetting.setName(t('Settings.Immersive.KissTargetLang'));
+        targetLangSetting.setDesc(t('Settings.Immersive.KissTargetLangDesc'));
+        targetLangSetting.addDropdown(cb => {
+            OPT_LANGS_TO.forEach(([code, name]) => cb.addOption(code, name));
+            cb.setValue(kiss.selectedToLang || 'zh-CN');
+            cb.onChange(async (v) => {
+                await this.saveKissSetting(s => { s.selectedToLang = v; });
+            });
+        });
+
+        // [设置项] 译文样式
+        const textStyleSetting = new Setting(this.containerEl);
+        textStyleSetting.setName(t('Settings.Immersive.KissTextStyle'));
+        textStyleSetting.setDesc(t('Settings.Immersive.KissTextStyleDesc'));
+        textStyleSetting.addDropdown(cb => {
+            OPT_STYLE_ALL.forEach(slug => cb.addOption(slug, slug));
+            cb.setValue(kiss.selectedTextStyle || 'style_none');
+            cb.onChange(async (v) => {
+                await this.saveKissSetting(s => { s.selectedTextStyle = v; });
+            });
+        });
+
+        // [设置项] 批量提示词
+        const systemPromptSetting = new Setting(this.containerEl);
+        systemPromptSetting.setName(t('Settings.Immersive.KissSystemPrompt'));
+        systemPromptSetting.setDesc(t('Settings.Immersive.KissSystemPromptDesc'));
+        systemPromptSetting.addTextArea(cb => {
+            cb.setValue(activeApi.systemPrompt || '')
+                .onChange(async (v) => {
+                    await this.saveKissSetting(s => { this.pickKissApi(s).systemPrompt = v; });
+                });
+            cb.inputEl.setAttr("rows", 4);
+        });
+
+        // [设置项] 非批量提示词
+        const nobatchPromptSetting = new Setting(this.containerEl);
+        nobatchPromptSetting.setName(t('Settings.Immersive.KissNobatchPrompt'));
+        nobatchPromptSetting.setDesc(t('Settings.Immersive.KissNobatchPromptDesc'));
+        nobatchPromptSetting.addTextArea(cb => {
+            cb.setValue(activeApi.nobatchPrompt || '')
+                .onChange(async (v) => {
+                    await this.saveKissSetting(s => { this.pickKissApi(s).nobatchPrompt = v; });
+                });
             cb.inputEl.setAttr("rows", 4);
         });
     }

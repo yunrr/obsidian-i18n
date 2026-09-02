@@ -217,6 +217,7 @@ export interface I18nSettings {
     // ==============================
     modeImt: boolean;         // 是否启用沉浸式翻译
     imtPagerule: pageRule;    // 沉浸式翻译页面的匹配规则
+    kissStorage: Record<string, string>; // kiss-translator 核心的存储键值表（设置/规则等）
 
     // ==============================
     // 共建云端翻译 (Share)
@@ -591,6 +592,7 @@ export const DEFAULT_SETTINGS: I18nSettings = {
             ".cm-editor"
         ],
     },
+    kissStorage: {},          // kiss-translator 核心存储表（供应商配置/规则/提示词等）
 
     // ==============================
     // 共建云端翻译 (Share)

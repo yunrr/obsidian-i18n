@@ -16,6 +16,8 @@ import { t } from "src/locales";
 import { ScopedDomTranslator } from "./scoped-dom-translator";
 import { TranslationRenderer } from "./translation-renderer";
 import { KissTranslationService } from "./kiss-translation-service";
+import { genTextClass } from "./vendor/libs/style";
+import { getSettingWithDefault } from "./vendor/libs/storage";
 
 /** 激活上下文：由 CoreManager 传入 */
 export interface ImtActivationContext {
@@ -28,6 +30,8 @@ export interface ImtActivationContext {
 const OBSERVER_DEBOUNCE_MS = 600;
 /** 注入样式节点 id */
 const INJECTED_STYLE_ID = "imt-kiss-injected-css";
+/** kiss 译文样式表节点 id */
+const KISS_TEXT_STYLE_ID = "imt-kiss-text-styles";
 
 const toList = (value?: string | string[]): string[] => {
     if (!value) return [];
@@ -49,6 +53,12 @@ export class KissObsidianTranslator {
     private pendingRun = false;
     private service = new KissTranslationService();
     private scanner: ScopedDomTranslator | null = null;
+    /** kiss 译文样式类映射 (styleSlug -> class) */
+    private kissTextClass: Record<string, string> | null = null;
+    /** 当前选中的 kiss 译文样式 slug */
+    private kissTextStyleSlug = "style_none";
+    /** kiss 样式表注入完成的信号 */
+    private stylesReady: Promise<void> = Promise.resolve();
 
     /** 激活界面翻译：创建悬浮球、注入样式、启动观察器并自动翻译当前界面 */
     public activate(ctx: ImtActivationContext): void {
@@ -58,6 +68,7 @@ export class KissObsidianTranslator {
         this.scanner = new ScopedDomTranslator(ctx.settings.imtPagerule);
         this.createBall();
         this.applyInjectedCss();
+        this.stylesReady = this.applyKissTextStyles();
         this.setupObserver();
         ctx.registerCleanup?.(() => this.deactivate());
         // 激活后自动翻译当前界面，与原 SDK 行为保持一致
@@ -80,6 +91,7 @@ export class KissObsidianTranslator {
         this.running = false;
         TranslationRenderer.restore(document.body);
         this.removeInjectedCss();
+        this.removeKissTextStyles();
         this.removeBall();
         this.scanner = null;
     }
@@ -105,6 +117,8 @@ export class KissObsidianTranslator {
         this.running = true;
 
         try {
+            await this.stylesReady;
+            if (!this.active || !this.scanner || !this.ctx) return;
             const units = this.scanner.collect(document.body);
             if (!units.length) {
                 // 观察器引起的空轮询不打扰状态显示
@@ -112,7 +126,11 @@ export class KissObsidianTranslator {
                 return;
             }
 
-            const extraClasses = toList(this.ctx.settings.imtPagerule?.translationClasses);
+            const styleClass = this.kissTextClass?.[this.kissTextStyleSlug];
+            const extraClasses = [
+                ...(styleClass ? [styleClass] : []),
+                ...toList(this.ctx.settings.imtPagerule?.translationClasses),
+            ].filter(Boolean);
             this.updateStatus(`${t("Settings.Immersive.Translating")} 0/${units.length}`);
             const map = await this.service.translate(
                 units.map(unit => unit.text),
@@ -243,6 +261,29 @@ export class KissObsidianTranslator {
         this.injectedStyle?.remove();
         document.getElementById(INJECTED_STYLE_ID)?.remove();
         this.injectedStyle = null;
+    }
+
+    /** 注入 kiss 译文样式表，并记录当前样式对应的类名 */
+    private async applyKissTextStyles(): Promise<void> {
+        try {
+            const setting = (await getSettingWithDefault()) as any;
+            const [textClass, textStyles] = genTextClass(setting.customStyles || []);
+            this.kissTextClass = textClass;
+            this.kissTextStyleSlug = setting.selectedTextStyle || "style_none";
+
+            document.getElementById(KISS_TEXT_STYLE_ID)?.remove();
+            const style = document.createElement("style");
+            style.id = KISS_TEXT_STYLE_ID;
+            style.textContent = textStyles;
+            document.head.appendChild(style);
+        } catch (error) {
+            console.error("[i18n-kiss] apply kiss text styles failed:", error);
+        }
+    }
+
+    private removeKissTextStyles(): void {
+        document.getElementById(KISS_TEXT_STYLE_ID)?.remove();
+        this.kissTextClass = null;
     }
 
     /**
